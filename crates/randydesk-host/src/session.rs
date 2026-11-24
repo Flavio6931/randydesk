@@ -258,7 +258,12 @@ pub(crate) fn spawn_capture_worker(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut encoder = TileEncoder::new();
+        let mut last_awake = Instant::now() - Duration::from_secs(60);
         while !stop_flag.load(Ordering::Relaxed) {
+            if last_awake.elapsed() >= Duration::from_secs(30) {
+                crate::power::keep_session_awake();
+                last_awake = Instant::now();
+            }
             let settings = shared_settings
                 .lock()
                 .map(|s| *s)

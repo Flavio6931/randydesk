@@ -21,6 +21,9 @@ pub const DEFAULT_PORT: u16 = 21118;
 /// Puerto TCP/WebSocket por defecto para el servidor Relay.
 pub const DEFAULT_RELAY_PORT: u16 = 21119;
 
+/// Servidor Relay público gratuito por defecto del proyecto.
+pub const DEFAULT_RELAY_URL: &str = "wss://randydesk-relay.onrender.com";
+
 /// Versión actual del protocolo de comunicación.
 pub const PROTOCOL_VERSION: u16 = 1;
 

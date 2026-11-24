@@ -92,6 +92,7 @@ pub async fn run_relay_loop(
                             }
                         }
                         _ = ping_ticker.tick() => {
+                            crate::power::keep_system_awake();
                             if ws.send(Message::Ping(vec![])).await.is_err() {
                                 break;
                             }

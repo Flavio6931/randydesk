@@ -4,21 +4,40 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use randydesk_proto::{
     format_host_id, normalize_relay_ws_url, parse_numeric_id, CodecKind, DEFAULT_PORT,
+    DEFAULT_RELAY_URL,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
 /// Preferencias globales de red del usuario (URL del servidor Relay).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    #[serde(default)]
+    #[serde(default = "default_relay_url_string")]
     pub relay_url: String,
+    #[serde(default)]
+    pub relay_disabled: bool,
+}
+
+fn default_relay_url_string() -> String {
+    DEFAULT_RELAY_URL.to_string()
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            relay_disabled: false,
+        }
+    }
 }
 
 impl AppSettings {
-    /// Devuelve la URL del Relay normalizada (`ws://` o `wss://`) si está configurada.
+    /// Devuelve la URL del Relay normalizada (`ws://` o `wss://`) si está habilitada.
     pub fn normalized_relay_url(&self) -> Option<String> {
+        if self.relay_disabled {
+            return None;
+        }
         normalize_relay_ws_url(&self.relay_url)
     }
 }
@@ -137,7 +156,7 @@ pub fn upsert_recent(
     hosts.push(host);
 }
 
-/// Carga la configuración global (`settings.json`) o lee `RANDYDESK_RELAY_URL` si está vacía.
+/// Carga la configuración global (`settings.json`) aplicando `DEFAULT_RELAY_URL` si no fue desactivado.
 pub fn load_settings() -> AppSettings {
     let mut settings = settings_file_path()
         .ok()
@@ -146,10 +165,14 @@ pub fn load_settings() -> AppSettings {
         .and_then(|json| serde_json::from_str::<AppSettings>(&json).ok())
         .unwrap_or_default();
 
-    if settings.relay_url.trim().is_empty() {
+    if !settings.relay_disabled && settings.relay_url.trim().is_empty() {
         if let Ok(env_url) = std::env::var("RANDYDESK_RELAY_URL") {
-            settings.relay_url = env_url;
+            if !env_url.trim().is_empty() {
+                settings.relay_url = env_url;
+                return settings;
+            }
         }
+        settings.relay_url = DEFAULT_RELAY_URL.to_string();
     }
     settings
 }
@@ -221,6 +244,21 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_settings_uses_render_relay_unless_disabled() {
+        let def = AppSettings::default();
+        assert_eq!(
+            def.normalized_relay_url().as_deref(),
+            Some(DEFAULT_RELAY_URL)
+        );
+
+        let disabled = AppSettings {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            relay_disabled: true,
+        };
+        assert_eq!(disabled.normalized_relay_url(), None);
+    }
 
     #[test]
     fn deserializes_v010_hosts_json_with_defaults() {

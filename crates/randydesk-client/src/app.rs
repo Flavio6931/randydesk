@@ -14,7 +14,9 @@ use crate::theme::{
 };
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
-use randydesk_proto::{normalize_relay_ws_url, CodecKind, InputEvent, StreamSettings};
+use randydesk_proto::{
+    normalize_relay_ws_url, CodecKind, InputEvent, StreamSettings, DEFAULT_RELAY_URL,
+};
 use std::time::Duration;
 
 /// Datos temporales del modal para pedir contraseña al conectar.
@@ -687,7 +689,11 @@ impl RandyDeskApp {
                         {
                             apply_relay = Some(self.relay_url_input.trim().to_string());
                         }
-                        if ui.button("Quitar servidor").clicked() {
+                        if ui.button("Usar por defecto").clicked() {
+                            self.relay_url_input = DEFAULT_RELAY_URL.to_string();
+                            apply_relay = Some(DEFAULT_RELAY_URL.to_string());
+                        }
+                        if ui.button("Solo red local").clicked() {
                             self.relay_url_input.clear();
                             apply_relay = Some(String::new());
                         }
@@ -696,14 +702,15 @@ impl RandyDeskApp {
 
             if let Some(raw) = apply_relay {
                 let normalized = normalize_relay_ws_url(&raw).unwrap_or_default();
+                self.settings.relay_disabled = normalized.is_empty();
                 self.settings.relay_url = normalized.clone();
                 self.relay_url_input = normalized;
                 match save_settings(&self.settings) {
                     Ok(()) => {
                         self.host_panel
                             .set_relay_url(self.settings.normalized_relay_url(), &self.rt_handle);
-                        self.relay_modal_msg = Some(if self.settings.relay_url.is_empty() {
-                            "Relay desactivado (modo red local).".into()
+                        self.relay_modal_msg = Some(if self.settings.relay_disabled {
+                            "Relay desactivado (modo solo red local).".into()
                         } else {
                             "Servidor Relay guardado y conectando...".into()
                         });
