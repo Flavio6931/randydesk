@@ -54,6 +54,9 @@ pub trait ScreenCapturer: Send {
     /// Captura el siguiente cuadro disponible; devuelve `Ok(None)` si no hubo cambios dentro de `timeout_ms`.
     fn capture(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>>;
 
+    /// Devuelve el buffer de un cuadro ya procesado para reutilizar su capacidad sin realocar memoria.
+    fn recycle_buffer(&mut self, _bgra: Vec<u8>) {}
+
     /// Devuelve la geometría actual del monitor capturado.
     fn dimensions(&self) -> MonitorGeometry;
 }
@@ -98,6 +101,9 @@ impl Drop for DxgiFrameGuard {
     }
 }
 
+/// Límite máximo de cuadros acumulados a drenar por ciclo para evitar inanición en tasas altas.
+const MAX_DRAIN_FRAMES: usize = 8;
+
 /// Capturador de alto rendimiento basado en DXGI Desktop Duplication API.
 pub struct DxgiCapturer {
     monitor_index: usize,
@@ -106,6 +112,7 @@ pub struct DxgiCapturer {
     output1: IDXGIOutput1,
     dup: IDXGIOutputDuplication,
     staging: Option<ID3D11Texture2D>,
+    bgra: Vec<u8>,
     geometry: MonitorGeometry,
 }
 
@@ -163,6 +170,7 @@ impl DxgiCapturer {
             output1,
             dup,
             staging: None,
+            bgra: Vec::new(),
             geometry,
         })
     }
@@ -219,6 +227,27 @@ impl DxgiCapturer {
         self.staging = Some(tex.clone());
         Ok(tex)
     }
+
+    fn copy_resource_to_staging(
+        &mut self,
+        resource: Option<IDXGIResource>,
+    ) -> Result<(ID3D11Texture2D, u32, u32)> {
+        let resource = resource.ok_or_else(|| anyhow!("AcquireNextFrame devolvió recurso nulo"))?;
+        let gpu_tex: ID3D11Texture2D = resource.cast()?;
+        let mut gpu_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { gpu_tex.GetDesc(&mut gpu_desc) };
+
+        let width = gpu_desc.Width;
+        let height = gpu_desc.Height;
+        self.geometry.width = width;
+        self.geometry.height = height;
+
+        let staging = self.ensure_staging(width, height)?;
+        unsafe {
+            self.context.CopyResource(&staging, &gpu_tex);
+        }
+        Ok((staging, width, height))
+    }
 }
 
 impl ScreenCapturer for DxgiCapturer {
@@ -237,22 +266,35 @@ impl ScreenCapturer for DxgiCapturer {
             Err(e) => return Err(e).context("error en AcquireNextFrame"),
         }
 
-        let _guard = DxgiFrameGuard {
-            dup: self.dup.clone(),
+        let (mut staging, mut width, mut height) = {
+            let _guard = DxgiFrameGuard {
+                dup: self.dup.clone(),
+            };
+            self.copy_resource_to_staging(resource)?
         };
-        let resource = resource.ok_or_else(|| anyhow!("AcquireNextFrame devolvió recurso nulo"))?;
-        let gpu_tex: ID3D11Texture2D = resource.cast()?;
-        let mut gpu_desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { gpu_tex.GetDesc(&mut gpu_desc) };
 
-        let width = gpu_desc.Width;
-        let height = gpu_desc.Height;
-        self.geometry.width = width;
-        self.geometry.height = height;
-
-        let staging = self.ensure_staging(width, height)?;
-        unsafe {
-            self.context.CopyResource(&staging, &gpu_tex);
+        // Drenar cuadros acumulados para copiar únicamente el más reciente a memoria CPU.
+        for _ in 0..MAX_DRAIN_FRAMES {
+            let mut drained_info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut drained_res: Option<IDXGIResource> = None;
+            match unsafe { self.dup.AcquireNextFrame(0, &mut drained_info, &mut drained_res) } {
+                Ok(()) => {
+                    let _guard = DxgiFrameGuard {
+                        dup: self.dup.clone(),
+                    };
+                    let (next_staging, next_w, next_h) = self.copy_resource_to_staging(drained_res)?;
+                    staging = next_staging;
+                    width = next_w;
+                    height = next_h;
+                }
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => break,
+                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                    warn!("DXGI_ERROR_ACCESS_LOST detectado al drenar; recreando duplicación");
+                    self.recreate_duplication()?;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e).context("error drenando AcquireNextFrame(0)"),
+            }
         }
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -264,7 +306,9 @@ impl ScreenCapturer for DxgiCapturer {
 
         let row_bytes = (width as usize) * 4;
         let pitch = mapped.RowPitch as usize;
-        let mut bgra = vec![0u8; row_bytes * (height as usize)];
+        let needed_bytes = row_bytes * (height as usize);
+        let mut bgra = std::mem::take(&mut self.bgra);
+        bgra.resize(needed_bytes, 0);
 
         unsafe {
             let src_ptr = mapped.pData as *const u8;
@@ -281,6 +325,12 @@ impl ScreenCapturer for DxgiCapturer {
             height,
             bgra,
         }))
+    }
+
+    fn recycle_buffer(&mut self, bgra: Vec<u8>) {
+        if bgra.capacity() >= self.bgra.capacity() {
+            self.bgra = bgra;
+        }
     }
 
     fn dimensions(&self) -> MonitorGeometry {

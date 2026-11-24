@@ -10,11 +10,131 @@ use randydesk_proto::{
     generate_nonce, read_msg, verify_proof, write_msg, ClientMsg, HostMsg, StreamSettings,
     PROTOCOL_VERSION,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
+
+/// Slot de último cuadro sin cola FIFO para evitar lag acumulado y preservar keyframes pendientes.
+pub(crate) struct LatestFrameSlot {
+    pending: Mutex<Option<HostMsg>>,
+    closed: AtomicBool,
+    notify: Notify,
+}
+
+impl LatestFrameSlot {
+    /// Crea un nuevo slot vacío abierto para entrega de cuadros.
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Inserta el cuadro más reciente; devuelve `false` si el slot ya fue cerrado.
+    ///
+    /// Si había un cuadro pendiente sin enviar, combina los tiles (prevaleciendo los nuevos)
+    /// y preserva `full_refresh = true` cuando el cuadro reemplazado era un keyframe.
+    pub(crate) fn push(&self, mut msg: HostMsg) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+        {
+            let mut guard = match self.pending.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if self.closed.load(Ordering::Acquire) {
+                return false;
+            }
+            if let Some(prev) = guard.take() {
+                merge_video_frames(prev, &mut msg);
+            }
+            *guard = Some(msg);
+        }
+        self.notify.notify_one();
+        true
+    }
+
+    /// Espera y extrae el cuadro más reciente, o devuelve `None` si el slot cerró sin pendientes.
+    pub(crate) async fn recv(&self) -> Option<HostMsg> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(msg) = self.take_pending() {
+                return Some(msg);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            notified.await;
+        }
+    }
+
+    /// Marca el slot como cerrado, limpia cualquier cuadro pendiente y despierta al receptor.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.pending.lock() {
+            *guard = None;
+        }
+        self.notify.notify_one();
+        self.notify.notify_waiters();
+    }
+
+    fn take_pending(&self) -> Option<HostMsg> {
+        let mut guard = match self.pending.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.take()
+    }
+}
+
+fn merge_video_frames(prev: HostMsg, next: &mut HostMsg) {
+    let HostMsg::VideoFrame {
+        width: prev_w,
+        height: prev_h,
+        full_refresh: prev_full,
+        tiles: prev_tiles,
+        ..
+    } = prev
+    else {
+        return;
+    };
+
+    let HostMsg::VideoFrame {
+        width: next_w,
+        height: next_h,
+        full_refresh: next_full,
+        tiles: next_tiles,
+        ..
+    } = next
+    else {
+        return;
+    };
+
+    let next_was_full = *next_full;
+    if prev_full {
+        *next_full = true;
+    }
+
+    if prev_w != *next_w || prev_h != *next_h || next_was_full {
+        return;
+    }
+
+    let mut merged = HashMap::with_capacity(prev_tiles.len() + next_tiles.len());
+    for tile in prev_tiles {
+        merged.insert((tile.x, tile.y), tile);
+    }
+    for tile in std::mem::take(next_tiles) {
+        merged.insert((tile.x, tile.y), tile);
+    }
+    let mut out: Vec<_> = merged.into_values().collect();
+    out.sort_unstable_by_key(|t| (t.y, t.x));
+    *next_tiles = out;
+}
 
 /// Fábrica de capturadores de pantalla inyectable para producción o pruebas.
 pub type CapturerFactory = Arc<dyn Fn() -> Result<Box<dyn ScreenCapturer>> + Send + Sync>;
@@ -157,14 +277,14 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
     let shared_settings = Arc::new(Mutex::new(cfg.default_settings));
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let (frame_tx, mut frame_rx) = mpsc::channel::<HostMsg>(2);
+    let frame_slot = Arc::new(LatestFrameSlot::new());
 
     let capture_thread = spawn_capture_worker(
         capturer,
         Arc::clone(&shared_settings),
         Arc::clone(&force_keyframe),
         Arc::clone(&stop_flag),
-        frame_tx,
+        Arc::clone(&frame_slot),
     );
 
     let session_res = run_session_loops(
@@ -172,7 +292,7 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
         &mut ctrl_send,
         &mut ctrl_recv,
         &mut video_send,
-        &mut frame_rx,
+        &frame_slot,
         monitor,
         &shared_settings,
         &force_keyframe,
@@ -180,6 +300,7 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
     .await;
 
     stop_flag.store(true, Ordering::Relaxed);
+    frame_slot.close();
     let _ = capture_thread.join();
     session_res
 }
@@ -190,7 +311,7 @@ async fn run_session_loops(
     ctrl_send: &mut quinn::SendStream,
     ctrl_recv: &mut quinn::RecvStream,
     video_send: &mut quinn::SendStream,
-    frame_rx: &mut mpsc::Receiver<HostMsg>,
+    frame_slot: &LatestFrameSlot,
     monitor: MonitorGeometry,
     shared_settings: &Arc<Mutex<StreamSettings>>,
     force_keyframe: &Arc<AtomicBool>,
@@ -236,7 +357,7 @@ async fn run_session_loops(
                     }
                 }
             }
-            maybe_frame = frame_rx.recv() => {
+            maybe_frame = frame_slot.recv() => {
                 match maybe_frame {
                     Some(frame_msg) => {
                         write_msg(video_send, &frame_msg).await?;
@@ -250,14 +371,23 @@ async fn run_session_loops(
     }
 }
 
+struct SlotCloseGuard(Arc<LatestFrameSlot>);
+
+impl Drop for SlotCloseGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 pub(crate) fn spawn_capture_worker(
     mut capturer: Box<dyn ScreenCapturer>,
     shared_settings: Arc<Mutex<StreamSettings>>,
     force_keyframe: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
-    frame_tx: mpsc::Sender<HostMsg>,
+    frame_slot: Arc<LatestFrameSlot>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        let _slot_guard = SlotCloseGuard(Arc::clone(&frame_slot));
         let mut encoder = TileEncoder::new();
         let mut last_awake = Instant::now() - Duration::from_secs(60);
         while !stop_flag.load(Ordering::Relaxed) {
@@ -279,21 +409,14 @@ pub(crate) fn spawn_capture_worker(
                     let keyframe = force_keyframe.swap(false, Ordering::Relaxed);
                     match encoder.encode(&captured, settings, keyframe) {
                         Ok(Some(msg)) => {
-                            if let Err(err) = frame_tx.try_send(msg) {
-                                match err {
-                                    mpsc::error::TrySendError::Full(_) => {
-                                        // Backpressure: si se descartó un keyframe, reintentar en el próximo cuadro.
-                                        if keyframe {
-                                            force_keyframe.store(true, Ordering::Relaxed);
-                                        }
-                                    }
-                                    mpsc::error::TrySendError::Closed(_) => break,
-                                }
+                            if !frame_slot.push(msg) {
+                                break;
                             }
                         }
                         Ok(None) => {}
                         Err(err) => error!("Error codificando frame: {err:#}"),
                     }
+                    capturer.recycle_buffer(captured.bgra);
                 }
                 Ok(None) => {
                     // Si el cliente pidió keyframe con pantalla estática, forzamos esperar o invalidar.
@@ -313,4 +436,80 @@ pub(crate) fn spawn_capture_worker(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use randydesk_proto::{CodecKind, EncodedTile};
+
+    fn make_frame(frame_id: u64, full_refresh: bool, coords: &[(u32, u32, u8)]) -> HostMsg {
+        HostMsg::VideoFrame {
+            frame_id,
+            width: 256,
+            height: 256,
+            full_refresh,
+            tiles: coords
+                .iter()
+                .map(|&(x, y, val)| EncodedTile {
+                    x,
+                    y,
+                    width: 128,
+                    height: 128,
+                    codec: CodecKind::Jpeg,
+                    data: vec![val],
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_frame_slot_drops_lag_preserves_keyframe_and_merges_tiles() {
+        let slot = LatestFrameSlot::new();
+
+        // Keyframe inicial con 2 tiles pendiente, sobrescrito por delta antes de ser consumido
+        assert!(slot.push(make_frame(1, true, &[(0, 0, 1), (128, 0, 2)])));
+        assert!(slot.push(make_frame(2, false, &[(128, 0, 20), (0, 128, 3)])));
+
+        let msg = slot.recv().await.expect("debe entregar frame fusionado");
+        match msg {
+            HostMsg::VideoFrame {
+                frame_id,
+                full_refresh,
+                tiles,
+                ..
+            } => {
+                assert_eq!(frame_id, 2);
+                assert!(full_refresh, "debe preservar full_refresh del keyframe sobrescrito");
+                assert_eq!(tiles.len(), 3);
+                assert_eq!(tiles[0].data, vec![1]);
+                assert_eq!(tiles[1].data, vec![20]);
+                assert_eq!(tiles[2].data, vec![3]);
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+
+        // Un nuevo full_refresh reemplaza por completo un delta previo
+        assert!(slot.push(make_frame(3, false, &[(0, 0, 5)])));
+        assert!(slot.push(make_frame(4, true, &[(128, 128, 9)])));
+        let msg2 = slot.recv().await.expect("debe entregar frame 4");
+        match msg2 {
+            HostMsg::VideoFrame {
+                frame_id,
+                full_refresh,
+                tiles,
+                ..
+            } => {
+                assert_eq!(frame_id, 4);
+                assert!(full_refresh);
+                assert_eq!(tiles.len(), 1);
+                assert_eq!(tiles[0].data, vec![9]);
+            }
+            other => panic!("mensaje inesperado: {other:?}"),
+        }
+
+        slot.close();
+        assert!(!slot.push(make_frame(5, false, &[(0, 0, 1)])));
+        assert!(slot.recv().await.is_none());
+    }
 }

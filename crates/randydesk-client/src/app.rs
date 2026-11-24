@@ -113,7 +113,7 @@ impl RandyDeskApp {
             active_tab: HostTab::Recent,
             search_query: String::new(),
             codec_input: CodecKind::Jpeg,
-            quality_input: 85,
+            quality_input: 72,
             fps_input: 30,
             ui_notice: None,
             last_attempt: None,
@@ -297,19 +297,22 @@ impl RandyDeskApp {
 impl eframe::App for RandyDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 1. Gestión de minimizar / restaurar desde la bandeja del sistema
-        if self.tray.as_ref().is_some_and(|t| t.take_restore_requested()) {
-            self.hidden_to_tray = false;
-            self.restored_at = Instant::now();
-            self.net.send_cmd(NetCommand::RequestKeyframe);
-        } else if !self.hidden_to_tray
-            && self.tray.is_some()
-            && self.restored_at.elapsed() >= Duration::from_millis(450)
-            && ctx.input(|i| i.viewport().minimized == Some(true))
-        {
-            self.hidden_to_tray = true;
-            self.release_remote_modifiers();
-            self.kb_hook.set_capture(false, None);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if let Some(tray) = self.tray.as_ref() {
+            if tray.take_restore_requested() {
+                self.hidden_to_tray = false;
+                self.restored_at = Instant::now();
+                self.net.send_cmd(NetCommand::RequestKeyframe);
+            } else if !self.hidden_to_tray {
+                tray.cache_main_hwnd();
+                if self.restored_at.elapsed() >= Duration::from_millis(450)
+                    && tray.is_window_minimized()
+                    && tray.hide_to_tray()
+                {
+                    self.hidden_to_tray = true;
+                    self.release_remote_modifiers();
+                    self.kb_hook.set_capture(false, None);
+                }
+            }
         }
 
         // 2. Lectura del estado compartido de red
@@ -932,15 +935,31 @@ impl RandyDeskApp {
 
                 ui.separator();
                 let mut changed = false;
+                let is_fast = self.codec_input == CodecKind::Jpeg && self.quality_input <= 58;
+                let is_balanced = self.codec_input == CodecKind::Jpeg && self.quality_input > 58;
                 if ui
-                    .selectable_label(self.codec_input == CodecKind::Jpeg, "JPEG")
+                    .selectable_label(is_fast, "Rápido")
+                    .on_hover_text("JPEG 52%, 30 FPS — menor latencia en redes lentas")
                     .clicked()
                 {
                     self.codec_input = CodecKind::Jpeg;
+                    self.quality_input = 52;
+                    self.fps_input = 30;
+                    changed = true;
+                }
+                if ui
+                    .selectable_label(is_balanced, "Equilibrado")
+                    .on_hover_text("JPEG 72%, 30 FPS — balance recomendado")
+                    .clicked()
+                {
+                    self.codec_input = CodecKind::Jpeg;
+                    self.quality_input = 72;
+                    self.fps_input = 30;
                     changed = true;
                 }
                 if ui
                     .selectable_label(self.codec_input == CodecKind::Lz4Rgba, "Nítido")
+                    .on_hover_text("LZ4 sin pérdida — máxima nitidez para texto y código")
                     .clicked()
                 {
                     self.codec_input = CodecKind::Lz4Rgba;
@@ -949,6 +968,7 @@ impl RandyDeskApp {
                 if self.codec_input == CodecKind::Jpeg
                     && ui
                         .add(egui::Slider::new(&mut self.quality_input, 35..=95).show_value(false))
+                        .on_hover_text(format!("Calidad JPEG: {}%", self.quality_input))
                         .changed()
                 {
                     changed = true;

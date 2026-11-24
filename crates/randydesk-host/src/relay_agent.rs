@@ -2,7 +2,7 @@
 
 use crate::clipboard;
 use crate::input;
-use crate::session::{spawn_capture_worker, HostServerConfig};
+use crate::session::{spawn_capture_worker, HostServerConfig, LatestFrameSlot};
 use anyhow::{anyhow, Context, Result};
 use directories::ProjectDirs;
 use futures_util::{SinkExt, StreamExt};
@@ -221,7 +221,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     let shared_settings = Arc::new(Mutex::new(cfg.default_settings));
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let stop_capture = Arc::new(AtomicBool::new(false));
-    let (frame_tx, mut frame_rx) = mpsc::channel::<HostMsg>(2);
+    let frame_slot = Arc::new(LatestFrameSlot::new());
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<OutboundItem>(64);
 
     let capture_thread = spawn_capture_worker(
@@ -229,11 +229,12 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
         Arc::clone(&shared_settings),
         Arc::clone(&force_keyframe),
         Arc::clone(&stop_capture),
-        frame_tx,
+        Arc::clone(&frame_slot),
     );
 
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (mut enc, mut dec) = cipher.split();
+    let writer_slot = Arc::clone(&frame_slot);
 
     let writer_task = tokio::spawn(async move {
         loop {
@@ -258,7 +259,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
                         }
                     }
                 }
-                maybe_frame = frame_rx.recv() => {
+                maybe_frame = writer_slot.recv() => {
                     match maybe_frame {
                         Some(frame_msg) => {
                             let Ok(bytes) = enc.encrypt_msg(&frame_msg) else { break; };
@@ -313,6 +314,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     };
 
     stop_capture.store(true, Ordering::Relaxed);
+    frame_slot.close();
     writer_task.abort();
     let _ = capture_thread.join();
     session_res

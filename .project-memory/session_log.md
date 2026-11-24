@@ -1,5 +1,22 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-24 — RandyDesk v0.4.4: Fluidez de video/red, fix bandeja Win32, hook dinámico y perfiles rápidos
+- **Resumen técnico:**
+  - Versión subida a `0.4.4` en `Cargo.toml` (y `Cargo.lock`).
+  - `crates/randydesk-host/src/encoder.rs`: codificación paralela de tiles modificados con `std::thread::scope`, submuestreo JPEG `4:2:0` (`SamplingFactor::F_2_2`) cuando `quality < 85` y `4:4:4` (`R_4_4_4`) cuando `quality >= 85`, más calidad adaptativa en movimiento (`>35%` de tiles modificados reduce temporalmente `-16` con piso `42` y refresco nítido al cesar el movimiento).
+  - `crates/randydesk-host/src/capture.rs`: reutilización de buffer `bgra: Vec<u8>` vía `recycle_buffer` y drenaje de hasta 8 cuadros acumulados DXGI (`AcquireNextFrame(0)`) cerrando cada `DxgiFrameGuard` entre llamadas.
+  - `crates/randydesk-host/src/session.rs` y `relay_agent.rs`: reemplazo de `mpsc::channel(2)` por `Arc<LatestFrameSlot>` compartido para enviar siempre el cuadro más fresco sin lag acumulado, fusionando tiles y preservando `full_refresh` en keyframes pendientes.
+  - `crates/randydesk-client/src/tray.rs` y `app.rs`: localizado y cacheado de `HWND` principal con `EnumWindows`, detección de minimizado con `IsIconic` + guarda `>= 450 ms`, ocultamiento directo con `ShowWindow(SW_HIDE)` (eliminando `ViewportCommand::Visible(false)` que congelaba `eframe/winit`) y restauración directa Win32 (`ShowWindow(SW_RESTORE)` + `SetForegroundWindow`).
+  - `crates/randydesk-client/src/win_hook.rs`: ciclo dinámico de `WH_KEYBOARD_LL` en `set_capture()` estilo RustDesk (`windows.cc`) sin instalar hook al arranque, y registro de `VK_LWIN`/`VK_RWIN` en `input_debug.log`.
+  - `crates/randydesk-proto/src/message.rs` y `crates/randydesk-client/src/app.rs`: calidad por defecto `72` (`StreamSettings::default` y `quality_input`) y 3 perfiles rápidos en la barra de sesión: `Rápido` (JPEG 52, 30 FPS), `Equilibrado` (JPEG 72, 30 FPS) y `Nítido` (LZ4 sin pérdida), conservando el slider JPEG.
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 33 pruebas aprobadas (14 en `randydesk-client`, 9 unit + 1 `quic_loopback` en `randydesk-host`, 8 en `randydesk-proto`, 1 `relay_e2e` en `randydesk-relay`).
+  - `cargo build --workspace --release`: generado `target\release\RandyDesk.exe` (`11,263,488` bytes) y `target\release\randydesk-relay.exe` (`2,766,336` bytes, copiado a `dist\`). `dist\RandyDesk.exe` (`11,174,400` bytes) no se sobreescribió porque `RandyDesk.exe` (PID `6060`) seguía en ejecución.
+  - Publicado commit en `main` y Release `v0.4.4` en `Flavio6931/randydesk`.
+- **Pendiente de verificación en vivo:**
+  - Cerrar `RandyDesk.exe` (PID `6060`), copiar `target\release\RandyDesk.exe` a `dist\`, actualizar ambas PCs a `v0.4.4` y validar restauración desde bandeja, fluidez/perfiles y `VK_LWIN`/`VK_RWIN`.
+
 ## 2026-11-24 — RandyDesk v0.4.3: Teclado híbrido estilo RustDesk (`egui` + hook solo sistema + `enigo` VK)
 - **Resumen técnico:**
   - Versión subida a `0.4.3` en `Cargo.toml`.
