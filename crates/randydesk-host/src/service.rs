@@ -25,6 +25,8 @@ pub struct HostRuntimeInfo {
     pub relay_connected: bool,
     pub fingerprint_sha256: String,
     pub active_clients: usize,
+    pub is_elevated: bool,
+    pub uipi_warning: bool,
 }
 
 /// Controlador activo del servidor QUIC y del agente Relay del host embebido.
@@ -118,6 +120,8 @@ impl HostService {
             relay_connected: !self.stopped && self.relay_connected.load(Ordering::Relaxed),
             fingerprint_sha256: self.fingerprint_sha256.clone(),
             active_clients: self.active_clients.load(Ordering::Relaxed),
+            is_elevated: crate::input::is_process_elevated(),
+            uipi_warning: crate::input::uipi_block_detected(),
         }
     }
 

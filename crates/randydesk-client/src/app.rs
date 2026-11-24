@@ -79,6 +79,7 @@ pub struct RandyDeskApp {
     screen_texture: Option<egui::TextureHandle>,
     fullscreen: bool,
     keyboard_grab_enabled: bool,
+    was_foreground: bool,
     active_target_address: Option<String>,
     recorded_recent_for_session: bool,
     last_error_handled: Option<String>,
@@ -122,6 +123,7 @@ impl RandyDeskApp {
             screen_texture: None,
             fullscreen: false,
             keyboard_grab_enabled: true,
+            was_foreground: false,
             active_target_address: None,
             recorded_recent_for_session: false,
             last_error_handled: None,
@@ -919,10 +921,12 @@ impl RandyDeskApp {
                 }
 
                 ui.separator();
-                let kb_label = if self.keyboard_grab_enabled {
+                let kb_label = if !self.keyboard_grab_enabled {
+                    egui::RichText::new("Teclado: OFF").color(TEXT_MUTED)
+                } else if self.kb_hook.is_installed() {
                     egui::RichText::new("Teclado: ON").color(ACCENT_TEAL)
                 } else {
-                    egui::RichText::new("Teclado: OFF").color(TEXT_MUTED)
+                    egui::RichText::new("Teclado: Fallback").color(STATUS_ORANGE)
                 };
                 if ui
                     .button(kb_label)
@@ -941,13 +945,13 @@ impl RandyDeskApp {
                 {
                     self.net.send_input(InputEvent::Key {
                         vk: 0x5B,
-                        scan: 0,
+                        scan: 0x5B,
                         extended: true,
                         down: true,
                     });
                     self.net.send_input(InputEvent::Key {
                         vk: 0x5B,
-                        scan: 0,
+                        scan: 0x5B,
                         extended: true,
                         down: false,
                     });
@@ -1018,10 +1022,14 @@ impl RandyDeskApp {
                 );
 
                 let pointer_in_canvas = response.hovered() || response.dragged();
-                let should_capture_kb = reconnecting.is_none()
-                    && self.keyboard_grab_enabled
-                    && !self.hidden_to_tray
-                    && KeyboardHookGuard::is_window_foreground();
+                let is_fg = KeyboardHookGuard::is_window_foreground();
+                let should_capture_kb =
+                    reconnecting.is_none() && self.keyboard_grab_enabled && !self.hidden_to_tray;
+                if self.was_foreground && !is_fg && should_capture_kb {
+                    self.kb_hook.release_modifiers_now();
+                }
+                self.was_foreground = is_fg;
+
                 self.kb_hook.set_capture(
                     should_capture_kb,
                     if should_capture_kb {

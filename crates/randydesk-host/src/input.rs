@@ -1,22 +1,73 @@
-//! Inyección de eventos de ratón y teclado en Windows mediante `SendInput`.
+//! Inyección de eventos de ratón y teclado en Windows mediante `SendInput` (estilo RustDesk: scancodes + desktop activo).
 
 use crate::capture::MonitorGeometry;
+use anyhow::{anyhow, Result};
 use randydesk_proto::{InputEvent, MouseButton};
+use std::ffi::c_void;
 use std::mem::size_of;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    MAPVK_VK_TO_VSC, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    VIRTUAL_KEY,
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::OnceLock;
+use tracing::warn;
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, HANDLE, HWND};
+use windows::Win32::Security::{
+    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop,
+    SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThreadId, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyboardLayout, MapVirtualKeyExW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+    KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC_EX, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+    MOUSEEVENTF_WHEEL, VIRTUAL_KEY,
+};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNORMAL,
 };
 
-/// Inyecta un evento remoto de ratón o teclado sobre la geometría del monitor capturado.
+/// Identificador `dwExtraInfo` usado en `SendInput` para distinguir eventos propios inyectados por RandyDesk.
+pub const RANDYDESK_INPUT_EXTRA_INFO: usize = 0x5244_4B01;
+
+const VK_PACKET_U16: u16 = 0x00E7;
+const DESKTOP_SWITCH_ACCESS: u32 = 0x01FF;
+
+static UIPI_BLOCK_DETECTED: AtomicBool = AtomicBool::new(false);
+static INPUT_WORKER_TX: OnceLock<SyncSender<(InputEvent, MonitorGeometry)>> = OnceLock::new();
+
+fn input_worker_sender() -> &'static SyncSender<(InputEvent, MonitorGeometry)> {
+    INPUT_WORKER_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<(InputEvent, MonitorGeometry)>(512);
+        std::thread::Builder::new()
+            .name("randydesk-input-injector".into())
+            .spawn(move || {
+                while let Ok((ev, monitor)) = rx.recv() {
+                    ensure_input_desktop();
+                    inject_input_on_current_thread(&ev, monitor);
+                }
+            })
+            .expect("spawn input injector thread");
+        tx
+    })
+}
+
+/// Encola un evento remoto para inyectarlo en orden FIFO desde el hilo dedicado ligado al Input Desktop activo.
 pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
+    let _ = input_worker_sender().try_send((event.clone(), monitor));
+}
+
+/// Ejecuta la inyección `SendInput` directamente sobre el hilo actual.
+fn inject_input_on_current_thread(event: &InputEvent, monitor: MonitorGeometry) {
     match *event {
         InputEvent::MouseMove { x_norm, y_norm } => {
             let (abs_x, abs_y) = map_normalized_to_virtual_desk(x_norm, y_norm, monitor);
@@ -26,7 +77,7 @@ pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
                 mouseData: 0,
                 dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
             });
         }
         InputEvent::MouseButton { button, down } => {
@@ -44,7 +95,7 @@ pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
                 mouseData: 0,
                 dwFlags: flag,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
             });
         }
         InputEvent::MouseWheel { delta_x, delta_y } => {
@@ -55,7 +106,7 @@ pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
                     mouseData: (delta_y as i32) as u32,
                     dwFlags: MOUSEEVENTF_WHEEL,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
                 });
             }
             if delta_x != 0 {
@@ -65,7 +116,7 @@ pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
                     mouseData: (delta_x as i32) as u32,
                     dwFlags: MOUSEEVENTF_HWHEEL,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
                 });
             }
         }
@@ -75,19 +126,13 @@ pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
             extended,
             down,
         } => {
-            let resolved_scan = if scan == 0 {
-                unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 }
+            let resolved_scan_ex = if scan == 0 && vk != VK_PACKET_U16 {
+                resolve_vk_to_vsc_ex(vk)
             } else {
-                scan
+                0
             };
-            let flags = build_key_flags(vk, extended, down);
-            send_keyboard(KEYBDINPUT {
-                wVk: VIRTUAL_KEY(vk),
-                wScan: resolved_scan,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            });
+            let ki = build_keybd_input(vk, scan, extended, down, resolved_scan_ex);
+            send_keyboard(ki);
         }
         InputEvent::UnicodeChar { ch, down } => {
             let mut buf = [0u16; 2];
@@ -101,23 +146,218 @@ pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
                     wScan: code_unit,
                     dwFlags: flags,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
                 });
             }
         }
     }
 }
 
-/// Construye las banderas `KEYBD_EVENT_FLAGS`, forzando `KEYEVENTF_EXTENDEDKEY` en `Win` izquierda/derecha.
-fn build_key_flags(vk: u16, extended: bool, down: bool) -> KEYBD_EVENT_FLAGS {
-    let mut flags = KEYBD_EVENT_FLAGS(0);
-    if extended || matches!(vk, 0x5B | 0x5C) {
-        flags |= KEYEVENTF_EXTENDEDKEY;
+/// Resuelve un Virtual-Key a scan code usando el `HKL` real de la ventana activa en primer plano.
+fn resolve_vk_to_vsc_ex(vk: u16) -> u32 {
+    unsafe {
+        let fg_tid = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let layout = GetKeyboardLayout(fg_tid);
+        MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, layout)
     }
-    if !down {
-        flags |= KEYEVENTF_KEYUP;
+}
+
+/// Indica si un Virtual-Key corresponde a tecla extendida Win32 (`Win`, navegación, `Insert`/`Delete`, `RControl`, `RAlt`, `Numpad/`).
+fn is_extended_vk(vk: u16) -> bool {
+    matches!(
+        vk,
+        0x21..=0x28 | 0x2D | 0x2E | 0x5B..=0x5D | 0xA3 | 0xA5 | 0x6F
+    )
+}
+
+/// Construye `KEYBDINPUT` en modo scan code (`KEYEVENTF_SCANCODE` + `wVk = 0`, estilo RustDesk) con fallback a VK/Unicode.
+pub(crate) fn build_keybd_input(
+    vk: u16,
+    scan: u16,
+    extended: bool,
+    down: bool,
+    resolved_scan_ex: u32,
+) -> KEYBDINPUT {
+    if vk == VK_PACKET_U16 {
+        let mut flags = KEYEVENTF_UNICODE;
+        if !down {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        return KEYBDINPUT {
+            wVk: VIRTUAL_KEY(0),
+            wScan: scan,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
+        };
     }
-    flags
+
+    let (raw_scan, is_extended) = if scan != 0 {
+        let raw = scan & 0x00FF;
+        let prefix = (scan >> 8) & 0x00FF;
+        let ext = if raw == 0x36 {
+            false
+        } else {
+            extended || prefix == 0xE0 || prefix == 0xE1 || is_extended_vk(vk)
+        };
+        (raw, ext)
+    } else {
+        let raw = (resolved_scan_ex & 0x00FF) as u16;
+        let prefix = (resolved_scan_ex >> 8) & 0x00FF;
+        let ext = if raw == 0x36 {
+            false
+        } else {
+            extended || prefix == 0xE0 || prefix == 0xE1 || is_extended_vk(vk)
+        };
+        (raw, ext)
+    };
+
+    if raw_scan != 0 {
+        let mut flags = KEYEVENTF_SCANCODE;
+        if is_extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if !down {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        KEYBDINPUT {
+            wVk: VIRTUAL_KEY(0),
+            wScan: raw_scan,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
+        }
+    } else {
+        let mut flags = KEYBD_EVENT_FLAGS(0);
+        if is_extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if !down {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        KEYBDINPUT {
+            wVk: VIRTUAL_KEY(vk),
+            wScan: 0,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
+        }
+    }
+}
+
+/// Adjunta el hilo dedicado al escritorio de entrada activo de Windows (`Default`, `Winlogon`, etc.) como hace RustDesk.
+fn ensure_input_desktop() {
+    unsafe {
+        let Ok(input_desk) = OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(DESKTOP_SWITCH_ACCESS),
+        ) else {
+            return;
+        };
+        let Ok(current_desk) = GetThreadDesktop(GetCurrentThreadId()) else {
+            let _ = CloseDesktop(input_desk);
+            return;
+        };
+
+        let same = desktop_name(current_desk) == desktop_name(input_desk);
+        if !same && SetThreadDesktop(input_desk).is_ok() {
+            let _ = CloseDesktop(current_desk);
+            return;
+        }
+        let _ = CloseDesktop(input_desk);
+    }
+}
+
+unsafe fn desktop_name(desk: HDESK) -> Option<Vec<u16>> {
+    let mut buf = [0u16; 128];
+    let mut needed = 0u32;
+    GetUserObjectInformationW(
+        HANDLE(desk.0),
+        UOI_NAME,
+        Some(buf.as_mut_ptr() as *mut c_void),
+        (buf.len() * size_of::<u16>()) as u32,
+        Some(&mut needed),
+    )
+    .ok()?;
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(buf[..len].to_vec())
+}
+
+/// Indica si el proceso actual de RandyDesk está ejecutándose con privilegios de Administrador (elevado).
+pub fn is_process_elevated() -> bool {
+    unsafe { is_handle_elevated(GetCurrentProcess()).unwrap_or(false) }
+}
+
+/// Indica si la ventana activa en primer plano pertenece a un proceso elevado.
+pub fn is_foreground_window_elevated() -> bool {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return false;
+        }
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(proc_handle) => {
+                let res = is_handle_elevated(proc_handle).unwrap_or(false);
+                let _ = CloseHandle(proc_handle);
+                res
+            }
+            Err(err) => err.code() == ERROR_ACCESS_DENIED.to_hresult() && !is_process_elevated(),
+        }
+    }
+}
+
+unsafe fn is_handle_elevated(proc_handle: HANDLE) -> Option<bool> {
+    let mut token = HANDLE::default();
+    OpenProcessToken(proc_handle, TOKEN_QUERY, &mut token).ok()?;
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut ret_len = 0u32;
+    let res = GetTokenInformation(
+        token,
+        TokenElevation,
+        Some(&mut elevation as *mut _ as *mut c_void),
+        size_of::<TOKEN_ELEVATION>() as u32,
+        &mut ret_len,
+    );
+    let _ = CloseHandle(token);
+    res.ok()?;
+    Some(elevation.TokenIsElevated != 0)
+}
+
+/// Indica si se detectó un bloqueo UIPI reciente (ventana remota elevada con RandyDesk sin elevar).
+pub fn uipi_block_detected() -> bool {
+    if is_process_elevated() {
+        return false;
+    }
+    UIPI_BLOCK_DETECTED.load(Ordering::Relaxed)
+}
+
+/// Relanza el ejecutable actual solicitando elevación UAC ("Ejecutar como Administrador").
+pub fn relaunch_as_admin() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let exe_wide = HSTRING::from(exe.as_os_str());
+    let ret = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            w!("runas"),
+            PCWSTR::from_raw(exe_wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (ret.0 as isize) <= 32 {
+        return Err(anyhow!(
+            "No se completó la elevación a Administrador (código ShellExecute {})",
+            ret.0 as isize
+        ));
+    }
+    Ok(())
 }
 
 fn map_normalized_to_virtual_desk(
@@ -148,9 +388,7 @@ fn send_mouse(mi: MOUSEINPUT) {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi },
     };
-    unsafe {
-        let _ = SendInput(&[input], size_of::<INPUT>() as i32);
-    }
+    dispatch_input(input);
 }
 
 fn send_keyboard(ki: KEYBDINPUT) {
@@ -158,8 +396,19 @@ fn send_keyboard(ki: KEYBDINPUT) {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
     };
-    unsafe {
-        let _ = SendInput(&[input], size_of::<INPUT>() as i32);
+    dispatch_input(input);
+}
+
+fn dispatch_input(input: INPUT) {
+    let sent = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    if sent == 0 {
+        let err = unsafe { GetLastError() };
+        if !is_process_elevated() && is_foreground_window_elevated() {
+            UIPI_BLOCK_DETECTED.store(true, Ordering::Relaxed);
+        }
+        warn!("SendInput devolvió 0 (posible bloqueo UIPI): {err:?}");
+    } else if !is_process_elevated() && is_foreground_window_elevated() {
+        UIPI_BLOCK_DETECTED.store(true, Ordering::Relaxed);
     }
 }
 
@@ -168,16 +417,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn win_keys_always_include_extended_flag() {
-        let lwin_down = build_key_flags(0x5B, false, true);
-        assert!(lwin_down.contains(KEYEVENTF_EXTENDEDKEY));
-        assert!(!lwin_down.contains(KEYEVENTF_KEYUP));
+    fn win_keys_use_scancode_and_extended_flag() {
+        let lwin_down = build_keybd_input(0x5B, 0x5B, false, true, 0);
+        assert_eq!(lwin_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(lwin_down.wScan, 0x5B);
+        assert!(lwin_down.dwFlags.contains(KEYEVENTF_SCANCODE));
+        assert!(lwin_down.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(!lwin_down.dwFlags.contains(KEYEVENTF_KEYUP));
 
-        let rwin_up = build_key_flags(0x5C, false, false);
-        assert!(rwin_up.contains(KEYEVENTF_EXTENDEDKEY));
-        assert!(rwin_up.contains(KEYEVENTF_KEYUP));
+        let rwin_up = build_keybd_input(0x5C, 0, false, false, 0xE05C);
+        assert_eq!(rwin_up.wVk, VIRTUAL_KEY(0));
+        assert_eq!(rwin_up.wScan, 0x5C);
+        assert!(rwin_up.dwFlags.contains(KEYEVENTF_SCANCODE));
+        assert!(rwin_up.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(rwin_up.dwFlags.contains(KEYEVENTF_KEYUP));
+    }
 
-        let letter_a = build_key_flags(0x41, false, true);
-        assert_eq!(letter_a, KEYBD_EVENT_FLAGS(0));
+    #[test]
+    fn normal_key_and_rshift_and_unicode_follow_rustdesk_rules() {
+        let a_down = build_keybd_input(0x41, 0x1E, false, true, 0);
+        assert_eq!(a_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(a_down.wScan, 0x1E);
+        assert_eq!(a_down.dwFlags, KEYEVENTF_SCANCODE);
+
+        let rshift_down = build_keybd_input(0xA1, 0x36, true, true, 0);
+        assert_eq!(rshift_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(rshift_down.wScan, 0x36);
+        assert_eq!(rshift_down.dwFlags, KEYEVENTF_SCANCODE);
+
+        let packet = build_keybd_input(VK_PACKET_U16, 'á' as u16, false, true, 0);
+        assert_eq!(packet.wVk, VIRTUAL_KEY(0));
+        assert_eq!(packet.wScan, 'á' as u16);
+        assert_eq!(packet.dwFlags, KEYEVENTF_UNICODE);
+
+        let media_fallback = build_keybd_input(0xAF, 0, false, true, 0);
+        assert_eq!(media_fallback.wVk, VIRTUAL_KEY(0xAF));
+        assert_eq!(media_fallback.wScan, 0);
+        assert_eq!(media_fallback.dwFlags, KEYBD_EVENT_FLAGS(0));
     }
 }

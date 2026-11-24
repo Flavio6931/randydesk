@@ -247,6 +247,38 @@ impl HostPanelState {
                             .color(ACCENT_TEAL),
                     );
                 }
+
+                ui.add_space(6.0);
+                if i.is_elevated {
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 3.5, ACCENT_TEAL);
+                        ui.label(
+                            egui::RichText::new("Modo Administrador activo")
+                                .size(11.0)
+                                .color(ACCENT_TEAL),
+                        );
+                    });
+                } else {
+                    if i.uipi_warning {
+                        ui.label(
+                            egui::RichText::new("Ventana Admin detectada: eleva permisos para controlarla")
+                                .size(10.5)
+                                .color(STATUS_ORANGE),
+                        );
+                    }
+                    if ui
+                        .small_button("Ejecutar como Admin")
+                        .on_hover_text("Necesario si en esta PC controlas ventanas elevadas (SSMS, Terminal Admin, UAC)")
+                        .clicked()
+                    {
+                        match randydesk_host::input::relaunch_as_admin() {
+                            Ok(()) => std::process::exit(0),
+                            Err(err) => self.status_msg = Some(format!("{err}")),
+                        }
+                    }
+                }
             } else {
                 ui.label(egui::RichText::new("Detenido").size(18.0).color(TEXT_MUTED));
             }
