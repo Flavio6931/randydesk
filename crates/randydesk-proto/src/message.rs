@@ -27,7 +27,7 @@ impl Default for StreamSettings {
     fn default() -> Self {
         Self {
             codec: CodecKind::Jpeg,
-            jpeg_quality: 75,
+            jpeg_quality: 85,
             target_fps: 30,
         }
     }

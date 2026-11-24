@@ -26,7 +26,9 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tray-icon.workspace = true
 url.workspace = true
+windows.workspace = true
 zune-jpeg.workspace = true
 
 [dev-dependencies]

@@ -217,6 +217,67 @@ async fn relay_healthcheck_and_e2e_session_work_end_to_end() -> Result<()> {
 
     stop_flag.store(true, Ordering::Relaxed);
     host_task.abort();
+
+    // 5. Acceso directo sin contraseña cuando el host tiene password vacío ("")
+    let open_id = "111222333".to_string();
+    let open_connected = Arc::new(AtomicBool::new(false));
+    let open_stop = Arc::new(AtomicBool::new(false));
+    let open_cfg = HostServerConfig {
+        password: String::new(),
+        host_name: "PC-ABIERTA".to_string(),
+        default_settings: StreamSettings::default(),
+        capturer_factory: Arc::new(|| Ok(Box::new(MockCapturer { emitted: false }))),
+        active_clients: Arc::new(AtomicUsize::new(0)),
+    };
+    let open_task = tokio::spawn(run_relay_loop(
+        relay_ws.clone(),
+        open_id.clone(),
+        open_cfg,
+        Arc::clone(&open_connected),
+        Arc::clone(&open_stop),
+    ));
+    for _ in 0..40 {
+        if open_connected.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(open_connected.load(Ordering::Relaxed));
+
+    {
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("{relay_ws}/ws/client/{open_id}")).await?;
+        assert_eq!(ws.next().await.expect("ready")?, Message::Text("READY".to_string()));
+        let (c_sec, c_pub) = E2eKeypair::generate();
+        let h_pub: [u8; 32] = match ws.next().await.expect("h_pub")? {
+            Message::Binary(b) => b.try_into().expect("32 bytes"),
+            other => panic!("inesperado: {other:?}"),
+        };
+        ws.send(Message::Binary(c_pub.to_vec())).await?;
+        let mut cipher = E2eCipher::from_handshake(c_sec, h_pub, true);
+        ws.send(Message::Binary(
+            cipher.encrypt_msg(&ClientMsg::Hello {
+                version: PROTOCOL_VERSION,
+            })?,
+        ))
+        .await?;
+        let nonce = match next_e2e(&mut ws, &mut cipher).await? {
+            HostMsg::AuthChallenge { nonce, .. } => nonce,
+            other => panic!("inesperado: {other:?}"),
+        };
+        let empty_proof = compute_proof(&nonce, "");
+        ws.send(Message::Binary(
+            cipher.encrypt_msg(&ClientMsg::AuthResponse { proof: empty_proof })?,
+        ))
+        .await?;
+        let auth_res = next_e2e(&mut ws, &mut cipher).await?;
+        assert!(matches!(auth_res, HostMsg::AuthResult { ok: true, .. }));
+        ws.send(Message::Binary(cipher.encrypt_msg(&ClientMsg::Disconnect)?))
+            .await?;
+    }
+
+    open_stop.store(true, Ordering::Relaxed);
+    open_task.abort();
     relay_task.abort();
     Ok(())
 }

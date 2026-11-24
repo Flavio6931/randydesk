@@ -69,7 +69,7 @@ impl SavedHost {
             address: address.into(),
             fingerprint_sha256: None,
             codec: CodecKind::Jpeg,
-            quality: 75,
+            quality: 85,
             fps: 30,
             favorite: false,
             last_connected: 0,

@@ -1,4 +1,4 @@
-//! Punto de entrada unificado de RandyDesk (anfitrión + visor gráfico en un solo binario).
+//! Punto de entrada unificado de RandyDesk (bandeja del sistema + hook Win + Relay E2E).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -11,6 +11,8 @@ mod keymap;
 mod net;
 mod relay_client;
 mod theme;
+mod tray;
+mod win_hook;
 
 use anyhow::Result;
 use app::RandyDeskApp;
@@ -36,7 +38,8 @@ fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 740.0])
-            .with_min_inner_size([920.0, 580.0]),
+            .with_min_inner_size([920.0, 580.0])
+            .with_icon(tray::build_egui_icon()),
         ..Default::default()
     };
 

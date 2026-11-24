@@ -1,11 +1,11 @@
-//! Barra lateral minimalista estilo RustDesk ("Tu escritorio") con ID numérico y PIN completo.
+//! Barra lateral minimalista estilo RustDesk ("Tu escritorio") con acceso directo sin contraseña.
 
 use crate::config::display_address;
 use crate::theme::{ACCENT_BLUE, ACCENT_TEAL, STATUS_ORANGE, TEXT_MUTED};
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use randydesk_host::service::{HostRuntimeInfo, HostService};
-use randydesk_proto::{format_host_id, generate_session_pin, StreamSettings, DEFAULT_PORT};
+use randydesk_proto::{format_host_id, StreamSettings, DEFAULT_PORT};
 
 /// Estado del servidor host embebido dentro de la aplicación gráfica.
 pub struct HostPanelState {
@@ -15,18 +15,14 @@ pub struct HostPanelState {
     password: String,
     relay_url: Option<String>,
     editing_password: bool,
-    show_password: bool,
     monitor_index: usize,
     status_msg: Option<String>,
 }
 
 impl HostPanelState {
-    /// Crea el estado e inicia automáticamente la escucha LAN + registro en Relay si está configurado.
+    /// Crea el estado e inicia automáticamente la escucha LAN + registro Relay sin contraseña obligatoria.
     pub fn new(rt_handle: &tokio::runtime::Handle, relay_url: Option<String>) -> Self {
-        let initial_pwd = std::env::var("RANDYDESK_PASSWORD")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(generate_session_pin);
+        let initial_pwd = std::env::var("RANDYDESK_PASSWORD").unwrap_or_default();
 
         let mut state = Self {
             service: None,
@@ -35,7 +31,6 @@ impl HostPanelState {
             password: initial_pwd,
             relay_url,
             editing_password: false,
-            show_password: true,
             monitor_index: 0,
             status_msg: None,
         };
@@ -49,13 +44,9 @@ impl HostPanelState {
         self.start_host(rt_handle);
     }
 
-    /// Inicia o reinicia el servicio host con el puerto, contraseña y Relay actuales.
+    /// Inicia o reinicia el servicio host con el puerto, contraseña (opcional) y Relay actuales.
     pub fn start_host(&mut self, rt_handle: &tokio::runtime::Handle) {
         self.stop_host();
-        if self.password.trim().is_empty() {
-            self.status_msg = Some("La contraseña no puede estar vacía.".into());
-            return;
-        }
         match HostService::start(
             rt_handle,
             self.port,
@@ -92,7 +83,7 @@ impl HostPanelState {
         ui.add_space(10.0);
         ui.label(egui::RichText::new("Tu escritorio").size(16.0).strong());
         ui.label(
-            egui::RichText::new("Comparte este ID y contraseña para que accedan a tu PC.")
+            egui::RichText::new("Comparte este ID para que accedan directo a tu PC.")
                 .size(11.5)
                 .color(TEXT_MUTED),
         );
@@ -101,7 +92,7 @@ impl HostPanelState {
         let info = self.service.as_ref().map(|s| s.info());
         let is_running = info.as_ref().is_some_and(|i| i.running);
 
-        // Bloque 1: ID numérico (siempre visible y completo) con menú avanzado "..."
+        // Bloque único principal: Tu ID + menú avanzado "..."
         render_accent_block(ui, ACCENT_BLUE, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Tu ID").size(12.0).color(TEXT_MUTED));
@@ -142,6 +133,18 @@ impl HostPanelState {
                             );
                             ui.separator();
                         }
+
+                        if ui.button("Configurar contraseña opcional").clicked() {
+                            self.editing_password = !self.editing_password;
+                            ui.close_menu();
+                        }
+                        if !self.password.is_empty() && ui.button("Quitar contraseña").clicked() {
+                            self.password.clear();
+                            self.start_host(rt_handle);
+                            self.status_msg = Some("Acceso directo sin contraseña activado.".into());
+                            ui.close_menu();
+                        }
+                        ui.separator();
 
                         ui.horizontal(|ui| {
                             ui.label("Puerto LAN:");
@@ -189,7 +192,7 @@ impl HostPanelState {
                     copy_to_clipboard(&id_fmt, &mut self.status_msg, "ID copiado");
                 }
 
-                ui.add_space(2.0);
+                ui.add_space(4.0);
                 if i.relay_connected {
                     ui.label(
                         egui::RichText::new("● Listo en Internet (Relay)")
@@ -202,7 +205,9 @@ impl HostPanelState {
                             .size(11.0)
                             .color(STATUS_ORANGE),
                     );
-                } else if let Some(lan) = &i.lan_ip {
+                }
+
+                if let Some(lan) = &i.lan_ip {
                     let lan_txt = display_address(&format!("{lan}:{}", i.port));
                     let lan_resp = ui.add(
                         egui::Label::new(
@@ -216,92 +221,55 @@ impl HostPanelState {
                         copy_to_clipboard(&lan_txt, &mut self.status_msg, "IP local copiada");
                     }
                 }
+
+                ui.add_space(4.0);
+                if self.password.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Acceso directo sin contraseña")
+                            .size(11.0)
+                            .color(TEXT_MUTED),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Protegido con contraseña opcional")
+                            .size(11.0)
+                            .color(ACCENT_TEAL),
+                    );
+                }
             } else {
                 ui.label(egui::RichText::new("Detenido").size(18.0).color(TEXT_MUTED));
             }
         });
 
-        ui.add_space(18.0);
-
-        // Bloque 2: Contraseña de un solo uso (siempre visible al 100%, botones debajo)
-        render_accent_block(ui, ACCENT_TEAL, |ui| {
-            ui.label(
-                egui::RichText::new("Contraseña de acceso")
-                    .size(12.0)
-                    .color(TEXT_MUTED),
-            );
-
-            if self.editing_password {
-                ui.add_space(2.0);
+        if self.editing_password {
+            ui.add_space(14.0);
+            render_accent_block(ui, ACCENT_TEAL, |ui| {
+                ui.label(
+                    egui::RichText::new("Contraseña opcional")
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(4.0);
                 ui.add_sized(
                     [180.0, 26.0],
                     egui::TextEdit::singleline(&mut self.password),
                 );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.small_button("Guardar").clicked()
-                        || ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
+                    if ui.small_button("Guardar").clicked() {
                         self.start_host(rt_handle);
-                        if self.status_msg.is_none() {
-                            self.status_msg = Some("Contraseña aplicada.".into());
-                        }
+                        self.status_msg = Some(if self.password.is_empty() {
+                            "Acceso directo sin contraseña.".into()
+                        } else {
+                            "Contraseña opcional activada.".into()
+                        });
                     }
                     if ui.small_button("Cancelar").clicked() {
                         self.editing_password = false;
                     }
                 });
-            } else {
-                let shown = if self.show_password {
-                    self.password.clone()
-                } else {
-                    "••••••••".to_string()
-                };
-                let lbl = ui
-                    .add(
-                        egui::Label::new(
-                            egui::RichText::new(shown)
-                                .size(17.0)
-                                .monospace()
-                                .strong()
-                                .color(Color32::WHITE),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text("Clic para copiar contraseña");
-                if lbl.clicked() {
-                    copy_to_clipboard(&self.password, &mut self.status_msg, "Contraseña copiada");
-                }
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .small_button("Nuevo")
-                        .on_hover_text("Generar nuevo PIN aleatorio")
-                        .clicked()
-                    {
-                        self.password = generate_session_pin();
-                        self.start_host(rt_handle);
-                        self.status_msg = Some("Nuevo PIN generado.".into());
-                    }
-                    if ui
-                        .small_button("Editar")
-                        .on_hover_text("Fijar contraseña personalizada")
-                        .clicked()
-                    {
-                        self.editing_password = true;
-                    }
-                    let toggle_txt = if self.show_password {
-                        "Ocultar"
-                    } else {
-                        "Ver"
-                    };
-                    if ui.small_button(toggle_txt).clicked() {
-                        self.show_password = !self.show_password;
-                    }
-                });
-            }
-        });
+            });
+        }
 
         if let Some(msg) = &self.status_msg {
             ui.add_space(14.0);

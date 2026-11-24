@@ -9,7 +9,7 @@ pub use auth::{
     compute_proof, format_host_id, generate_host_id, generate_nonce, generate_session_pin,
     parse_numeric_id, verify_proof,
 };
-pub use e2e::{E2eCipher, E2eError, E2eKeypair};
+pub use e2e::{E2eCipher, E2eDecryptor, E2eEncryptor, E2eError, E2eKeypair};
 pub use framing::{read_msg, write_msg, FramingError};
 pub use message::{
     ClientMsg, CodecKind, EncodedTile, HostMsg, InputEvent, MouseButton, StreamSettings,

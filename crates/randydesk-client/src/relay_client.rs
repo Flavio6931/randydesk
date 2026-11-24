@@ -1,7 +1,9 @@
-//! Sesión remota de cliente a través del servidor Relay WebSocket con cifrado E2E.
+//! Sesión remota de cliente a través del servidor Relay E2E con `TCP_NODELAY` y `ws.split()`.
 
-use crate::decoder::FrameBuffer;
-use crate::net::{ConnectRequest, ConnectionState, NetCommand, SessionExit, SharedSessionState};
+use crate::decoder::decode_frame_update;
+use crate::net::{
+    push_frame_update, ConnectRequest, ConnectionState, NetCommand, SessionExit, SharedSessionState,
+};
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
@@ -14,6 +16,13 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::info;
 use url::Url;
+
+enum OutboundClientItem {
+    Client(ClientMsg),
+    Pong(Vec<u8>),
+    Ping,
+    Close,
+}
 
 /// Conecta con un host remoto identificado por `target_id` vía `relay_url` usando X25519 + ChaCha20.
 pub async fn run_relay_session(
@@ -29,7 +38,7 @@ pub async fn run_relay_session(
     let ws_endpoint = format!("{base}/ws/client/{target_id}");
     Url::parse(&ws_endpoint).with_context(|| format!("URL de Relay inválida: {ws_endpoint}"))?;
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_endpoint)
+    let (mut ws, _) = tokio_tungstenite::connect_async_with_config(&ws_endpoint, None, true)
         .await
         .with_context(|| format!("no se pudo conectar al servidor Relay ({base})"))?;
 
@@ -68,7 +77,7 @@ pub async fn run_relay_session(
     )
     .await?;
 
-    let (host_name, width, height, nonce) = match recv_e2e::<HostMsg>(&mut ws, &mut cipher).await? {
+    let (host_name, width, height, nonce) = match recv_e2e(&mut ws, &mut cipher).await? {
         HostMsg::AuthChallenge {
             version,
             nonce,
@@ -89,7 +98,7 @@ pub async fn run_relay_session(
     let proof = compute_proof(&nonce, &req.password);
     send_e2e(&mut ws, &mut cipher, &ClientMsg::AuthResponse { proof }).await?;
 
-    match recv_e2e::<HostMsg>(&mut ws, &mut cipher).await? {
+    match recv_e2e(&mut ws, &mut cipher).await? {
         HostMsg::AuthResult { ok: true, .. } => {}
         HostMsg::AuthResult {
             ok: false, reason, ..
@@ -113,45 +122,77 @@ pub async fn run_relay_session(
     ctx.request_repaint();
     info!("Sesión Relay E2E autenticada con ID {target_id}");
 
-    let mut fb = FrameBuffer::new();
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (mut enc, mut dec) = cipher.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<OutboundClientItem>(256);
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(item) = out_rx.recv().await {
+            match item {
+                OutboundClientItem::Client(msg) => {
+                    let Ok(bytes) = enc.encrypt_msg(&msg) else { break; };
+                    if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                OutboundClientItem::Pong(p) => {
+                    if ws_tx.send(Message::Pong(p)).await.is_err() {
+                        break;
+                    }
+                }
+                OutboundClientItem::Ping => {
+                    if ws_tx.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
+                OutboundClientItem::Close => {
+                    let _ = ws_tx.close().await;
+                    break;
+                }
+            }
+        }
+    });
+
     let mut ping_ticker = tokio::time::interval(Duration::from_secs(2));
     let mut ws_ping_ticker = tokio::time::interval(Duration::from_secs(20));
     let mut stat_window_start = Instant::now();
     let mut frames_in_window: u32 = 0;
     let mut bytes_in_window: usize = 0;
 
-    loop {
+    let session_res: Result<SessionExit> = loop {
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(NetCommand::Input(ev)) => {
-                        send_e2e(&mut ws, &mut cipher, &ClientMsg::Input(ev)).await?;
+                        if out_tx.send(OutboundClientItem::Client(ClientMsg::Input(ev))).await.is_err() {
+                            break Err(anyhow!("canal de envío Relay cerrado"));
+                        }
                     }
                     Some(NetCommand::UpdateSettings(settings)) => {
                         req.settings = settings;
-                        send_e2e(&mut ws, &mut cipher, &ClientMsg::UpdateSettings(settings)).await?;
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::UpdateSettings(settings))).await;
                     }
                     Some(NetCommand::RequestKeyframe) => {
-                        send_e2e(&mut ws, &mut cipher, &ClientMsg::RequestKeyframe).await?;
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::RequestKeyframe)).await;
                     }
                     Some(NetCommand::ClipboardSet(text)) => {
-                        send_e2e(&mut ws, &mut cipher, &ClientMsg::ClipboardSet(text)).await?;
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::ClipboardSet(text))).await;
                     }
                     Some(NetCommand::ClipboardGet) => {
-                        send_e2e(&mut ws, &mut cipher, &ClientMsg::ClipboardGet).await?;
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::ClipboardGet)).await;
                     }
                     Some(NetCommand::Disconnect) | None => {
-                        let _ = send_e2e(&mut ws, &mut cipher, &ClientMsg::Disconnect).await;
-                        let _ = ws.close(None).await;
-                        return Ok(SessionExit::UserRequested);
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::Disconnect)).await;
+                        let _ = out_tx.send(OutboundClientItem::Close).await;
+                        break Ok(SessionExit::UserRequested);
                     }
                 }
             }
-            incoming = ws.next() => {
+            incoming = ws_rx.next() => {
                 match incoming {
                     Some(Ok(Message::Binary(data))) => {
-                        let msg: HostMsg = cipher.decrypt_msg(&data)?;
+                        let msg: HostMsg = dec.decrypt_msg(&data)?;
                         match msg {
                             HostMsg::Pong(sent_ms) => {
                                 let now_ms = session_start.elapsed().as_millis() as u64;
@@ -172,13 +213,12 @@ pub async fn run_relay_session(
                                 if let HostMsg::VideoFrame { tiles, .. } = &video {
                                     bytes_in_window += tiles.iter().map(|t| t.data.len()).sum::<usize>();
                                 }
-                                let decoded = fb.apply_frame(&video)?;
+                                let update = decode_frame_update(&video)?;
                                 frames_in_window += 1;
 
                                 let elapsed_win = stat_window_start.elapsed().as_secs_f32();
                                 if let Ok(mut guard) = shared.lock() {
-                                    guard.latest_frame = Some(Arc::new(decoded));
-                                    guard.frame_seq += 1;
+                                    push_frame_update(&mut guard.pending_updates, update);
                                     guard.stats.elapsed_secs = session_start.elapsed().as_secs();
                                     if elapsed_win >= 1.0 {
                                         guard.stats.fps = frames_in_window as f32 / elapsed_win;
@@ -194,24 +234,27 @@ pub async fn run_relay_session(
                         }
                     }
                     Some(Ok(Message::Ping(p))) => {
-                        ws.send(Message::Pong(p)).await?;
+                        let _ = out_tx.try_send(OutboundClientItem::Pong(p));
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        return Err(anyhow!("sesión cerrada por el equipo remoto o Relay"));
+                        break Err(anyhow!("sesión cerrada por el equipo remoto o Relay"));
                     }
-                    Some(Err(err)) => return Err(anyhow!("error WS Relay cliente: {err}")),
+                    Some(Err(err)) => break Err(anyhow!("error WS Relay cliente: {err}")),
                     _ => {}
                 }
             }
             _ = ping_ticker.tick() => {
                 let now_ms = session_start.elapsed().as_millis() as u64;
-                send_e2e(&mut ws, &mut cipher, &ClientMsg::Ping(now_ms)).await?;
+                let _ = out_tx.try_send(OutboundClientItem::Client(ClientMsg::Ping(now_ms)));
             }
             _ = ws_ping_ticker.tick() => {
-                ws.send(Message::Ping(vec![])).await?;
+                let _ = out_tx.try_send(OutboundClientItem::Ping);
             }
         }
-    }
+    };
+
+    writer_task.abort();
+    session_res
 }
 
 async fn read_binary_32<S>(ws: &mut S) -> Result<[u8; 32]>
@@ -235,27 +278,23 @@ where
     Err(anyhow!("fin de stream durante handshake E2E"))
 }
 
-async fn send_e2e<S, T>(ws: &mut S, cipher: &mut E2eCipher, msg: &T) -> Result<()>
+async fn send_e2e<S>(ws: &mut S, cipher: &mut E2eCipher, msg: &ClientMsg) -> Result<()>
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-    T: serde::Serialize,
 {
     let encrypted = cipher.encrypt_msg(msg)?;
     ws.send(Message::Binary(encrypted)).await?;
     Ok(())
 }
 
-async fn recv_e2e<T>(
+async fn recv_e2e(
     ws: &mut (impl StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
               + Unpin),
     cipher: &mut E2eCipher,
-) -> Result<T>
-where
-    T: serde::de::DeserializeOwned,
-{
+) -> Result<HostMsg> {
     while let Some(item) = ws.next().await {
         match item? {
-            Message::Binary(bytes) => return Ok(cipher.decrypt_msg(&bytes)?),
+            Message::Binary(bytes) => return Ok(cipher.decrypt_msg::<HostMsg>(&bytes)?),
             Message::Close(_) => return Err(anyhow!("sesión Relay cerrada por el par")),
             _ => {}
         }

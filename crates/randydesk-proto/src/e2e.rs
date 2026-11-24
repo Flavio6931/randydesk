@@ -35,12 +35,56 @@ impl E2eKeypair {
     }
 }
 
+/// Mitad emisora del canal cifrado E2E para uso concurrente en tareas separadas.
+pub struct E2eEncryptor {
+    cipher: ChaCha20Poly1305,
+    counter: u64,
+}
+
+impl E2eEncryptor {
+    /// Serializa y cifra un mensaje usando el contador monotónico de envío.
+    pub fn encrypt_msg<T: Serialize>(&mut self, msg: &T) -> Result<Vec<u8>, E2eError> {
+        let plain = bincode::serialize(msg)?;
+        if plain.len() > MAX_FRAME_BYTES {
+            return Err(E2eError::PayloadTooLarge);
+        }
+        let nonce = counter_to_nonce(self.counter);
+        let ciphertext = self
+            .cipher
+            .encrypt(&nonce, plain.as_slice())
+            .map_err(|_| E2eError::CryptoFailure)?;
+        self.counter = self.counter.checked_add(1).ok_or(E2eError::CryptoFailure)?;
+        Ok(ciphertext)
+    }
+}
+
+/// Mitad receptora del canal cifrado E2E para uso concurrente en tareas separadas.
+pub struct E2eDecryptor {
+    cipher: ChaCha20Poly1305,
+    counter: u64,
+}
+
+impl E2eDecryptor {
+    /// Descifra, autentica y deserializa un mensaje verificando el contador esperado.
+    pub fn decrypt_msg<T: DeserializeOwned>(&mut self, data: &[u8]) -> Result<T, E2eError> {
+        if data.len() > MAX_FRAME_BYTES + 64 {
+            return Err(E2eError::PayloadTooLarge);
+        }
+        let nonce = counter_to_nonce(self.counter);
+        let plain = self
+            .cipher
+            .decrypt(&nonce, data)
+            .map_err(|_| E2eError::CryptoFailure)?;
+        self.counter = self.counter.checked_add(1).ok_or(E2eError::CryptoFailure)?;
+        let msg = bincode::deserialize(&plain)?;
+        Ok(msg)
+    }
+}
+
 /// Canal cifrado bidireccional con claves direccionales y contadores anti-replay monotónicos.
 pub struct E2eCipher {
-    send_cipher: ChaCha20Poly1305,
-    recv_cipher: ChaCha20Poly1305,
-    send_counter: u64,
-    recv_counter: u64,
+    enc: E2eEncryptor,
+    dec: E2eDecryptor,
 }
 
 impl E2eCipher {
@@ -63,47 +107,30 @@ impl E2eCipher {
         };
 
         Self {
-            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key)),
-            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key)),
-            send_counter: 0,
-            recv_counter: 0,
+            enc: E2eEncryptor {
+                cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key)),
+                counter: 0,
+            },
+            dec: E2eDecryptor {
+                cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key)),
+                counter: 0,
+            },
         }
+    }
+
+    /// Divide el canal cifrado en emisor y receptor independientes para escritura/lectura paralela.
+    pub fn split(self) -> (E2eEncryptor, E2eDecryptor) {
+        (self.enc, self.dec)
     }
 
     /// Serializa y cifra un mensaje usando el contador monotónico de envío.
     pub fn encrypt_msg<T: Serialize>(&mut self, msg: &T) -> Result<Vec<u8>, E2eError> {
-        let plain = bincode::serialize(msg)?;
-        if plain.len() > MAX_FRAME_BYTES {
-            return Err(E2eError::PayloadTooLarge);
-        }
-        let nonce = counter_to_nonce(self.send_counter);
-        let ciphertext = self
-            .send_cipher
-            .encrypt(&nonce, plain.as_slice())
-            .map_err(|_| E2eError::CryptoFailure)?;
-        self.send_counter = self
-            .send_counter
-            .checked_add(1)
-            .ok_or(E2eError::CryptoFailure)?;
-        Ok(ciphertext)
+        self.enc.encrypt_msg(msg)
     }
 
     /// Descifra, autentica y deserializa un mensaje verificando el contador esperado.
     pub fn decrypt_msg<T: DeserializeOwned>(&mut self, data: &[u8]) -> Result<T, E2eError> {
-        if data.len() > MAX_FRAME_BYTES + 64 {
-            return Err(E2eError::PayloadTooLarge);
-        }
-        let nonce = counter_to_nonce(self.recv_counter);
-        let plain = self
-            .recv_cipher
-            .decrypt(&nonce, data)
-            .map_err(|_| E2eError::CryptoFailure)?;
-        self.recv_counter = self
-            .recv_counter
-            .checked_add(1)
-            .ok_or(E2eError::CryptoFailure)?;
-        let msg = bincode::deserialize(&plain)?;
-        Ok(msg)
+        self.dec.decrypt_msg(data)
     }
 }
 
@@ -155,5 +182,22 @@ mod tests {
         let mut enc_ping = client.encrypt_msg(&ClientMsg::Ping(1)).expect("cifrar ping");
         enc_ping[0] ^= 0x5A;
         assert!(host.decrypt_msg::<ClientMsg>(&enc_ping).is_err());
+    }
+
+    #[test]
+    fn split_encryptor_and_decryptor_work_concurrently() {
+        let (c_sec, c_pub) = E2eKeypair::generate();
+        let (h_sec, h_pub) = E2eKeypair::generate();
+
+        let (mut c_enc, mut c_dec) = E2eCipher::from_handshake(c_sec, h_pub, true).split();
+        let (mut h_enc, mut h_dec) = E2eCipher::from_handshake(h_sec, c_pub, false).split();
+
+        let enc_ping = c_enc.encrypt_msg(&ClientMsg::Ping(55)).expect("c_enc");
+        let dec_ping: ClientMsg = h_dec.decrypt_msg(&enc_ping).expect("h_dec");
+        assert_eq!(dec_ping, ClientMsg::Ping(55));
+
+        let enc_pong = h_enc.encrypt_msg(&HostMsg::Pong(55)).expect("h_enc");
+        let dec_pong: HostMsg = c_dec.decrypt_msg(&enc_pong).expect("c_dec");
+        assert_eq!(dec_pong, HostMsg::Pong(55));
     }
 }

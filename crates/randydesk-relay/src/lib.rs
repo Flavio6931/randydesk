@@ -33,6 +33,7 @@ pub async fn run_relay_listener(listener: TcpListener) -> Result<()> {
     let state = Arc::new(RelayState::default());
     loop {
         let (stream, remote) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let state_clone = Arc::clone(&state);
         tokio::spawn(async move {
             if let Err(err) = handle_tcp_connection(stream, state_clone).await {

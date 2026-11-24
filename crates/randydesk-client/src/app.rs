@@ -1,10 +1,11 @@
-//! Interfaz gráfica unificada de RandyDesk estilo RustDesk (LAN directa + ID por Internet E2E).
+//! Interfaz gráfica unificada de RandyDesk (bandeja, hook tecla Win, acceso directo y GPU parcial).
 
 use crate::cards::{render_host_cards, CardAction, HostTab};
 use crate::config::{
     display_address, load_hosts, load_settings, normalize_address, save_hosts, save_settings,
     upsert_recent, AppSettings, SavedHost,
 };
+use crate::decoder::FrameUpdate;
 use crate::host_panel::HostPanelState;
 use crate::keymap::{is_control_or_nav_key, map_egui_key_to_vk, map_mouse_button, normalize_pos};
 use crate::net::{ConnectRequest, ConnectionState, NetCommand, NetworkHandle};
@@ -12,14 +13,17 @@ use crate::theme::{
     apply_rustdesk_theme, ACCENT_BLUE, ACCENT_TEAL, BANNER_COLORS, BG_CARD, BG_MAIN, BG_SIDEBAR,
     BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED,
 };
+use crate::tray::TrayController;
+use crate::win_hook::KeyboardHookGuard;
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
 use randydesk_proto::{
     normalize_relay_ws_url, CodecKind, InputEvent, StreamSettings, DEFAULT_RELAY_URL,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Datos temporales del modal para pedir contraseña al conectar.
+/// Datos para pedir contraseña solo si el host remoto tiene contraseña opcional activada.
+#[derive(Clone)]
 struct PasswordPrompt {
     title: String,
     address: String,
@@ -39,13 +43,19 @@ struct HostEditor {
     color_idx: u8,
 }
 
-/// Aplicación principal de RandyDesk (anfitrión + visor remoto en una ventana).
+/// Aplicación principal de RandyDesk (anfitrión + visor remoto con bandeja del sistema).
 pub struct RandyDeskApp {
     rt_handle: tokio::runtime::Handle,
     host_panel: HostPanelState,
     net: NetworkHandle,
     hosts: Vec<SavedHost>,
     settings: AppSettings,
+    tray: Option<TrayController>,
+    kb_hook: KeyboardHookGuard,
+
+    // Estado de bandeja
+    hidden_to_tray: bool,
+    restored_at: Instant,
 
     // Estado de vista principal (Lobby)
     quick_address: String,
@@ -57,6 +67,7 @@ pub struct RandyDeskApp {
     ui_notice: Option<String>,
 
     // Modales
+    last_attempt: Option<PasswordPrompt>,
     password_prompt: Option<PasswordPrompt>,
     host_editor: Option<HostEditor>,
     show_relay_modal: bool,
@@ -64,35 +75,43 @@ pub struct RandyDeskApp {
     relay_modal_msg: Option<String>,
     show_guide: bool,
 
-    // Renderizado del escritorio remoto
+    // Renderizado incremental del escritorio remoto
     screen_texture: Option<egui::TextureHandle>,
-    last_uploaded_seq: u64,
     fullscreen: bool,
     active_target_address: Option<String>,
     recorded_recent_for_session: bool,
+    last_error_handled: Option<String>,
 }
 
 impl RandyDeskApp {
-    /// Inicializa la aplicación cargando el tema, la libreta, los ajustes de Relay y el receptor local.
+    /// Inicializa la aplicación con bandeja del sistema, hook de teclado Win32 y servidor Relay.
     pub fn new(cc: &eframe::CreationContext<'_>, rt_handle: tokio::runtime::Handle) -> Self {
         apply_rustdesk_theme(&cc.egui_ctx);
         let hosts = load_hosts();
         let settings = load_settings();
         let relay_url_input = settings.relay_url.clone();
         let host_panel = HostPanelState::new(&rt_handle, settings.normalized_relay_url());
+        let tray = TrayController::new(cc.egui_ctx.clone());
+        let kb_hook = KeyboardHookGuard::new();
+
         Self {
             net: NetworkHandle::new(rt_handle.clone()),
             rt_handle,
             host_panel,
             hosts,
             settings,
+            tray,
+            kb_hook,
+            hidden_to_tray: false,
+            restored_at: Instant::now() - Duration::from_secs(5),
             quick_address: String::new(),
             active_tab: HostTab::Recent,
             search_query: String::new(),
             codec_input: CodecKind::Jpeg,
-            quality_input: 75,
+            quality_input: 85,
             fps_input: 30,
             ui_notice: None,
+            last_attempt: None,
             password_prompt: None,
             host_editor: None,
             show_relay_modal: false,
@@ -100,14 +119,14 @@ impl RandyDeskApp {
             relay_modal_msg: None,
             show_guide: false,
             screen_texture: None,
-            last_uploaded_seq: 0,
             fullscreen: false,
             active_target_address: None,
             recorded_recent_for_session: false,
+            last_error_handled: None,
         }
     }
 
-    fn open_password_prompt_for_address(&mut self, raw_address: &str) {
+    fn connect_direct_address(&mut self, raw_address: &str, ctx: &egui::Context) {
         let trimmed = raw_address.trim();
         if trimmed.is_empty() {
             self.ui_notice = Some("Escribe el ID de 9 dígitos o la IP local del equipo destino.".into());
@@ -115,11 +134,10 @@ impl RandyDeskApp {
         }
         let normalized = normalize_address(trimmed);
         if let Some(idx) = self.hosts.iter().position(|h| h.address == normalized) {
-            self.open_password_prompt_for_host(idx);
+            self.connect_direct_host(idx, ctx);
             return;
         }
-        self.ui_notice = None;
-        self.password_prompt = Some(PasswordPrompt {
+        let attempt = PasswordPrompt {
             title: display_address(&normalized),
             address: normalized,
             password: String::new(),
@@ -128,18 +146,18 @@ impl RandyDeskApp {
             quality: self.quality_input,
             fps: self.fps_input,
             just_opened: true,
-        });
+        };
+        self.launch_connection(attempt, ctx);
     }
 
-    fn open_password_prompt_for_host(&mut self, idx: usize) {
+    fn connect_direct_host(&mut self, idx: usize, ctx: &egui::Context) {
         let Some(host) = self.hosts.get(idx) else {
             return;
         };
-        self.ui_notice = None;
         self.codec_input = host.codec;
         self.quality_input = host.quality;
         self.fps_input = host.fps;
-        self.password_prompt = Some(PasswordPrompt {
+        let attempt = PasswordPrompt {
             title: host.name.clone(),
             address: host.address.clone(),
             password: String::new(),
@@ -148,13 +166,16 @@ impl RandyDeskApp {
             quality: host.quality,
             fps: host.fps,
             just_opened: true,
-        });
+        };
+        self.launch_connection(attempt, ctx);
     }
 
     fn launch_connection(&mut self, prompt: PasswordPrompt, ctx: &egui::Context) {
         self.active_target_address = Some(prompt.address.clone());
         self.recorded_recent_for_session = false;
+        self.last_error_handled = None;
         self.ui_notice = None;
+        self.last_attempt = Some(prompt.clone());
         self.net.connect(
             ConnectRequest {
                 address: prompt.address,
@@ -171,9 +192,9 @@ impl RandyDeskApp {
         );
     }
 
-    fn handle_card_action(&mut self, act: CardAction) {
+    fn handle_card_action(&mut self, act: CardAction, ctx: &egui::Context) {
         match act {
-            CardAction::Connect(idx) => self.open_password_prompt_for_host(idx),
+            CardAction::Connect(idx) => self.connect_direct_host(idx, ctx),
             CardAction::ToggleFavorite(idx) => {
                 if let Some(h) = self.hosts.get_mut(idx) {
                     h.favorite = !h.favorite;
@@ -198,18 +219,67 @@ impl RandyDeskApp {
             }
         }
     }
+
+    fn apply_frame_updates_to_gpu(&mut self, ctx: &egui::Context, updates: Vec<FrameUpdate>) {
+        for update in updates {
+            let target_size = [update.width as usize, update.height as usize];
+            let needs_alloc = match &self.screen_texture {
+                Some(tex) => tex.size() != target_size,
+                None => true,
+            };
+
+            if needs_alloc {
+                let blank = egui::ColorImage::new(target_size, Color32::BLACK);
+                self.screen_texture = Some(ctx.load_texture(
+                    "remote-screen",
+                    blank,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+
+            if let Some(tex) = &mut self.screen_texture {
+                for tile in update.tiles {
+                    let tile_img = egui::ColorImage::from_rgba_unmultiplied(
+                        [tile.width as usize, tile.height as usize],
+                        &tile.rgba,
+                    );
+                    tex.set_partial(
+                        [tile.x as usize, tile.y as usize],
+                        tile_img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for RandyDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (status, stats, maybe_frame, frame_seq, incoming_clip) = {
+        // 1. Gestión de minimizar / restaurar desde la bandeja del sistema
+        if self.tray.as_ref().is_some_and(|t| t.take_restore_requested()) {
+            self.hidden_to_tray = false;
+            self.restored_at = Instant::now();
+            self.net.send_cmd(NetCommand::RequestKeyframe);
+        } else if !self.hidden_to_tray
+            && self.tray.is_some()
+            && self.restored_at.elapsed() >= Duration::from_millis(450)
+            && ctx.input(|i| i.viewport().minimized == Some(true))
+        {
+            self.hidden_to_tray = true;
+            self.kb_hook.set_capture(false, None);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // 2. Lectura del estado compartido de red
+        let (status, stats, updates, incoming_clip) = {
             let mut guard = self.net.shared.lock().expect("lock estado red");
             let clip = guard.incoming_clipboard.take();
+            let updates: Vec<FrameUpdate> = guard.pending_updates.drain(..).collect();
             (
                 guard.status.clone(),
                 guard.stats.clone(),
-                guard.latest_frame.clone(),
-                guard.frame_seq,
+                updates,
                 clip,
             )
         };
@@ -236,38 +306,42 @@ impl eframe::App for RandyDeskApp {
                 }
                 self.recorded_recent_for_session = true;
             }
-            ctx.request_repaint_after(Duration::from_millis(500));
+            if !self.hidden_to_tray {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
         }
 
-        if let Some(decoded) = maybe_frame {
-            if frame_seq != self.last_uploaded_seq {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [decoded.width as usize, decoded.height as usize],
-                    &decoded.rgba,
-                );
-                match &mut self.screen_texture {
-                    Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
-                    None => {
-                        self.screen_texture = Some(ctx.load_texture(
-                            "remote-screen",
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    }
-                }
-                self.last_uploaded_seq = frame_seq;
-            }
+        if !updates.is_empty() {
+            self.apply_frame_updates_to_gpu(ctx, updates);
+        }
+
+        if self.hidden_to_tray {
+            self.kb_hook.set_capture(false, None);
+            return;
         }
 
         match status {
             ConnectionState::Disconnected | ConnectionState::Error(_) => {
+                self.kb_hook.set_capture(false, None);
                 if let ConnectionState::Error(msg) = &status {
-                    self.ui_notice = Some(format!("No se pudo conectar: {msg}"));
+                    if self.last_error_handled.as_deref() != Some(msg.as_str()) {
+                        self.last_error_handled = Some(msg.clone());
+                        if msg.contains("Contraseña") || msg.contains("PIN") {
+                            if let Some(mut attempt) = self.last_attempt.clone() {
+                                attempt.password.clear();
+                                attempt.just_opened = true;
+                                self.password_prompt = Some(attempt);
+                            }
+                        } else {
+                            self.ui_notice = Some(format!("No se pudo conectar: {msg}"));
+                        }
+                    }
                 }
                 self.render_lobby(ctx);
                 self.render_modals(ctx);
             }
             ConnectionState::Connecting { ref address } => {
+                self.kb_hook.set_capture(false, None);
                 self.render_connecting(ctx, address);
             }
             ConnectionState::Connected {
@@ -281,6 +355,7 @@ impl eframe::App for RandyDeskApp {
                 attempt,
                 ref reason,
             } => {
+                self.kb_hook.set_capture(false, None);
                 self.render_remote_session(
                     ctx,
                     &self.quick_address.clone(),
@@ -296,6 +371,7 @@ impl eframe::App for RandyDeskApp {
 
 impl Drop for RandyDeskApp {
     fn drop(&mut self) {
+        self.kb_hook.set_capture(false, None);
         self.net.disconnect();
         self.host_panel.stop_host();
     }
@@ -443,7 +519,7 @@ impl RandyDeskApp {
                                 );
                                 if connect_btn.clicked() || pressed_enter {
                                     let addr = self.quick_address.clone();
-                                    self.open_password_prompt_for_address(&addr);
+                                    self.connect_direct_address(&addr, ctx);
                                 }
                             });
                         });
@@ -485,17 +561,17 @@ impl RandyDeskApp {
                 if let Some(act) =
                     render_host_cards(ui, &self.hosts, self.active_tab, &self.search_query)
                 {
-                    self.handle_card_action(act);
+                    self.handle_card_action(act, ctx);
                 }
             });
     }
 
     fn render_modals(&mut self, ctx: &egui::Context) {
-        // 1. Modal de contraseña al conectar
+        // 1. Modal de contraseña (solo si el equipo destino configuró contraseña opcional)
         let mut launch: Option<PasswordPrompt> = None;
         let mut close_prompt = false;
         if let Some(prompt) = &mut self.password_prompt {
-            egui::Window::new(format!("Conectar a {}", prompt.title))
+            egui::Window::new(format!("Contraseña requerida — {}", prompt.title))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -507,7 +583,7 @@ impl RandyDeskApp {
                             .color(TEXT_MUTED),
                     );
                     ui.add_space(8.0);
-                    ui.label("Contraseña o PIN del equipo remoto:");
+                    ui.label("Este equipo solicita contraseña opcional:");
                     let resp = ui.add_sized(
                         [310.0, 30.0],
                         egui::TextEdit::singleline(&mut prompt.password).password(true),
@@ -530,16 +606,7 @@ impl RandyDeskApp {
                                 )
                                 .clicked();
                             if (ok || enter) && !prompt.password.is_empty() {
-                                launch = Some(PasswordPrompt {
-                                    title: prompt.title.clone(),
-                                    address: prompt.address.clone(),
-                                    password: prompt.password.clone(),
-                                    expected_fp: prompt.expected_fp.clone(),
-                                    codec: prompt.codec,
-                                    quality: prompt.quality,
-                                    fps: prompt.fps,
-                                    just_opened: false,
-                                });
+                                launch = Some(prompt.clone());
                             }
                             if ui.button("Cancelar").clicked()
                                 || ui.input(|i| i.key_pressed(egui::Key::Escape))
@@ -579,7 +646,8 @@ impl RandyDeskApp {
                     ui.label("ID de 9 dígitos o IP local:");
                     ui.add_sized(
                         [320.0, 28.0],
-                        egui::TextEdit::singleline(&mut ed.address).hint_text("482 910 331 o 192.168.1.25"),
+                        egui::TextEdit::singleline(&mut ed.address)
+                            .hint_text("482 910 331 o 192.168.1.25"),
                     );
                     ui.add_space(8.0);
                     ui.label("Color de tarjeta:");
@@ -662,7 +730,7 @@ impl RandyDeskApp {
                     ui.set_max_width(430.0);
                     ui.label(
                         egui::RichText::new(
-                            "Pega la URL de tu servidor Relay (ej. https://tu-relay.onrender.com o https://xxxx.trycloudflare.com). Todo el tráfico viaja cifrado E2E.",
+                            "RandyDesk ya incluye su servidor por defecto. Todo el tráfico viaja cifrado E2E.",
                         )
                         .color(TEXT_MUTED),
                     );
@@ -733,26 +801,26 @@ impl RandyDeskApp {
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.set_max_width(430.0);
-                    ui.label("1. Por Internet sin Tailscale (ID de 9 dígitos):");
+                    ui.label("1. Conexión directa sin contraseña:");
                     ui.label(
                         egui::RichText::new(
-                            "Pega la URL de tu servidor Relay (Render Free o cloudflared) en 'Configurar servidor Relay' en ambos equipos y conéctate solo usando el ID numérico.",
+                            "Escribe el ID de 9 dígitos del otro equipo y pulsa Conectar (o haz clic en su tarjeta).",
                         )
                         .color(TEXT_MUTED),
                     );
                     ui.add_space(8.0);
-                    ui.label("2. En la misma casa u oficina (LAN):");
+                    ui.label("2. Bandeja del sistema:");
                     ui.label(
                         egui::RichText::new(
-                            "No necesitas servidor Relay: escribe directo la IP local (192.168.x.x) que aparece debajo de 'Tu ID'.",
+                            "Al minimizar la ventana queda en la bandeja de Windows (junto al reloj) manteniendo tu conexión activa.",
                         )
                         .color(TEXT_MUTED),
                     );
                     ui.add_space(8.0);
-                    ui.label("3. Sesiones largas (2+ horas):");
+                    ui.label("3. Tecla Windows y nitidez:");
                     ui.label(
                         egui::RichText::new(
-                            "En la PC remota configura Windows en 'Suspender el equipo: Nunca'.",
+                            "Con el puntero sobre el escritorio remoto, la tecla Win y Alt+Tab actúan directo en la otra PC. Si ves texto pequeño en un IDE, prueba modo 'Nítido'.",
                         )
                         .color(TEXT_MUTED),
                     );
@@ -846,6 +914,24 @@ impl RandyDeskApp {
                 }
 
                 ui.separator();
+                if ui
+                    .button("Tecla Win")
+                    .on_hover_text("Enviar pulsación de tecla Windows a la PC remota")
+                    .clicked()
+                {
+                    self.net.send_input(InputEvent::Key {
+                        vk: 0x5B,
+                        scan: 0,
+                        extended: true,
+                        down: true,
+                    });
+                    self.net.send_input(InputEvent::Key {
+                        vk: 0x5B,
+                        scan: 0,
+                        extended: true,
+                        down: false,
+                    });
+                }
                 if ui.button("Enviar portapapeles").clicked() {
                     if let Ok(text) = Clipboard::new().and_then(|mut c| c.get_text()) {
                         self.net.send_cmd(NetCommand::ClipboardSet(text));
@@ -879,6 +965,7 @@ impl RandyDeskApp {
                         self.fullscreen = false;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     }
+                    self.kb_hook.set_capture(false, None);
                     self.net.disconnect();
                 }
             });
@@ -888,6 +975,7 @@ impl RandyDeskApp {
             .frame(egui::Frame::none().fill(Color32::BLACK))
             .show(ctx, |ui| {
                 let Some(tex) = &self.screen_texture else {
+                    self.kb_hook.set_capture(false, None);
                     ui.centered_and_justified(|ui| {
                         ui.label("Esperando primer cuadro del equipo remoto...");
                     });
@@ -910,6 +998,19 @@ impl RandyDeskApp {
                 );
 
                 let pointer_in_canvas = response.hovered() || response.dragged();
+                let window_focused = ctx.input(|i| i.focused);
+                let should_capture_kb =
+                    reconnecting.is_none() && window_focused && (self.fullscreen || pointer_in_canvas);
+                self.kb_hook.set_capture(
+                    should_capture_kb,
+                    if should_capture_kb {
+                        self.net.cmd_sender()
+                    } else {
+                        None
+                    },
+                );
+
+                let hook_active = self.kb_hook.is_capturing();
                 let events = ctx.input(|i| i.events.clone());
 
                 for ev in events {
@@ -952,7 +1053,7 @@ impl RandyDeskApp {
                             pressed,
                             modifiers,
                             ..
-                        } => {
+                        } if !hook_active => {
                             let is_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
                             if is_combo || is_control_or_nav_key(key) {
                                 if let Some((vk, extended)) = map_egui_key_to_vk(key) {
@@ -965,7 +1066,7 @@ impl RandyDeskApp {
                                 }
                             }
                         }
-                        egui::Event::Text(text) => {
+                        egui::Event::Text(text) if !hook_active => {
                             let mods = ctx.input(|i| i.modifiers);
                             if !mods.ctrl && !mods.alt && !mods.command {
                                 for ch in text.chars().filter(|c| !c.is_control()) {

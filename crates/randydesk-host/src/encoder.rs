@@ -2,7 +2,7 @@
 
 use crate::capture::CapturedFrame;
 use anyhow::Result;
-use jpeg_encoder::{ColorType, Encoder};
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use randydesk_proto::{CodecKind, EncodedTile, HostMsg, StreamSettings, TILE_SIZE};
 
 /// Codificador con memoria del cuadro previo para enviar únicamente bloques modificados.
@@ -144,7 +144,8 @@ impl TileEncoder {
         }
 
         self.jpeg_scratch.clear();
-        let encoder = Encoder::new(&mut self.jpeg_scratch, quality);
+        let mut encoder = Encoder::new(&mut self.jpeg_scratch, quality);
+        encoder.set_sampling_factor(SamplingFactor::R_4_4_4);
         encoder.encode(&self.rgb_scratch, tw as u16, th as u16, ColorType::Rgb)?;
         Ok(self.jpeg_scratch.clone())
     }

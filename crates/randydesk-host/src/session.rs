@@ -117,7 +117,8 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
     // 3. Verificar respuesta criptográfica
     match read_msg::<_, ClientMsg>(&mut ctrl_recv).await? {
         ClientMsg::AuthResponse { proof } => {
-            if !verify_proof(&nonce, &cfg.password, &proof) {
+            let auth_ok = cfg.password.is_empty() || verify_proof(&nonce, &cfg.password, &proof);
+            if !auth_ok {
                 write_msg(
                     &mut ctrl_send,
                     &HostMsg::AuthResult {

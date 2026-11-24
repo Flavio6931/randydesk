@@ -1,6 +1,6 @@
 //! Cliente QUIC con verificación TLS TOFU, keep-alive para sesiones largas y reconexión automática.
 
-use crate::decoder::{DecodedFrame, FrameBuffer};
+use crate::decoder::{decode_frame_update, FrameUpdate};
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use quinn::{ClientConfig, Endpoint, TransportConfig, VarInt};
@@ -12,6 +12,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,8 +66,7 @@ pub struct SessionStats {
 pub struct SharedSessionState {
     pub status: ConnectionState,
     pub stats: SessionStats,
-    pub latest_frame: Option<Arc<DecodedFrame>>,
-    pub frame_seq: u64,
+    pub pending_updates: VecDeque<FrameUpdate>,
     pub incoming_clipboard: Option<String>,
 }
 
@@ -75,11 +75,20 @@ impl Default for SharedSessionState {
         Self {
             status: ConnectionState::Disconnected,
             stats: SessionStats::default(),
-            latest_frame: None,
-            frame_seq: 0,
+            pending_updates: VecDeque::new(),
             incoming_clipboard: None,
         }
     }
+}
+
+/// Inserta una actualización incremental manteniendo la cola acotada para evitar lag acumulado.
+pub(crate) fn push_frame_update(queue: &mut VecDeque<FrameUpdate>, update: FrameUpdate) {
+    if update.full_refresh {
+        queue.clear();
+    } else if queue.len() >= 16 {
+        queue.pop_front();
+    }
+    queue.push_back(update);
 }
 
 /// Verificador TLS 1.3 basado en TOFU (Trust On First Use) por huella SHA-256 del certificado.
@@ -209,6 +218,11 @@ impl NetworkHandle {
         }
     }
 
+    /// Devuelve un clon del canal de comandos para el hook de teclado Win32.
+    pub fn cmd_sender(&self) -> Option<mpsc::Sender<NetCommand>> {
+        self.cmd_tx.clone()
+    }
+
     /// Cierra la sesión actual de forma limpia y detiene la reconexión automática.
     pub fn disconnect(&mut self) {
         if let Some(tx) = self.cmd_tx.take() {
@@ -219,7 +233,7 @@ impl NetworkHandle {
         }
         if let Ok(mut guard) = self.shared.lock() {
             guard.status = ConnectionState::Disconnected;
-            guard.latest_frame = None;
+            guard.pending_updates.clear();
         }
     }
 }
@@ -438,7 +452,6 @@ async fn run_single_session(
     ctx.request_repaint();
     info!("Sesión QUIC autenticada con {}", req.address);
 
-    let mut fb = FrameBuffer::new();
     let mut ping_ticker = tokio::time::interval(Duration::from_secs(2));
     let mut stat_window_start = Instant::now();
     let mut frames_in_window: u32 = 0;
@@ -497,13 +510,12 @@ async fn run_single_session(
                 if let HostMsg::VideoFrame { tiles, .. } = &msg {
                     bytes_in_window += tiles.iter().map(|t| t.data.len()).sum::<usize>();
                 }
-                let decoded = fb.apply_frame(&msg)?;
+                let update = decode_frame_update(&msg)?;
                 frames_in_window += 1;
 
                 let elapsed_win = stat_window_start.elapsed().as_secs_f32();
                 if let Ok(mut guard) = shared.lock() {
-                    guard.latest_frame = Some(Arc::new(decoded));
-                    guard.frame_seq += 1;
+                    push_frame_update(&mut guard.pending_updates, update);
                     guard.stats.elapsed_secs = session_start.elapsed().as_secs();
                     if elapsed_win >= 1.0 {
                         guard.stats.fps = frames_in_window as f32 / elapsed_win;

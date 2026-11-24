@@ -1,4 +1,4 @@
-//! Agente saliente hacia el servidor Relay con cifrado extremo a extremo (X25519 + ChaCha20).
+//! Agente saliente hacia el servidor Relay con cifrado E2E (X25519 + ChaCha20) y WebSocket `TCP_NODELAY`.
 
 use crate::clipboard;
 use crate::input;
@@ -55,7 +55,7 @@ pub async fn run_relay_loop(
             break;
         }
 
-        match tokio_tungstenite::connect_async(&ws_endpoint).await {
+        match tokio_tungstenite::connect_async_with_config(&ws_endpoint, None, true).await {
             Ok((mut ws, _)) => {
                 relay_connected.store(true, Ordering::Relaxed);
                 info!("Host registrado en Relay {base} con ID {host_id}");
@@ -134,20 +134,26 @@ impl Drop for ActiveRelayGuard {
     }
 }
 
+enum OutboundItem {
+    Host(HostMsg),
+    Pong(Vec<u8>),
+    Close,
+}
+
 async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) -> Result<()> {
     let _active_guard = ActiveRelayGuard::new(Arc::clone(&cfg.active_clients));
-    let (mut ws, _) = tokio_tungstenite::connect_async(&bridge_url)
+    let (mut ws, _) = tokio_tungstenite::connect_async_with_config(&bridge_url, None, true)
         .await
         .with_context(|| format!("error abriendo puente Relay {bridge_url}"))?;
 
-    // 1. Handshake E2E X25519 (el servidor Relay no puede descifrar nada después de aquí)
+    // 1. Handshake E2E X25519
     let (secret, my_pub) = E2eKeypair::generate();
     ws.send(Message::Binary(my_pub.to_vec())).await?;
     let peer_pub = read_binary_32(&mut ws).await?;
     let mut cipher = E2eCipher::from_handshake(secret, peer_pub, false);
 
     // 2. Hello cifrado
-    match recv_e2e::<ClientMsg>(&mut ws, &mut cipher).await? {
+    match recv_e2e(&mut ws, &mut cipher).await? {
         ClientMsg::Hello { version } if version == PROTOCOL_VERSION => {}
         ClientMsg::Hello { version } => {
             let _ = send_e2e(
@@ -165,7 +171,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
         other => return Err(anyhow!("se esperaba Hello, llegó {other:?}")),
     }
 
-    // 3. Capturador y reto de autenticación
+    // 3. Capturador y autenticación (acceso directo si password está vacío)
     let capturer = (cfg.capturer_factory)()?;
     let monitor = capturer.dimensions();
     let nonce = generate_nonce();
@@ -182,9 +188,10 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     )
     .await?;
 
-    match recv_e2e::<ClientMsg>(&mut ws, &mut cipher).await? {
+    match recv_e2e(&mut ws, &mut cipher).await? {
         ClientMsg::AuthResponse { proof } => {
-            if !verify_proof(&nonce, &cfg.password, &proof) {
+            let auth_ok = cfg.password.is_empty() || verify_proof(&nonce, &cfg.password, &proof);
+            if !auth_ok {
                 let _ = send_e2e(
                     &mut ws,
                     &mut cipher,
@@ -215,6 +222,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let stop_capture = Arc::new(AtomicBool::new(false));
     let (frame_tx, mut frame_rx) = mpsc::channel::<HostMsg>(2);
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<OutboundItem>(64);
 
     let capture_thread = spawn_capture_worker(
         capturer,
@@ -224,64 +232,88 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
         frame_tx,
     );
 
-    let session_res = async {
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (mut enc, mut dec) = cipher.split();
+
+    let writer_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
-                incoming = ws.next() => {
-                    match incoming {
-                        Some(Ok(Message::Binary(data))) => {
-                            let msg: ClientMsg = cipher.decrypt_msg(&data)?;
-                            match msg {
-                                ClientMsg::Input(ev) => input::inject_input(&ev, monitor),
-                                ClientMsg::UpdateSettings(new_settings) => {
-                                    if let Ok(mut guard) = shared_settings.lock() {
-                                        if guard.codec != new_settings.codec {
-                                            force_keyframe.store(true, Ordering::Relaxed);
-                                        }
-                                        *guard = new_settings;
-                                    }
-                                }
-                                ClientMsg::RequestKeyframe => {
-                                    force_keyframe.store(true, Ordering::Relaxed);
-                                }
-                                ClientMsg::ClipboardSet(text) => clipboard::set_text(&text),
-                                ClientMsg::ClipboardGet => {
-                                    let text = clipboard::get_text();
-                                    send_e2e(&mut ws, &mut cipher, &HostMsg::ClipboardData(text)).await?;
-                                }
-                                ClientMsg::Ping(ts) => {
-                                    send_e2e(&mut ws, &mut cipher, &HostMsg::Pong(ts)).await?;
-                                }
-                                ClientMsg::Disconnect => {
-                                    let _ = ws.close(None).await;
-                                    return Ok(());
-                                }
-                                other => warn!("Mensaje inesperado en sesión Relay: {other:?}"),
+                maybe_ctrl = ctrl_rx.recv() => {
+                    match maybe_ctrl {
+                        Some(OutboundItem::Host(msg)) => {
+                            let Ok(bytes) = enc.encrypt_msg(&msg) else { break; };
+                            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                                break;
                             }
                         }
-                        Some(Ok(Message::Ping(p))) => {
-                            ws.send(Message::Pong(p)).await?;
+                        Some(OutboundItem::Pong(p)) => {
+                            if ws_tx.send(Message::Pong(p)).await.is_err() {
+                                break;
+                            }
                         }
-                        Some(Ok(Message::Close(_))) | None => return Ok(()),
-                        Some(Err(err)) => return Err(anyhow!("error WS Relay host: {err}")),
-                        _ => {}
+                        Some(OutboundItem::Close) | None => {
+                            let _ = ws_tx.close().await;
+                            break;
+                        }
                     }
                 }
                 maybe_frame = frame_rx.recv() => {
                     match maybe_frame {
                         Some(frame_msg) => {
-                            send_e2e(&mut ws, &mut cipher, &frame_msg).await?;
+                            let Ok(bytes) = enc.encrypt_msg(&frame_msg) else { break; };
+                            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                                break;
+                            }
                         }
-                        None => return Err(anyhow!("hilo de captura finalizado")),
+                        None => break,
                     }
                 }
             }
         }
-    }
-    .await;
+    });
+
+    let session_res: Result<()> = loop {
+        match ws_rx.next().await {
+            Some(Ok(Message::Binary(data))) => match dec.decrypt_msg::<ClientMsg>(&data) {
+                Ok(ClientMsg::Input(ev)) => input::inject_input(&ev, monitor),
+                Ok(ClientMsg::UpdateSettings(new_settings)) => {
+                    if let Ok(mut guard) = shared_settings.lock() {
+                        if guard.codec != new_settings.codec {
+                            force_keyframe.store(true, Ordering::Relaxed);
+                        }
+                        *guard = new_settings;
+                    }
+                }
+                Ok(ClientMsg::RequestKeyframe) => {
+                    force_keyframe.store(true, Ordering::Relaxed);
+                }
+                Ok(ClientMsg::ClipboardSet(text)) => clipboard::set_text(&text),
+                Ok(ClientMsg::ClipboardGet) => {
+                    let text = clipboard::get_text();
+                    let _ = ctrl_tx.try_send(OutboundItem::Host(HostMsg::ClipboardData(text)));
+                }
+                Ok(ClientMsg::Ping(ts)) => {
+                    let _ = ctrl_tx.try_send(OutboundItem::Host(HostMsg::Pong(ts)));
+                }
+                Ok(ClientMsg::Disconnect) => {
+                    let _ = ctrl_tx.send(OutboundItem::Close).await;
+                    break Ok(());
+                }
+                Ok(other) => warn!("Mensaje inesperado en sesión Relay: {other:?}"),
+                Err(err) => break Err(anyhow!("error descifrando mensaje cliente: {err}")),
+            },
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ctrl_tx.try_send(OutboundItem::Pong(p));
+            }
+            Some(Ok(Message::Close(_))) | None => break Ok(()),
+            Some(Err(err)) => break Err(anyhow!("error WS Relay host: {err}")),
+            _ => {}
+        }
+    };
 
     stop_capture.store(true, Ordering::Relaxed);
+    writer_task.abort();
     let _ = capture_thread.join();
     session_res
 }
@@ -316,15 +348,11 @@ where
     Ok(())
 }
 
-async fn recv_e2e<T>(
+async fn recv_e2e(
     ws: &mut (impl StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
               + Unpin),
     cipher: &mut E2eCipher,
-) -> Result<ClientMsg>
-where
-    T: Sized,
-{
-    let _ = std::marker::PhantomData::<T>;
+) -> Result<ClientMsg> {
     while let Some(item) = ws.next().await {
         match item? {
             Message::Binary(bytes) => return Ok(cipher.decrypt_msg::<ClientMsg>(&bytes)?),
