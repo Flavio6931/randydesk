@@ -3,11 +3,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cards;
 mod config;
 mod decoder;
 mod host_panel;
 mod keymap;
 mod net;
+mod theme;
 
 use anyhow::Result;
 use app::RandyDeskApp;
@@ -32,13 +34,14 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 760.0])
-            .with_min_inner_size([900.0, 580.0]),
+            .with_inner_size([1240.0, 740.0])
+            .with_min_inner_size([920.0, 580.0]),
         ..Default::default()
     };
 
+    let title = format!("RandyDesk v{}", env!("CARGO_PKG_VERSION"));
     eframe::run_native(
-        "RandyDesk — Escritorio Remoto",
+        &title,
         options,
         Box::new(move |cc| Ok(Box::new(RandyDeskApp::new(cc, rt_handle)))),
     )

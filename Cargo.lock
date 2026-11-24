@@ -2837,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "randydesk-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "randydesk-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "randydesk-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "rand 0.8.8",
