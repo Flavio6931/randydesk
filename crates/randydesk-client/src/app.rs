@@ -78,6 +78,7 @@ pub struct RandyDeskApp {
     // Renderizado incremental del escritorio remoto
     screen_texture: Option<egui::TextureHandle>,
     fullscreen: bool,
+    keyboard_grab_enabled: bool,
     active_target_address: Option<String>,
     recorded_recent_for_session: bool,
     last_error_handled: Option<String>,
@@ -120,6 +121,7 @@ impl RandyDeskApp {
             show_guide: false,
             screen_texture: None,
             fullscreen: false,
+            keyboard_grab_enabled: true,
             active_target_address: None,
             recorded_recent_for_session: false,
             last_error_handled: None,
@@ -864,9 +866,12 @@ impl RandyDeskApp {
                         format!("Reconectando (#{attempt}): {reason}"),
                     );
                 } else {
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot_rect.center(), 4.0, ACCENT_TEAL);
                     ui.colored_label(
                         ACCENT_TEAL,
-                        format!("● {host_name} ({width}x{height})"),
+                        format!("{host_name} ({width}x{height})"),
                     );
                 }
 
@@ -914,6 +919,21 @@ impl RandyDeskApp {
                 }
 
                 ui.separator();
+                let kb_label = if self.keyboard_grab_enabled {
+                    egui::RichText::new("Teclado: ON").color(ACCENT_TEAL)
+                } else {
+                    egui::RichText::new("Teclado: OFF").color(TEXT_MUTED)
+                };
+                if ui
+                    .button(kb_label)
+                    .on_hover_text("Replicar todo tu teclado (incluida tecla Win y Alt+Tab) en la PC remota")
+                    .clicked()
+                {
+                    self.keyboard_grab_enabled = !self.keyboard_grab_enabled;
+                    if !self.keyboard_grab_enabled {
+                        self.kb_hook.set_capture(false, None);
+                    }
+                }
                 if ui
                     .button("Tecla Win")
                     .on_hover_text("Enviar pulsación de tecla Windows a la PC remota")
@@ -998,9 +1018,10 @@ impl RandyDeskApp {
                 );
 
                 let pointer_in_canvas = response.hovered() || response.dragged();
-                let window_focused = ctx.input(|i| i.focused);
-                let should_capture_kb =
-                    reconnecting.is_none() && window_focused && (self.fullscreen || pointer_in_canvas);
+                let should_capture_kb = reconnecting.is_none()
+                    && self.keyboard_grab_enabled
+                    && !self.hidden_to_tray
+                    && KeyboardHookGuard::is_window_foreground();
                 self.kb_hook.set_capture(
                     should_capture_kb,
                     if should_capture_kb {

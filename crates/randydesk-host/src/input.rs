@@ -4,11 +4,12 @@ use crate::capture::MonitorGeometry;
 use randydesk_proto::{InputEvent, MouseButton};
 use std::mem::size_of;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    MAPVK_VK_TO_VSC, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -74,16 +75,15 @@ pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
             extended,
             down,
         } => {
-            let mut flags = windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0);
-            if extended {
-                flags |= KEYEVENTF_EXTENDEDKEY;
-            }
-            if !down {
-                flags |= KEYEVENTF_KEYUP;
-            }
+            let resolved_scan = if scan == 0 {
+                unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 }
+            } else {
+                scan
+            };
+            let flags = build_key_flags(vk, extended, down);
             send_keyboard(KEYBDINPUT {
                 wVk: VIRTUAL_KEY(vk),
-                wScan: scan,
+                wScan: resolved_scan,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
@@ -108,6 +108,18 @@ pub fn inject_input(event: &InputEvent, monitor: MonitorGeometry) {
     }
 }
 
+/// Construye las banderas `KEYBD_EVENT_FLAGS`, forzando `KEYEVENTF_EXTENDEDKEY` en `Win` izquierda/derecha.
+fn build_key_flags(vk: u16, extended: bool, down: bool) -> KEYBD_EVENT_FLAGS {
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if extended || matches!(vk, 0x5B | 0x5C) {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if !down {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    flags
+}
+
 fn map_normalized_to_virtual_desk(
     x_norm: f32,
     y_norm: f32,
@@ -116,8 +128,10 @@ fn map_normalized_to_virtual_desk(
     let x_clamped = x_norm.clamp(0.0, 1.0);
     let y_clamped = y_norm.clamp(0.0, 1.0);
 
-    let target_x = monitor.origin_x as f64 + (x_clamped as f64) * (monitor.width.saturating_sub(1) as f64);
-    let target_y = monitor.origin_y as f64 + (y_clamped as f64) * (monitor.height.saturating_sub(1) as f64);
+    let target_x =
+        monitor.origin_x as f64 + (x_clamped as f64) * (monitor.width.saturating_sub(1) as f64);
+    let target_y =
+        monitor.origin_y as f64 + (y_clamped as f64) * (monitor.height.saturating_sub(1) as f64);
 
     let virt_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as f64;
     let virt_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) } as f64;
@@ -146,5 +160,24 @@ fn send_keyboard(ki: KEYBDINPUT) {
     };
     unsafe {
         let _ = SendInput(&[input], size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn win_keys_always_include_extended_flag() {
+        let lwin_down = build_key_flags(0x5B, false, true);
+        assert!(lwin_down.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(!lwin_down.contains(KEYEVENTF_KEYUP));
+
+        let rwin_up = build_key_flags(0x5C, false, false);
+        assert!(rwin_up.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(rwin_up.contains(KEYEVENTF_KEYUP));
+
+        let letter_a = build_key_flags(0x41, false, true);
+        assert_eq!(letter_a, KEYBD_EVENT_FLAGS(0));
     }
 }

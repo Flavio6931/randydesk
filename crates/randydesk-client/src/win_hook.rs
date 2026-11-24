@@ -1,4 +1,4 @@
-//! Hook de teclado de bajo nivel (`WH_KEYBOARD_LL`) para enviar `Win` y atajos a la PC remota.
+//! Hook de teclado de bajo nivel (`WH_KEYBOARD_LL`) para replicar `Win` y atajos en la PC remota.
 
 use crate::net::NetCommand;
 use randydesk_proto::InputEvent;
@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 use tracing::warn;
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
@@ -20,6 +21,7 @@ const MODIFIER_VKS: &[u16] = &[0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
 const LLKHF_INJECTED_BIT: u32 = 0x10;
 
 struct HookSharedState {
+    installed: AtomicBool,
     active: AtomicBool,
     own_pid: u32,
     tx: Mutex<Option<mpsc::Sender<NetCommand>>>,
@@ -30,6 +32,7 @@ static HOOK_STATE: OnceLock<Arc<HookSharedState>> = OnceLock::new();
 fn shared_state() -> &'static Arc<HookSharedState> {
     HOOK_STATE.get_or_init(|| {
         Arc::new(HookSharedState {
+            installed: AtomicBool::new(false),
             active: AtomicBool::new(false),
             own_pid: unsafe { GetCurrentProcessId() },
             tx: Mutex::new(None),
@@ -53,13 +56,16 @@ impl KeyboardHookGuard {
 
         let worker = std::thread::spawn(move || unsafe {
             tid_clone.store(GetCurrentThreadId(), Ordering::SeqCst);
-            let hook: HHOOK = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_kb_proc), None, 0) {
+            let hmod: HINSTANCE = GetModuleHandleW(None).map(Into::into).unwrap_or_default();
+            let hook: HHOOK = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_kb_proc), hmod, 0) {
                 Ok(h) => h,
                 Err(err) => {
                     warn!("No se pudo instalar hook WH_KEYBOARD_LL: {err}");
+                    shared_state().installed.store(false, Ordering::SeqCst);
                     return;
                 }
             };
+            shared_state().installed.store(true, Ordering::SeqCst);
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -67,6 +73,7 @@ impl KeyboardHookGuard {
                 DispatchMessageW(&msg);
             }
 
+            shared_state().installed.store(false, Ordering::SeqCst);
             let _ = UnhookWindowsHookEx(hook);
         });
 
@@ -77,8 +84,30 @@ impl KeyboardHookGuard {
         }
     }
 
+    /// Indica si la ventana de RandyDesk está actualmente en primer plano en Windows.
+    pub fn is_window_foreground() -> bool {
+        let own_pid = shared_state().own_pid;
+        unsafe { is_own_window_foreground(own_pid) }
+    }
+
+    /// Indica si el hook Win32 quedó instalado correctamente.
+    pub fn is_installed(&self) -> bool {
+        shared_state().installed.load(Ordering::Acquire)
+    }
+
     /// Activa o desactiva la captura exclusiva de teclado hacia `tx`; libera modificadores al soltar.
     pub fn set_capture(&mut self, active: bool, tx: Option<mpsc::Sender<NetCommand>>) {
+        if self.was_active == active {
+            if active {
+                if let Ok(mut guard) = shared_state().tx.lock() {
+                    if guard.is_none() && tx.is_some() {
+                        *guard = tx;
+                    }
+                }
+            }
+            return;
+        }
+
         let state = shared_state();
         if self.was_active && !active {
             if let Ok(guard) = state.tx.lock() {
@@ -94,9 +123,9 @@ impl KeyboardHookGuard {
         self.was_active = active;
     }
 
-    /// Indica si el hook está interceptando actualmente las teclas hacia el escritorio remoto.
+    /// Indica si el hook está activo e interceptando realmente las teclas hacia la PC remota.
     pub fn is_capturing(&self) -> bool {
-        self.was_active
+        self.was_active && self.is_installed()
     }
 }
 
@@ -148,9 +177,11 @@ unsafe extern "system" fn low_level_kb_proc(
                 if let Some(down) = down {
                     if let Ok(guard) = state.tx.lock() {
                         if let Some(tx) = guard.as_ref() {
-                            let extended = (kb.flags.0 & LLKHF_EXTENDED.0) != 0;
+                            let vk = kb.vkCode as u16;
+                            let extended =
+                                (kb.flags.0 & LLKHF_EXTENDED.0) != 0 || matches!(vk, 0x5B | 0x5C);
                             let _ = tx.try_send(NetCommand::Input(InputEvent::Key {
-                                vk: kb.vkCode as u16,
+                                vk,
                                 scan: kb.scanCode as u16,
                                 extended,
                                 down,

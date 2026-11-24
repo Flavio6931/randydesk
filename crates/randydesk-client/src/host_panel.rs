@@ -194,17 +194,28 @@ impl HostPanelState {
 
                 ui.add_space(4.0);
                 if i.relay_connected {
-                    ui.label(
-                        egui::RichText::new("● Listo en Internet (Relay)")
-                            .size(11.0)
-                            .color(ACCENT_TEAL),
-                    );
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 3.5, ACCENT_TEAL);
+                        ui.label(
+                            egui::RichText::new("Listo en Internet (Relay)")
+                                .size(11.0)
+                                .color(ACCENT_TEAL),
+                        );
+                    });
                 } else if i.relay_url.is_some() {
-                    ui.label(
-                        egui::RichText::new("○ Conectando al servidor Relay...")
-                            .size(11.0)
-                            .color(STATUS_ORANGE),
-                    );
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                        ui.painter()
+                            .circle_filled(dot_rect.center(), 3.5, STATUS_ORANGE);
+                        ui.label(
+                            egui::RichText::new("Conectando al servidor Relay...")
+                                .size(11.0)
+                                .color(STATUS_ORANGE),
+                        );
+                    });
                 }
 
                 if let Some(lan) = &i.lan_ip {
