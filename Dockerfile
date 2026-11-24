@@ -1,12 +1,14 @@
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY crates/randydesk-proto ./crates/randydesk-proto
 COPY crates/randydesk-relay ./crates/randydesk-relay
 
-# Compila únicamente randydesk-proto y randydesk-relay en el contenedor Linux
+# Compila únicamente randydesk-proto y randydesk-relay en Linux (excluye dev-dependencies de Windows)
 RUN sed -i '/"crates\/randydesk-host"/d; /"crates\/randydesk-client"/d' Cargo.toml && \
+    sed -i '/^\[dev-dependencies\]/,$d' crates/randydesk-relay/Cargo.toml && \
+    rm -rf crates/randydesk-relay/tests && \
     cargo build --release -p randydesk-relay
 
 FROM debian:bookworm-slim
