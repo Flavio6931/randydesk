@@ -80,6 +80,9 @@ pub struct RandyDeskApp {
     fullscreen: bool,
     keyboard_grab_enabled: bool,
     was_foreground: bool,
+    remote_ctrl_down: bool,
+    remote_alt_down: bool,
+    remote_shift_down: bool,
     active_target_address: Option<String>,
     recorded_recent_for_session: bool,
     last_error_handled: Option<String>,
@@ -124,9 +127,42 @@ impl RandyDeskApp {
             fullscreen: false,
             keyboard_grab_enabled: true,
             was_foreground: false,
+            remote_ctrl_down: false,
+            remote_alt_down: false,
+            remote_shift_down: false,
             active_target_address: None,
             recorded_recent_for_session: false,
             last_error_handled: None,
+        }
+    }
+
+    fn release_remote_modifiers(&mut self) {
+        if self.remote_ctrl_down {
+            self.net.send_input(InputEvent::Key {
+                vk: 0xA2,
+                scan: 0x1D,
+                extended: false,
+                down: false,
+            });
+            self.remote_ctrl_down = false;
+        }
+        if self.remote_alt_down {
+            self.net.send_input(InputEvent::Key {
+                vk: 0xA4,
+                scan: 0x38,
+                extended: false,
+                down: false,
+            });
+            self.remote_alt_down = false;
+        }
+        if self.remote_shift_down {
+            self.net.send_input(InputEvent::Key {
+                vk: 0xA0,
+                scan: 0x2A,
+                extended: false,
+                down: false,
+            });
+            self.remote_shift_down = false;
         }
     }
 
@@ -271,6 +307,7 @@ impl eframe::App for RandyDeskApp {
             && ctx.input(|i| i.viewport().minimized == Some(true))
         {
             self.hidden_to_tray = true;
+            self.release_remote_modifiers();
             self.kb_hook.set_capture(false, None);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -320,12 +357,14 @@ impl eframe::App for RandyDeskApp {
         }
 
         if self.hidden_to_tray {
+            self.release_remote_modifiers();
             self.kb_hook.set_capture(false, None);
             return;
         }
 
         match status {
             ConnectionState::Disconnected | ConnectionState::Error(_) => {
+                self.release_remote_modifiers();
                 self.kb_hook.set_capture(false, None);
                 if let ConnectionState::Error(msg) = &status {
                     if self.last_error_handled.as_deref() != Some(msg.as_str()) {
@@ -345,6 +384,7 @@ impl eframe::App for RandyDeskApp {
                 self.render_modals(ctx);
             }
             ConnectionState::Connecting { ref address } => {
+                self.release_remote_modifiers();
                 self.kb_hook.set_capture(false, None);
                 self.render_connecting(ctx, address);
             }
@@ -359,6 +399,7 @@ impl eframe::App for RandyDeskApp {
                 attempt,
                 ref reason,
             } => {
+                self.release_remote_modifiers();
                 self.kb_hook.set_capture(false, None);
                 self.render_remote_session(
                     ctx,
@@ -921,16 +962,22 @@ impl RandyDeskApp {
                 }
 
                 ui.separator();
+                let kb_hits = self.kb_hook.sent_key_count();
                 let kb_label = if !self.keyboard_grab_enabled {
-                    egui::RichText::new("Teclado: OFF").color(TEXT_MUTED)
+                    egui::RichText::new("Atajos Win: OFF").color(TEXT_MUTED)
                 } else if self.kb_hook.is_installed() {
-                    egui::RichText::new("Teclado: ON").color(ACCENT_TEAL)
+                    let txt = if kb_hits > 0 {
+                        format!("Atajos Win: ON ({kb_hits})")
+                    } else {
+                        "Atajos Win: ON".to_string()
+                    };
+                    egui::RichText::new(txt).color(ACCENT_TEAL)
                 } else {
-                    egui::RichText::new("Teclado: Fallback").color(STATUS_ORANGE)
+                    egui::RichText::new("Atajos Win: Error").color(STATUS_ORANGE)
                 };
                 if ui
                     .button(kb_label)
-                    .on_hover_text("Replicar todo tu teclado (incluida tecla Win y Alt+Tab) en la PC remota")
+                    .on_hover_text("Captura tecla Windows y Alt+Tab hacia la PC remota (escribir texto siempre está activo)")
                     .clicked()
                 {
                     self.keyboard_grab_enabled = !self.keyboard_grab_enabled;
@@ -943,18 +990,27 @@ impl RandyDeskApp {
                     .on_hover_text("Enviar pulsación de tecla Windows a la PC remota")
                     .clicked()
                 {
-                    self.net.send_input(InputEvent::Key {
-                        vk: 0x5B,
-                        scan: 0x5B,
-                        extended: true,
-                        down: true,
-                    });
-                    self.net.send_input(InputEvent::Key {
-                        vk: 0x5B,
-                        scan: 0x5B,
-                        extended: true,
-                        down: false,
-                    });
+                    if let Some(tx) = self.net.cmd_sender() {
+                        self.rt_handle.spawn(async move {
+                            let _ = tx
+                                .send(NetCommand::Input(InputEvent::Key {
+                                    vk: 0x5B,
+                                    scan: 0x5B,
+                                    extended: true,
+                                    down: true,
+                                }))
+                                .await;
+                            tokio::time::sleep(Duration::from_millis(35)).await;
+                            let _ = tx
+                                .send(NetCommand::Input(InputEvent::Key {
+                                    vk: 0x5B,
+                                    scan: 0x5B,
+                                    extended: true,
+                                    down: false,
+                                }))
+                                .await;
+                        });
+                    }
                 }
                 if ui.button("Enviar portapapeles").clicked() {
                     if let Ok(text) = Clipboard::new().and_then(|mut c| c.get_text()) {
@@ -989,6 +1045,7 @@ impl RandyDeskApp {
                         self.fullscreen = false;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     }
+                    self.release_remote_modifiers();
                     self.kb_hook.set_capture(false, None);
                     self.net.disconnect();
                 }
@@ -1025,8 +1082,11 @@ impl RandyDeskApp {
                 let is_fg = KeyboardHookGuard::is_window_foreground();
                 let should_capture_kb =
                     reconnecting.is_none() && self.keyboard_grab_enabled && !self.hidden_to_tray;
-                if self.was_foreground && !is_fg && should_capture_kb {
-                    self.kb_hook.release_modifiers_now();
+                if self.was_foreground && !is_fg {
+                    self.release_remote_modifiers();
+                    if should_capture_kb {
+                        self.kb_hook.release_modifiers_now();
+                    }
                 }
                 self.was_foreground = is_fg;
 
@@ -1039,7 +1099,40 @@ impl RandyDeskApp {
                     },
                 );
 
-                let hook_active = self.kb_hook.is_capturing();
+                // Sincroniza Ctrl/Alt/Shift con la ventana remota para atajos (Ctrl+C, Ctrl+V, Alt+F4, Shift+Flechas)
+                if is_fg && reconnecting.is_none() {
+                    let mods = ctx.input(|i| i.modifiers);
+                    if mods.ctrl != self.remote_ctrl_down {
+                        self.net.send_input(InputEvent::Key {
+                            vk: 0xA2,
+                            scan: 0x1D,
+                            extended: false,
+                            down: mods.ctrl,
+                        });
+                        self.remote_ctrl_down = mods.ctrl;
+                    }
+                    if mods.alt != self.remote_alt_down {
+                        self.net.send_input(InputEvent::Key {
+                            vk: 0xA4,
+                            scan: 0x38,
+                            extended: false,
+                            down: mods.alt,
+                        });
+                        self.remote_alt_down = mods.alt;
+                    }
+                    if mods.shift != self.remote_shift_down {
+                        self.net.send_input(InputEvent::Key {
+                            vk: 0xA0,
+                            scan: 0x2A,
+                            extended: false,
+                            down: mods.shift,
+                        });
+                        self.remote_shift_down = mods.shift;
+                    }
+                } else {
+                    self.release_remote_modifiers();
+                }
+
                 let events = ctx.input(|i| i.events.clone());
 
                 for ev in events {
@@ -1082,7 +1175,7 @@ impl RandyDeskApp {
                             pressed,
                             modifiers,
                             ..
-                        } if !hook_active => {
+                        } => {
                             let is_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
                             if is_combo || is_control_or_nav_key(key) {
                                 if let Some((vk, extended)) = map_egui_key_to_vk(key) {
@@ -1095,7 +1188,7 @@ impl RandyDeskApp {
                                 }
                             }
                         }
-                        egui::Event::Text(text) if !hook_active => {
+                        egui::Event::Text(text) => {
                             let mods = ctx.input(|i| i.modifiers);
                             if !mods.ctrl && !mods.alt && !mods.command {
                                 for ch in text.chars().filter(|c| !c.is_control()) {

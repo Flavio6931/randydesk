@@ -1,13 +1,16 @@
-//! Inyección de eventos de ratón y teclado en Windows mediante `SendInput` (estilo RustDesk: scancodes + desktop activo).
+//! Inyección de eventos de ratón y teclado en Windows mediante `SendInput` (estilo `enigo` de RustDesk + desktop activo).
 
 use crate::capture::MonitorGeometry;
 use anyhow::{anyhow, Result};
+use directories::ProjectDirs;
 use randydesk_proto::{InputEvent, MouseButton};
 use std::ffi::c_void;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tracing::warn;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, HANDLE, HWND};
@@ -44,6 +47,31 @@ const DESKTOP_SWITCH_ACCESS: u32 = 0x01FF;
 
 static UIPI_BLOCK_DETECTED: AtomicBool = AtomicBool::new(false);
 static INPUT_WORKER_TX: OnceLock<SyncSender<(InputEvent, MonitorGeometry)>> = OnceLock::new();
+static DEBUG_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+/// Registra eventos de teclado en `%APPDATA%\RandyDesk\input_debug.log` para diagnóstico local.
+pub fn append_input_debug_log(line: &str) {
+    let mutex = DEBUG_LOG_FILE.get_or_init(|| {
+        let opened = ProjectDirs::from("com", "RandyDesk", "RandyDesk").and_then(|proj| {
+            let dir = proj.config_dir();
+            fs::create_dir_all(dir).ok()?;
+            let path = dir.join("input_debug.log");
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .ok()
+        });
+        Mutex::new(opened)
+    });
+    if let Ok(mut guard) = mutex.lock() {
+        if let Some(file) = guard.as_mut() {
+            let _ = writeln!(file, "{line}");
+            let _ = file.flush();
+        }
+    }
+}
 
 fn input_worker_sender() -> &'static SyncSender<(InputEvent, MonitorGeometry)> {
     INPUT_WORKER_TX.get_or_init(|| {
@@ -132,7 +160,7 @@ fn inject_input_on_current_thread(event: &InputEvent, monitor: MonitorGeometry) 
                 0
             };
             let ki = build_keybd_input(vk, scan, extended, down, resolved_scan_ex);
-            send_keyboard(ki);
+            dispatch_keyboard_with_log(ki, vk, scan, extended, down);
         }
         InputEvent::UnicodeChar { ch, down } => {
             let mut buf = [0u16; 2];
@@ -170,7 +198,7 @@ fn is_extended_vk(vk: u16) -> bool {
     )
 }
 
-/// Construye `KEYBDINPUT` en modo scan code (`KEYEVENTF_SCANCODE` + `wVk = 0`, estilo RustDesk) con fallback a VK/Unicode.
+/// Construye `KEYBDINPUT` al estilo `enigo` de RustDesk (`wVk + wScan` sin `KEYEVENTF_SCANCODE`) con fallback `VK_PACKET`/scancode.
 pub(crate) fn build_keybd_input(
     vk: u16,
     scan: u16,
@@ -212,7 +240,22 @@ pub(crate) fn build_keybd_input(
         (raw, ext)
     };
 
-    if raw_scan != 0 {
+    if vk != 0 {
+        let mut flags = KEYBD_EVENT_FLAGS(0);
+        if is_extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if !down {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        KEYBDINPUT {
+            wVk: VIRTUAL_KEY(vk),
+            wScan: raw_scan,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
+        }
+    } else if raw_scan != 0 {
         let mut flags = KEYEVENTF_SCANCODE;
         if is_extended {
             flags |= KEYEVENTF_EXTENDEDKEY;
@@ -236,7 +279,7 @@ pub(crate) fn build_keybd_input(
             flags |= KEYEVENTF_KEYUP;
         }
         KEYBDINPUT {
-            wVk: VIRTUAL_KEY(vk),
+            wVk: VIRTUAL_KEY(0),
             wScan: 0,
             dwFlags: flags,
             time: 0,
@@ -262,7 +305,6 @@ fn ensure_input_desktop() {
 
         let same = desktop_name(current_desk) == desktop_name(input_desk);
         if !same && SetThreadDesktop(input_desk).is_ok() {
-            let _ = CloseDesktop(current_desk);
             return;
         }
         let _ = CloseDesktop(input_desk);
@@ -396,20 +438,39 @@ fn send_keyboard(ki: KEYBDINPUT) {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
     };
-    dispatch_input(input);
+    let _ = dispatch_input(input);
 }
 
-fn dispatch_input(input: INPUT) {
+fn dispatch_keyboard_with_log(ki: KEYBDINPUT, vk: u16, scan: u16, extended: bool, down: bool) {
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki },
+    };
+    let (sent, err_code) = dispatch_input(input);
+    let elev = is_process_elevated();
+    let fg_elev = is_foreground_window_elevated();
+    append_input_debug_log(&format!(
+        "[HOST-KEY] vk=0x{vk:04X} scan=0x{scan:04X} ext={extended} down={down} -> wVk=0x{:04X} wScan=0x{:04X} flags=0x{:04X} sent={sent} err={err_code} elev={elev} fg_elev={fg_elev}",
+        ki.wVk.0, ki.wScan, ki.dwFlags.0
+    ));
+}
+
+fn dispatch_input(input: INPUT) -> (u32, u32) {
     let sent = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    let err = if sent == 0 {
+        unsafe { GetLastError().0 }
+    } else {
+        0
+    };
     if sent == 0 {
-        let err = unsafe { GetLastError() };
         if !is_process_elevated() && is_foreground_window_elevated() {
             UIPI_BLOCK_DETECTED.store(true, Ordering::Relaxed);
         }
-        warn!("SendInput devolvió 0 (posible bloqueo UIPI): {err:?}");
+        warn!("SendInput devolvió 0 (posible bloqueo UIPI, err={err})");
     } else if !is_process_elevated() && is_foreground_window_elevated() {
         UIPI_BLOCK_DETECTED.store(true, Ordering::Relaxed);
     }
+    (sent, err)
 }
 
 #[cfg(test)]
@@ -417,42 +478,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn win_keys_use_scancode_and_extended_flag() {
+    fn win_keys_use_enigo_vk_and_extended_flag() {
         let lwin_down = build_keybd_input(0x5B, 0x5B, false, true, 0);
-        assert_eq!(lwin_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(lwin_down.wVk, VIRTUAL_KEY(0x5B));
         assert_eq!(lwin_down.wScan, 0x5B);
-        assert!(lwin_down.dwFlags.contains(KEYEVENTF_SCANCODE));
-        assert!(lwin_down.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
-        assert!(!lwin_down.dwFlags.contains(KEYEVENTF_KEYUP));
+        assert_eq!(lwin_down.dwFlags, KEYEVENTF_EXTENDEDKEY);
 
         let rwin_up = build_keybd_input(0x5C, 0, false, false, 0xE05C);
-        assert_eq!(rwin_up.wVk, VIRTUAL_KEY(0));
+        assert_eq!(rwin_up.wVk, VIRTUAL_KEY(0x5C));
         assert_eq!(rwin_up.wScan, 0x5C);
-        assert!(rwin_up.dwFlags.contains(KEYEVENTF_SCANCODE));
-        assert!(rwin_up.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
-        assert!(rwin_up.dwFlags.contains(KEYEVENTF_KEYUP));
+        assert_eq!(rwin_up.dwFlags, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP);
     }
 
     #[test]
     fn normal_key_and_rshift_and_unicode_follow_rustdesk_rules() {
         let a_down = build_keybd_input(0x41, 0x1E, false, true, 0);
-        assert_eq!(a_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(a_down.wVk, VIRTUAL_KEY(0x41));
         assert_eq!(a_down.wScan, 0x1E);
-        assert_eq!(a_down.dwFlags, KEYEVENTF_SCANCODE);
+        assert_eq!(a_down.dwFlags, KEYBD_EVENT_FLAGS(0));
 
         let rshift_down = build_keybd_input(0xA1, 0x36, true, true, 0);
-        assert_eq!(rshift_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(rshift_down.wVk, VIRTUAL_KEY(0xA1));
         assert_eq!(rshift_down.wScan, 0x36);
-        assert_eq!(rshift_down.dwFlags, KEYEVENTF_SCANCODE);
+        assert_eq!(rshift_down.dwFlags, KEYBD_EVENT_FLAGS(0));
 
         let packet = build_keybd_input(VK_PACKET_U16, 'á' as u16, false, true, 0);
         assert_eq!(packet.wVk, VIRTUAL_KEY(0));
         assert_eq!(packet.wScan, 'á' as u16);
         assert_eq!(packet.dwFlags, KEYEVENTF_UNICODE);
 
-        let media_fallback = build_keybd_input(0xAF, 0, false, true, 0);
-        assert_eq!(media_fallback.wVk, VIRTUAL_KEY(0xAF));
-        assert_eq!(media_fallback.wScan, 0);
-        assert_eq!(media_fallback.dwFlags, KEYBD_EVENT_FLAGS(0));
+        let scan_only = build_keybd_input(0, 0x1E, false, true, 0);
+        assert_eq!(scan_only.wVk, VIRTUAL_KEY(0));
+        assert_eq!(scan_only.wScan, 0x1E);
+        assert_eq!(scan_only.dwFlags, KEYEVENTF_SCANCODE);
     }
 }

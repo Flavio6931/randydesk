@@ -1,7 +1,7 @@
-//! Hook de teclado de bajo nivel (`WH_KEYBOARD_LL`) estilo RustDesk para replicar todo el teclado.
+//! Hook de teclado de bajo nivel (`WH_KEYBOARD_LL`) estilo RustDesk para capturar solo `Win` y atajos de sistema.
 
 use crate::net::NetCommand;
-use randydesk_host::input::RANDYDESK_INPUT_EXTRA_INFO;
+use randydesk_host::input::{append_input_debug_log, RANDYDESK_INPUT_EXTRA_INFO};
 use randydesk_proto::InputEvent;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,6 +10,7 @@ use tracing::warn;
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
     PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
@@ -24,6 +25,7 @@ const VK_PACKET_U16: u16 = 0x00E7;
 struct HookSharedState {
     installed: AtomicBool,
     active: AtomicBool,
+    win_down: AtomicBool,
     own_pid: u32,
     sent_keys: AtomicU64,
     tx: Mutex<Option<mpsc::Sender<NetCommand>>>,
@@ -36,6 +38,7 @@ fn shared_state() -> &'static Arc<HookSharedState> {
         Arc::new(HookSharedState {
             installed: AtomicBool::new(false),
             active: AtomicBool::new(false),
+            win_down: AtomicBool::new(false),
             own_pid: unsafe { GetCurrentProcessId() },
             sent_keys: AtomicU64::new(0),
             tx: Mutex::new(None),
@@ -71,10 +74,14 @@ impl KeyboardHookGuard {
                         Err(err) => {
                             warn!("No se pudo instalar hook WH_KEYBOARD_LL: {err}");
                             shared_state().installed.store(false, Ordering::SeqCst);
+                            append_input_debug_log(&format!(
+                                "[CLIENT-HOOK] WH_KEYBOARD_LL installed=false err={err}"
+                            ));
                             return;
                         }
                     };
                 shared_state().installed.store(true, Ordering::SeqCst);
+                append_input_debug_log("[CLIENT-HOOK] WH_KEYBOARD_LL installed=true");
 
                 while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                     let _ = TranslateMessage(&msg);
@@ -104,19 +111,18 @@ impl KeyboardHookGuard {
         shared_state().installed.load(Ordering::Acquire)
     }
 
-    /// Cantidad acumulada de eventos de teclado capturados por el hook.
-    #[allow(dead_code)]
+    /// Cantidad acumulada de teclas de sistema capturadas por el hook.
     pub fn sent_key_count(&self) -> u64 {
         shared_state().sent_keys.load(Ordering::Relaxed)
     }
 
-    /// Activa o desactiva la captura exclusiva de teclado hacia `tx`; libera modificadores al soltar.
+    /// Activa o desactiva la captura de atajos de sistema hacia `tx`; libera modificadores al soltar.
     pub fn set_capture(&mut self, active: bool, tx: Option<mpsc::Sender<NetCommand>>) {
         let state = shared_state();
         if self.was_active == active {
             if active {
                 if let Ok(mut guard) = state.tx.lock() {
-                    if guard.is_none() && tx.is_some() {
+                    if guard.as_ref().is_none_or(|old| old.is_closed()) && tx.is_some() {
                         *guard = tx;
                     }
                 }
@@ -127,6 +133,9 @@ impl KeyboardHookGuard {
         if self.was_active && !active {
             self.release_modifiers_now();
         }
+        if !active {
+            state.win_down.store(false, Ordering::Relaxed);
+        }
         state.active.store(active, Ordering::SeqCst);
         if let Ok(mut guard) = state.tx.lock() {
             *guard = if active { tx } else { None };
@@ -136,16 +145,12 @@ impl KeyboardHookGuard {
 
     /// Libera los modificadores en la PC remota sin desconectar el canal ni apagar el hook.
     pub fn release_modifiers_now(&self) {
+        shared_state().win_down.store(false, Ordering::Relaxed);
         if let Ok(guard) = shared_state().tx.try_lock() {
             if let Some(prev_tx) = guard.as_ref() {
                 release_modifiers(prev_tx);
             }
         }
-    }
-
-    /// Indica si el hook está activo e interceptando realmente las teclas hacia la PC remota.
-    pub fn is_capturing(&self) -> bool {
-        self.was_active && self.is_installed()
     }
 }
 
@@ -173,6 +178,25 @@ fn release_modifiers(tx: &mpsc::Sender<NetCommand>) {
             extended,
             down: false,
         }));
+    }
+}
+
+/// Decide al estilo RustDesk (`windows.cc`) si una pulsación debe interceptarse como hotkey de sistema.
+/// Devuelve `(interceptar, nuevo_estado_win_down)`. Las teclas normales regresan `false` hacia `egui`.
+pub(crate) fn should_intercept_system_key(
+    vk: u16,
+    down: bool,
+    win_was_down: bool,
+    alt_down: bool,
+    ctrl_down: bool,
+) -> (bool, bool) {
+    match vk {
+        0x5B | 0x5C => (true, down),
+        0x2C => (true, win_was_down),
+        0x09 if alt_down => (true, win_was_down),
+        0x1B if alt_down || ctrl_down => (true, win_was_down),
+        _ if win_was_down => (true, win_was_down),
+        _ => (false, win_was_down),
     }
 }
 
@@ -226,13 +250,35 @@ unsafe extern "system" fn low_level_kb_proc(
                     _ => None,
                 };
                 if let Some(down) = down {
-                    if let Ok(guard) = state.tx.try_lock() {
-                        if let Some(tx) = guard.as_ref() {
-                            let ev = build_hook_key_event(kb.vkCode, kb.scanCode, kb.flags.0, down);
-                            if tx.try_send(NetCommand::Input(ev)).is_ok() {
-                                state.sent_keys.fetch_add(1, Ordering::Relaxed);
+                    let vk = kb.vkCode as u16;
+                    let win_was_down = state.win_down.load(Ordering::Relaxed);
+                    let alt_down = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0;
+                    let ctrl_down = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0;
+                    let (intercept, new_win_down) =
+                        should_intercept_system_key(vk, down, win_was_down, alt_down, ctrl_down);
+                    state.win_down.store(new_win_down, Ordering::Relaxed);
+
+                    if intercept {
+                        if let Ok(guard) = state.tx.try_lock() {
+                            if let Some(tx) = guard.as_ref() {
+                                let ev =
+                                    build_hook_key_event(kb.vkCode, kb.scanCode, kb.flags.0, down);
+                                match tx.try_send(NetCommand::Input(ev)) {
+                                    Ok(()) => {
+                                        state.sent_keys.fetch_add(1, Ordering::Relaxed);
+                                        append_input_debug_log(&format!(
+                                            "[CLIENT-HOOK] syskey vk=0x{vk:04X} scan=0x{:02X} down={down} -> sent=ok",
+                                            kb.scanCode & 0xFF
+                                        ));
+                                        return LRESULT(1);
+                                    }
+                                    Err(err) => {
+                                        append_input_debug_log(&format!(
+                                            "[CLIENT-HOOK] syskey vk=0x{vk:04X} down={down} -> send_err={err}"
+                                        ));
+                                    }
+                                }
                             }
-                            return LRESULT(1);
                         }
                     }
                 }
@@ -290,5 +336,24 @@ mod tests {
                 down: true,
             }
         );
+    }
+
+    #[test]
+    fn intercepts_only_system_hotkeys_like_rustdesk() {
+        // Teclas normales pasan a egui
+        assert_eq!(should_intercept_system_key(0x41, true, false, false, false), (false, false));
+        assert_eq!(should_intercept_system_key(0x0D, true, false, false, false), (false, false));
+        assert_eq!(should_intercept_system_key(0x09, true, false, false, false), (false, false));
+
+        // Tecla Win y combinaciones Win+R se interceptan
+        assert_eq!(should_intercept_system_key(0x5B, true, false, false, false), (true, true));
+        assert_eq!(should_intercept_system_key(0x52, true, true, false, false), (true, true));
+        assert_eq!(should_intercept_system_key(0x5B, false, true, false, false), (true, false));
+
+        // Alt+Tab, Alt+Esc, Ctrl+Esc y PrintScreen se interceptan
+        assert_eq!(should_intercept_system_key(0x09, true, false, true, false), (true, false));
+        assert_eq!(should_intercept_system_key(0x1B, true, false, true, false), (true, false));
+        assert_eq!(should_intercept_system_key(0x1B, true, false, false, true), (true, false));
+        assert_eq!(should_intercept_system_key(0x2C, true, false, false, false), (true, false));
     }
 }

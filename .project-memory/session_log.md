@@ -1,5 +1,20 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-24 — RandyDesk v0.4.3: Teclado híbrido estilo RustDesk (`egui` + hook solo sistema + `enigo` VK)
+- **Resumen técnico:**
+  - Versión subida a `0.4.3` en `Cargo.toml`.
+  - Aislada causa raíz tras prueba en vivo: con el modo `egui` (`KEYEVENTF_UNICODE` / `wVk`) la escritura sí funcionaba, mientras que secuestrar todo el teclado con `WH_KEYBOARD_LL` + `KEYEVENTF_SCANCODE` bloqueaba letras normales y Menú Inicio.
+  - `crates/randydesk-client/src/win_hook.rs`: hook `WH_KEYBOARD_LL` limitado exclusivamente a teclas de sistema al estilo RustDesk (`windows.cc`: `VK_LWIN`/`VK_RWIN`, combos con `Win`, `Alt+Tab`, `Alt+Esc`, `Ctrl+Esc`, `PrintScreen`), dejando pasar teclas normales al flujo de ventana `egui`.
+  - `crates/randydesk-client/src/app.rs`: flujo `egui::Event::Text` y `egui::Event::Key` siempre activo, sincronización de modificadores `Ctrl`/`Alt`/`Shift` con la PC remota, botón `Atajos Win: ON (N)` y retardo de `35 ms` entre `down` y `up` en el botón `Tecla Win`.
+  - `crates/randydesk-host/src/input.rs`: inyección estilo `enigo` (`wVk + wScan` sin `KEYEVENTF_SCANCODE` cuando `vk != 0`), corrección en `ensure_input_desktop()` para no cerrar el handle de `GetThreadDesktop`, y log de diagnóstico en `%APPDATA%\RandyDesk\input_debug.log`.
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 24 pruebas aprobadas (9 en `randydesk-client`, 5 en `randydesk-host`, 1 `quic_loopback`, 8 en `randydesk-proto`, 1 `relay_e2e`).
+  - `cargo build --workspace --release`: generado `target\release\RandyDesk.exe` (`11,174,400` bytes) y `target\release\randydesk-relay.exe` (`2,766,336` bytes, copiado a `dist\`). `dist\RandyDesk.exe` no se sobreescribió porque `RandyDesk.exe` (`v0.4.2`, PID `10888`) seguía en ejecución.
+  - Publicado commit en `main` y Release `v0.4.3` en `Flavio6931/randydesk`.
+- **Pendiente de verificación en vivo:**
+  - Cerrar `dist\RandyDesk.exe` (PID `10888`), copiar `target\release\RandyDesk.exe` a `dist\`, actualizar ambas PCs a `v0.4.3` y probar escritura, atajos, `Win` y `Atajos Win: ON`.
+
 ## 2026-11-24 — RandyDesk v0.4.2: Inyección por scancode estilo RustDesk, desktop activo y UIPI/Admin
 - **Resumen técnico:**
   - Comparado con la arquitectura real de RustDesk (`libs/enigo/src/win/win_impl.rs`, `src/server/input_service.rs`, `src/platform/windows.cc` y `rustdesk-org/rdev/src/windows/{simulate,common,grab}.rs`).
