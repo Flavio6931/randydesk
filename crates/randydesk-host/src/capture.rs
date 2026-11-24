@@ -1,0 +1,427 @@
+//! Captura de pantalla de baja latencia mediante DXGI Desktop Duplication con fallback a GDI.
+
+use anyhow::{anyhow, Context, Result};
+use std::mem::size_of;
+use tracing::{info, warn};
+use windows::core::Interface;
+use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{
+    IDXGIAdapter, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+};
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors,
+    GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HBITMAP, HDC, HMONITOR, SRCCOPY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+};
+
+/// Geometría en coordenadas del escritorio virtual del monitor capturado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorGeometry {
+    /// Origen X en píxeles dentro del escritorio virtual.
+    pub origin_x: i32,
+    /// Origen Y en píxeles dentro del escritorio virtual.
+    pub origin_y: i32,
+    /// Ancho del monitor en píxeles.
+    pub width: u32,
+    /// Alto del monitor en píxeles.
+    pub height: u32,
+}
+
+/// Cuadro capturado en formato BGRA8 empaquetado (4 bytes por píxel).
+#[derive(Debug, Clone)]
+pub struct CapturedFrame {
+    /// Ancho del cuadro en píxeles.
+    pub width: u32,
+    /// Alto del cuadro en píxeles.
+    pub height: u32,
+    /// Buffer continuo de tamaño `width * height * 4` en orden B, G, R, A.
+    pub bgra: Vec<u8>,
+}
+
+/// Interfaz unificada para backends de captura de pantalla.
+pub trait ScreenCapturer: Send {
+    /// Captura el siguiente cuadro disponible; devuelve `Ok(None)` si no hubo cambios dentro de `timeout_ms`.
+    fn capture(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>>;
+
+    /// Devuelve la geometría actual del monitor capturado.
+    fn dimensions(&self) -> MonitorGeometry;
+}
+
+/// Crea el mejor capturador disponible para `monitor_index`: intenta DXGI y cae a GDI si falla.
+pub fn create_capturer(monitor_index: usize) -> Result<Box<dyn ScreenCapturer>> {
+    match DxgiCapturer::new(monitor_index) {
+        Ok(dxgi) => {
+            let dims = dxgi.dimensions();
+            info!(
+                "Captura iniciada con DXGI Desktop Duplication (monitor {}, {}x{} en {},{})",
+                monitor_index, dims.width, dims.height, dims.origin_x, dims.origin_y
+            );
+            Ok(Box::new(dxgi))
+        }
+        Err(err) => {
+            warn!(
+                "DXGI no disponible ({err:#}); activando fallback automático a GDI"
+            );
+            let gdi = GdiCapturer::new(monitor_index)?;
+            let dims = gdi.dimensions();
+            info!(
+                "Captura iniciada con GDI (monitor {}, {}x{} en {},{})",
+                monitor_index, dims.width, dims.height, dims.origin_x, dims.origin_y
+            );
+            Ok(Box::new(gdi))
+        }
+    }
+}
+
+/// Guardia RAII que garantiza llamar a `ReleaseFrame` al salir del ámbito de un frame DXGI.
+struct DxgiFrameGuard {
+    dup: IDXGIOutputDuplication,
+}
+
+impl Drop for DxgiFrameGuard {
+    fn drop(&mut self) {
+        // Ignoramos errores al liberar si el dispositivo ya se perdió.
+        unsafe {
+            let _ = self.dup.ReleaseFrame();
+        }
+    }
+}
+
+/// Capturador de alto rendimiento basado en DXGI Desktop Duplication API.
+pub struct DxgiCapturer {
+    monitor_index: usize,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    output1: IDXGIOutput1,
+    dup: IDXGIOutputDuplication,
+    staging: Option<ID3D11Texture2D>,
+    geometry: MonitorGeometry,
+}
+
+impl DxgiCapturer {
+    /// Inicializa el dispositivo D3D11 y la duplicación del monitor especificado.
+    pub fn new(monitor_index: usize) -> Result<Self> {
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .context("falló D3D11CreateDevice")?;
+        }
+        let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice devolvió device nulo"))?;
+        let context = context.ok_or_else(|| anyhow!("D3D11CreateDevice devolvió context nulo"))?;
+
+        let dxgi_device: IDXGIDevice = device.cast()?;
+        let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter()? };
+        let output: IDXGIOutput = unsafe {
+            adapter
+                .EnumOutputs(monitor_index as u32)
+                .with_context(|| format!("monitor índice {monitor_index} no encontrado en DXGI"))?
+        };
+        let desc = unsafe { output.GetDesc()? };
+        let rect = desc.DesktopCoordinates;
+        let width = (rect.right - rect.left).max(1) as u32;
+        let height = (rect.bottom - rect.top).max(1) as u32;
+        let geometry = MonitorGeometry {
+            origin_x: rect.left,
+            origin_y: rect.top,
+            width,
+            height,
+        };
+
+        let output1: IDXGIOutput1 = output.cast()?;
+        let dup = unsafe {
+            output1
+                .DuplicateOutput(&device)
+                .context("falló DuplicateOutput (posible sesión sin composición o UAC)")?
+        };
+
+        Ok(Self {
+            monitor_index,
+            device,
+            context,
+            output1,
+            dup,
+            staging: None,
+            geometry,
+        })
+    }
+
+    fn recreate_duplication(&mut self) -> Result<()> {
+        self.staging = None;
+        let dxgi_device: IDXGIDevice = self.device.cast()?;
+        let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter()? };
+        let output: IDXGIOutput = unsafe { adapter.EnumOutputs(self.monitor_index as u32)? };
+        let desc = unsafe { output.GetDesc()? };
+        let rect = desc.DesktopCoordinates;
+        self.geometry = MonitorGeometry {
+            origin_x: rect.left,
+            origin_y: rect.top,
+            width: (rect.right - rect.left).max(1) as u32,
+            height: (rect.bottom - rect.top).max(1) as u32,
+        };
+        self.output1 = output.cast()?;
+        self.dup = unsafe { self.output1.DuplicateOutput(&self.device)? };
+        Ok(())
+    }
+
+    fn ensure_staging(&mut self, width: u32, height: u32) -> Result<ID3D11Texture2D> {
+        if let Some(tex) = &self.staging {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { tex.GetDesc(&mut desc) };
+            if desc.Width == width && desc.Height == height {
+                return Ok(tex.clone());
+            }
+        }
+
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .context("falló CreateTexture2D staging")?;
+        }
+        let tex = tex.ok_or_else(|| anyhow!("CreateTexture2D devolvió textura nula"))?;
+        self.staging = Some(tex.clone());
+        Ok(tex)
+    }
+}
+
+impl ScreenCapturer for DxgiCapturer {
+    fn capture(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
+        let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut resource: Option<IDXGIResource> = None;
+
+        match unsafe { self.dup.AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource) } {
+            Ok(()) => {}
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                warn!("DXGI_ERROR_ACCESS_LOST detectado; recreando duplicación");
+                self.recreate_duplication()?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e).context("error en AcquireNextFrame"),
+        }
+
+        let _guard = DxgiFrameGuard {
+            dup: self.dup.clone(),
+        };
+        let resource = resource.ok_or_else(|| anyhow!("AcquireNextFrame devolvió recurso nulo"))?;
+        let gpu_tex: ID3D11Texture2D = resource.cast()?;
+        let mut gpu_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { gpu_tex.GetDesc(&mut gpu_desc) };
+
+        let width = gpu_desc.Width;
+        let height = gpu_desc.Height;
+        self.geometry.width = width;
+        self.geometry.height = height;
+
+        let staging = self.ensure_staging(width, height)?;
+        unsafe {
+            self.context.CopyResource(&staging, &gpu_tex);
+        }
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("falló Map de textura staging")?;
+        }
+
+        let row_bytes = (width as usize) * 4;
+        let pitch = mapped.RowPitch as usize;
+        let mut bgra = vec![0u8; row_bytes * (height as usize)];
+
+        unsafe {
+            let src_ptr = mapped.pData as *const u8;
+            for y in 0..(height as usize) {
+                let src_row = std::slice::from_raw_parts(src_ptr.add(y * pitch), row_bytes);
+                let dst_row = &mut bgra[y * row_bytes..(y + 1) * row_bytes];
+                dst_row.copy_from_slice(src_row);
+            }
+            self.context.Unmap(&staging, 0);
+        }
+
+        Ok(Some(CapturedFrame {
+            width,
+            height,
+            bgra,
+        }))
+    }
+
+    fn dimensions(&self) -> MonitorGeometry {
+        self.geometry
+    }
+}
+
+/// Capturador de respaldo basado en Win32 GDI (`BitBlt`) para entornos sin soporte DXGI.
+pub struct GdiCapturer {
+    geometry: MonitorGeometry,
+}
+
+impl GdiCapturer {
+    /// Inicializa la geometría del monitor usando `EnumDisplayMonitors` o pantalla primaria.
+    pub fn new(monitor_index: usize) -> Result<Self> {
+        let monitors = enumerate_monitor_rects();
+        let geometry = if let Some(rect) = monitors.get(monitor_index) {
+            MonitorGeometry {
+                origin_x: rect.left,
+                origin_y: rect.top,
+                width: (rect.right - rect.left).max(1) as u32,
+                height: (rect.bottom - rect.top).max(1) as u32,
+            }
+        } else {
+            let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1) as u32;
+            let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1) as u32;
+            MonitorGeometry {
+                origin_x: 0,
+                origin_y: 0,
+                width,
+                height,
+            }
+        };
+        Ok(Self { geometry })
+    }
+}
+
+impl ScreenCapturer for GdiCapturer {
+    fn capture(&mut self, _timeout_ms: u32) -> Result<Option<CapturedFrame>> {
+        let width = self.geometry.width;
+        let height = self.geometry.height;
+
+        unsafe {
+            let screen_dc = GetDC(None);
+            if screen_dc.is_invalid() {
+                return Err(anyhow!("GetDC(None) falló"));
+            }
+            let mem_dc = CreateCompatibleDC(screen_dc);
+            if mem_dc.is_invalid() {
+                ReleaseDC(None, screen_dc);
+                return Err(anyhow!("CreateCompatibleDC falló"));
+            }
+            let bmp: HBITMAP = CreateCompatibleBitmap(screen_dc, width as i32, height as i32);
+            if bmp.is_invalid() {
+                let _ = DeleteDC(mem_dc);
+                ReleaseDC(None, screen_dc);
+                return Err(anyhow!("CreateCompatibleBitmap falló"));
+            }
+
+            let old_obj = SelectObject(mem_dc, bmp);
+            let blt_res = BitBlt(
+                mem_dc,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                screen_dc,
+                self.geometry.origin_x,
+                self.geometry.origin_y,
+                SRCCOPY,
+            );
+
+            let mut bgra = vec![0u8; (width as usize) * (height as usize) * 4];
+            if blt_res.is_ok() {
+                let mut bi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width as i32,
+                        biHeight: -(height as i32), // top-down
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let scanlines = GetDIBits(
+                    mem_dc,
+                    bmp,
+                    0,
+                    height,
+                    Some(bgra.as_mut_ptr() as *mut _),
+                    &mut bi,
+                    DIB_RGB_COLORS,
+                );
+                if scanlines == 0 {
+                    SelectObject(mem_dc, old_obj);
+                    let _ = DeleteObject(bmp);
+                    let _ = DeleteDC(mem_dc);
+                    ReleaseDC(None, screen_dc);
+                    return Err(anyhow!("GetDIBits devolvió 0 scanlines"));
+                }
+            }
+
+            SelectObject(mem_dc, old_obj);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(None, screen_dc);
+            blt_res.context("BitBlt falló")?;
+
+            Ok(Some(CapturedFrame {
+                width,
+                height,
+                bgra,
+            }))
+        }
+    }
+
+    fn dimensions(&self) -> MonitorGeometry {
+        self.geometry
+    }
+}
+
+unsafe extern "system" fn monitor_enum_proc(
+    _hmonitor: HMONITOR,
+    _hdc: HDC,
+    lprect: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    if !lprect.is_null() {
+        let list = &mut *(lparam.0 as *mut Vec<RECT>);
+        list.push(*lprect);
+    }
+    BOOL(1)
+}
+
+fn enumerate_monitor_rects() -> Vec<RECT> {
+    let mut rects: Vec<RECT> = Vec::new();
+    unsafe {
+        let ptr = (&mut rects as *mut Vec<RECT>) as isize;
+        let _ = EnumDisplayMonitors(None, None, Some(monitor_enum_proc), LPARAM(ptr));
+    }
+    rects
+}
