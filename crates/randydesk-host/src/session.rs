@@ -249,7 +249,7 @@ async fn run_session_loops(
     }
 }
 
-fn spawn_capture_worker(
+pub(crate) fn spawn_capture_worker(
     mut capturer: Box<dyn ScreenCapturer>,
     shared_settings: Arc<Mutex<StreamSettings>>,
     force_keyframe: Arc<AtomicBool>,

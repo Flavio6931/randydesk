@@ -1,30 +1,28 @@
 # RandyDesk
 
-Software ligero de escritorio remoto para Windows escrito en **Rust puro**, inspirado en RustDesk y optimizado para **sesiones ilimitadas (2–24+ horas)** entre tus equipos sin límites comerciales ni servidores pagos.
+Software ligero de escritorio remoto para Windows escrito en **Rust puro**, inspirado en RustDesk y optimizado para **sesiones ilimitadas (2–24+ horas)** sin depender de Tailscale ni servicios pagos.
 
-## Ejecutable unificado (`RandyDesk.exe`)
+## Cómo conectarse sin Tailscale (ID numérico + Relay E2E)
 
-Al abrir **`dist\RandyDesk.exe`** (o `target\release\RandyDesk.exe`) con doble clic se abre la interfaz gráfica sin consola negra:
-- **Panel izquierdo (`Tu Escritorio`):** enciende automáticamente la recepción de conexiones en el puerto UDP `21118`, muestra tu IP LAN y tu IP Tailscale, y genera o permite fijar un PIN/contraseña.
-- **Panel derecho (`Controlar escritorio remoto` + `Mis Equipos`):** guarda tus 3–4 PCs para conectarte en 1 clic con cifrado QUIC TLS 1.3, verificación TOFU, modo Fluido (JPEG) o Nítido (LZ4), portapapeles y reconexión automática.
+1. **Tu servidor Relay (`randydesk-relay`):**
+   - **Para probar hoy en 10 segundos** desde tu PC (si tienes `cloudflared`):
+     ```powershell
+     .\dist\randydesk-relay.exe
+     cloudflared tunnel --url http://127.0.0.1:21119
+     ```
+     Copia la URL `https://xxxx.trycloudflare.com` que imprime `cloudflared`.
+   - **Para dejarlo gratis 24/7 en la nube:** conecta este repositorio en **Render** (incluye `Dockerfile` y `render.yaml` con `plan: free`).
+2. **En ambas PCs (la tuya y la de tu compañero):**
+   - Abran **`RandyDesk.exe`**, pulsen **`Configurar servidor Relay`** en la barra inferior y peguen la URL del Relay.
+   - El panel izquierdo mostrará **`● Listo en Internet (Relay)`** debajo de tu **ID de 9 dígitos** (ej. `482 910 331`).
+   - Escribe el ID de tu compañero, pon su contraseña/PIN y listo: todo el video, teclado y ratón viajan cifrados **E2E (X25519 + ChaCha20-Poly1305)**.
 
-*(Opcional: `target\release\randydesk-host.exe` sigue disponible si quieres correr el agente en modo consola/servicio sin ventana).*
+*(En red local Wi-Fi/oficina funciona directo sin Relay escribiendo la IP `192.168.x.x`).*
 
-## Compilación
-
-```powershell
-cargo build --workspace --release
-```
-
-## Uso en red local (LAN) o por Internet (\$0 con Tailscale)
-
-1. Copia **`RandyDesk.exe`** en tus 3–4 computadoras y ábrelo (acepta el acceso UDP `21118` en el Firewall de Windows si te lo pide).
-2. Si las PCs están en casas u oficinas distintas, instala **Tailscale** (plan gratuito) en ellas y usa la IP `100.x.y.z:21118` que aparece automáticamente en el panel **Tu Escritorio**.
-3. En las PCs a las que te conectas por **2–24+ horas**, configura **Energía y suspensión → Suspender el equipo: Nunca**.
-
-## Verificación técnica
+## Compilación y verificación
 
 ```powershell
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build --workspace --release
 ```

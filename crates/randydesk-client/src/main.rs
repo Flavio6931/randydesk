@@ -9,6 +9,7 @@ mod decoder;
 mod host_panel;
 mod keymap;
 mod net;
+mod relay_client;
 mod theme;
 
 use anyhow::Result;

@@ -1,17 +1,20 @@
-//! Interfaz gráfica unificada de RandyDesk estilo RustDesk (simple, limpia y fácil de manejar).
+//! Interfaz gráfica unificada de RandyDesk estilo RustDesk (LAN directa + ID por Internet E2E).
 
 use crate::cards::{render_host_cards, CardAction, HostTab};
-use crate::config::{display_address, load_hosts, normalize_address, save_hosts, upsert_recent, SavedHost};
+use crate::config::{
+    display_address, load_hosts, load_settings, normalize_address, save_hosts, save_settings,
+    upsert_recent, AppSettings, SavedHost,
+};
 use crate::host_panel::HostPanelState;
 use crate::keymap::{is_control_or_nav_key, map_egui_key_to_vk, map_mouse_button, normalize_pos};
 use crate::net::{ConnectRequest, ConnectionState, NetCommand, NetworkHandle};
 use crate::theme::{
     apply_rustdesk_theme, ACCENT_BLUE, ACCENT_TEAL, BANNER_COLORS, BG_CARD, BG_MAIN, BG_SIDEBAR,
-    BORDER_SUBTLE, TEXT_MUTED,
+    BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED,
 };
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
-use randydesk_proto::{CodecKind, InputEvent, StreamSettings};
+use randydesk_proto::{normalize_relay_ws_url, CodecKind, InputEvent, StreamSettings};
 use std::time::Duration;
 
 /// Datos temporales del modal para pedir contraseña al conectar.
@@ -40,6 +43,7 @@ pub struct RandyDeskApp {
     host_panel: HostPanelState,
     net: NetworkHandle,
     hosts: Vec<SavedHost>,
+    settings: AppSettings,
 
     // Estado de vista principal (Lobby)
     quick_address: String,
@@ -53,6 +57,9 @@ pub struct RandyDeskApp {
     // Modales
     password_prompt: Option<PasswordPrompt>,
     host_editor: Option<HostEditor>,
+    show_relay_modal: bool,
+    relay_url_input: String,
+    relay_modal_msg: Option<String>,
     show_guide: bool,
 
     // Renderizado del escritorio remoto
@@ -64,16 +71,19 @@ pub struct RandyDeskApp {
 }
 
 impl RandyDeskApp {
-    /// Inicializa la aplicación cargando el tema estilo RustDesk, la libreta y el receptor local.
+    /// Inicializa la aplicación cargando el tema, la libreta, los ajustes de Relay y el receptor local.
     pub fn new(cc: &eframe::CreationContext<'_>, rt_handle: tokio::runtime::Handle) -> Self {
         apply_rustdesk_theme(&cc.egui_ctx);
         let hosts = load_hosts();
-        let host_panel = HostPanelState::new(&rt_handle);
+        let settings = load_settings();
+        let relay_url_input = settings.relay_url.clone();
+        let host_panel = HostPanelState::new(&rt_handle, settings.normalized_relay_url());
         Self {
             net: NetworkHandle::new(rt_handle.clone()),
             rt_handle,
             host_panel,
             hosts,
+            settings,
             quick_address: String::new(),
             active_tab: HostTab::Recent,
             search_query: String::new(),
@@ -83,6 +93,9 @@ impl RandyDeskApp {
             ui_notice: None,
             password_prompt: None,
             host_editor: None,
+            show_relay_modal: false,
+            relay_url_input,
+            relay_modal_msg: None,
             show_guide: false,
             screen_texture: None,
             last_uploaded_seq: 0,
@@ -95,7 +108,7 @@ impl RandyDeskApp {
     fn open_password_prompt_for_address(&mut self, raw_address: &str) {
         let trimmed = raw_address.trim();
         if trimmed.is_empty() {
-            self.ui_notice = Some("Escribe la IP LAN o de Tailscale del equipo destino.".into());
+            self.ui_notice = Some("Escribe el ID de 9 dígitos o la IP local del equipo destino.".into());
             return;
         }
         let normalized = normalize_address(trimmed);
@@ -145,6 +158,7 @@ impl RandyDeskApp {
                 address: prompt.address,
                 password: prompt.password,
                 expected_fingerprint: prompt.expected_fp,
+                relay_url: self.settings.normalized_relay_url(),
                 settings: StreamSettings {
                     codec: prompt.codec,
                     jpeg_quality: prompt.quality,
@@ -289,7 +303,7 @@ impl RandyDeskApp {
     fn render_lobby(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("este_equipo_panel")
             .resizable(false)
-            .exact_width(235.0)
+            .exact_width(240.0)
             .frame(
                 egui::Frame::none()
                     .fill(BG_SIDEBAR)
@@ -300,7 +314,7 @@ impl RandyDeskApp {
             });
 
         egui::TopBottomPanel::bottom("status_footer")
-            .exact_height(32.0)
+            .exact_height(34.0)
             .frame(
                 egui::Frame::none()
                     .fill(BG_SIDEBAR)
@@ -310,21 +324,43 @@ impl RandyDeskApp {
             .show(ctx, |ui| {
                 let info = self.host_panel.runtime_info();
                 let running = info.as_ref().is_some_and(|i| i.running);
+                let relay_ok = info.as_ref().is_some_and(|i| i.relay_connected);
+                let has_relay = info.as_ref().and_then(|i| i.relay_url.as_ref()).is_some();
+
                 ui.horizontal(|ui| {
-                    let dot_color = if running { ACCENT_TEAL } else { TEXT_MUTED };
+                    let dot_color = if relay_ok {
+                        ACCENT_TEAL
+                    } else if running {
+                        STATUS_ORANGE
+                    } else {
+                        TEXT_MUTED
+                    };
                     let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
 
-                    let state_txt = if running { "Listo." } else { "Recepción detenida." };
+                    let state_txt = if relay_ok {
+                        "Listo (Internet y red local)."
+                    } else if has_relay {
+                        "Conectando al servidor Relay..."
+                    } else if running {
+                        "Solo red local."
+                    } else {
+                        "Recepción detenida."
+                    };
                     ui.label(egui::RichText::new(state_txt).size(12.0).color(TEXT_MUTED));
 
                     if ui
-                        .link(
-                            egui::RichText::new("Como conectarse por Internet o red local")
-                                .size(12.0),
-                        )
+                        .link(egui::RichText::new("Configurar servidor Relay").size(12.0))
                         .clicked()
                     {
+                        self.relay_url_input = self.settings.relay_url.clone();
+                        self.relay_modal_msg = None;
+                        self.show_relay_modal = true;
+                    }
+
+                    ui.label(egui::RichText::new("|").size(12.0).color(BORDER_SUBTLE));
+
+                    if ui.link(egui::RichText::new("Guía rápida").size(12.0)).clicked() {
                         self.show_guide = true;
                     }
 
@@ -363,7 +399,7 @@ impl RandyDeskApp {
                         let input_resp = ui.add_sized(
                             [370.0, 38.0],
                             egui::TextEdit::singleline(&mut self.quick_address)
-                                .hint_text("Escribe la IP del equipo (ej. 100.x.y.z o 192.168.1.x)")
+                                .hint_text("Escribe el ID (ej. 482 910 331) o IP local")
                                 .font(egui::FontId::proportional(15.0)),
                         );
                         let pressed_enter =
@@ -382,7 +418,7 @@ impl RandyDeskApp {
                                     ui.radio_value(
                                         &mut self.codec_input,
                                         CodecKind::Lz4Rgba,
-                                        "Nitido (LZ4)",
+                                        "Nítido (LZ4)",
                                     );
                                     ui.separator();
                                     ui.add(
@@ -420,7 +456,6 @@ impl RandyDeskApp {
                 ui.separator();
                 ui.add_space(8.0);
 
-                // Barra de pestañas + Agregar + Buscador
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.active_tab, HostTab::Recent, "Recientes");
                     ui.selectable_value(&mut self.active_tab, HostTab::Favorites, "Favoritos");
@@ -465,7 +500,7 @@ impl RandyDeskApp {
                 .show(ctx, |ui| {
                     ui.set_min_width(320.0);
                     ui.label(
-                        egui::RichText::new(format!("Dirección: {}", display_address(&prompt.address)))
+                        egui::RichText::new(format!("Destino: {}", display_address(&prompt.address)))
                             .small()
                             .color(TEXT_MUTED),
                     );
@@ -539,10 +574,10 @@ impl RandyDeskApp {
                     ui.label("Nombre:");
                     ui.add_sized([320.0, 28.0], egui::TextEdit::singleline(&mut ed.name));
                     ui.add_space(6.0);
-                    ui.label("Dirección IP o Tailscale:");
+                    ui.label("ID de 9 dígitos o IP local:");
                     ui.add_sized(
                         [320.0, 28.0],
-                        egui::TextEdit::singleline(&mut ed.address).hint_text("100.x.y.z o 192.168.1.25"),
+                        egui::TextEdit::singleline(&mut ed.address).hint_text("482 910 331 o 192.168.1.25"),
                     );
                     ui.add_space(8.0);
                     ui.label("Color de tarjeta:");
@@ -612,7 +647,76 @@ impl RandyDeskApp {
             self.host_editor = None;
         }
 
-        // 3. Modal Guía rápida
+        // 3. Modal Configurar servidor Relay
+        if self.show_relay_modal {
+            let mut open = true;
+            let mut apply_relay: Option<String> = None;
+            egui::Window::new("Configurar servidor Relay (Internet)")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_max_width(430.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Pega la URL de tu servidor Relay (ej. https://tu-relay.onrender.com o https://xxxx.trycloudflare.com). Todo el tráfico viaja cifrado E2E.",
+                        )
+                        .color(TEXT_MUTED),
+                    );
+                    ui.add_space(8.0);
+                    ui.add_sized(
+                        [410.0, 30.0],
+                        egui::TextEdit::singleline(&mut self.relay_url_input)
+                            .hint_text("wss://randydesk-relay.onrender.com"),
+                    );
+                    if let Some(msg) = &self.relay_modal_msg {
+                        ui.add_space(6.0);
+                        ui.colored_label(ACCENT_TEAL, msg);
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Guardar y conectar").color(Color32::WHITE),
+                                )
+                                .fill(ACCENT_BLUE),
+                            )
+                            .clicked()
+                        {
+                            apply_relay = Some(self.relay_url_input.trim().to_string());
+                        }
+                        if ui.button("Quitar servidor").clicked() {
+                            self.relay_url_input.clear();
+                            apply_relay = Some(String::new());
+                        }
+                    });
+                });
+
+            if let Some(raw) = apply_relay {
+                let normalized = normalize_relay_ws_url(&raw).unwrap_or_default();
+                self.settings.relay_url = normalized.clone();
+                self.relay_url_input = normalized;
+                match save_settings(&self.settings) {
+                    Ok(()) => {
+                        self.host_panel
+                            .set_relay_url(self.settings.normalized_relay_url(), &self.rt_handle);
+                        self.relay_modal_msg = Some(if self.settings.relay_url.is_empty() {
+                            "Relay desactivado (modo red local).".into()
+                        } else {
+                            "Servidor Relay guardado y conectando...".into()
+                        });
+                    }
+                    Err(err) => self.relay_modal_msg = Some(format!("Error guardando: {err}")),
+                }
+            }
+            if !open {
+                self.show_relay_modal = false;
+            }
+        }
+
+        // 4. Modal Guía rápida
         if self.show_guide {
             let mut open = true;
             egui::Window::new("Guía rápida — Conexión ilimitada")
@@ -621,27 +725,27 @@ impl RandyDeskApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.set_max_width(420.0);
-                    ui.label("1. Misma red Wi-Fi / Oficina (LAN):");
+                    ui.set_max_width(430.0);
+                    ui.label("1. Por Internet sin Tailscale (ID de 9 dígitos):");
                     ui.label(
                         egui::RichText::new(
-                            "Abre RandyDesk en ambos equipos, copia la IP de 'Tu ID' y pégala en 'Controlar escritorio remoto'.",
+                            "Pega la URL de tu servidor Relay (Render Free o cloudflared) en 'Configurar servidor Relay' en ambos equipos y conéctate solo usando el ID numérico.",
                         )
                         .color(TEXT_MUTED),
                     );
                     ui.add_space(8.0);
-                    ui.label("2. Por Internet sin límites ($0):");
+                    ui.label("2. En la misma casa u oficina (LAN):");
                     ui.label(
                         egui::RichText::new(
-                            "Instala Tailscale gratis en tus 3-4 PCs. RandyDesk detectará la IP 100.x.y.z automáticamente.",
+                            "No necesitas servidor Relay: escribe directo la IP local (192.168.x.x) que aparece debajo de 'Tu ID'.",
                         )
                         .color(TEXT_MUTED),
                     );
                     ui.add_space(8.0);
-                    ui.label("3. Sesiones de 2+ horas:");
+                    ui.label("3. Sesiones largas (2+ horas):");
                     ui.label(
                         egui::RichText::new(
-                            "Configura Windows en 'Suspender: Nunca' en la PC remota para evitar cortes por reposo.",
+                            "En la PC remota configura Windows en 'Suspender el equipo: Nunca'.",
                         )
                         .color(TEXT_MUTED),
                     );
@@ -757,22 +861,19 @@ impl RandyDeskApp {
                     self.fullscreen = !self.fullscreen;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
                 }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(
-                            egui::RichText::new("Desconectar")
-                                .color(Color32::from_rgb(245, 115, 115)),
-                        )
-                        .clicked()
-                    {
-                        if self.fullscreen {
-                            self.fullscreen = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                        }
-                        self.net.disconnect();
+                if ui
+                    .button(
+                        egui::RichText::new("Desconectar")
+                            .color(Color32::from_rgb(245, 115, 115)),
+                    )
+                    .clicked()
+                {
+                    if self.fullscreen {
+                        self.fullscreen = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     }
-                });
+                    self.net.disconnect();
+                }
             });
         });
 

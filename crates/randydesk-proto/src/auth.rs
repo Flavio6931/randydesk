@@ -1,6 +1,6 @@
-//! Primitivas criptográficas de autenticación por reto (challenge-response) y generación de PIN.
+//! Primitivas de autenticación por reto, PIN temporal e IDs numéricos de 9 dígitos.
 
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::OsRng, Rng, RngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -45,6 +45,39 @@ pub fn generate_session_pin() -> String {
         .collect()
 }
 
+/// Genera un ID numérico aleatorio de 9 dígitos estilo RustDesk (`100000000`..=`999999999`).
+pub fn generate_host_id() -> String {
+    let num: u32 = OsRng.gen_range(100_000_000..=999_999_999);
+    num.to_string()
+}
+
+/// Formatea un ID de 9 dígitos con espacios cada 3 dígitos (`"482910331"` -> `"482 910 331"`).
+pub fn format_host_id(id: &str) -> String {
+    let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 9 {
+        format!("{} {} {}", &digits[0..3], &digits[3..6], &digits[6..9])
+    } else {
+        id.to_string()
+    }
+}
+
+/// Extrae un ID numérico exacto de 9 dígitos ignorando espacios y guiones; devuelve `None` si es IP/hostname.
+pub fn parse_numeric_id(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.contains('.') || trimmed.contains(':') {
+        return None;
+    }
+    let digits: String = trimmed
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    if digits.len() == 9 && digits.chars().all(|c| c.is_ascii_digit()) {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +99,20 @@ mod tests {
         let pin = generate_session_pin();
         assert_eq!(pin.len(), 8);
         assert!(pin.chars().all(|c| PIN_ALPHABET.contains(&(c as u8))));
+    }
+
+    #[test]
+    fn host_id_generation_formatting_and_parsing() {
+        let id = generate_host_id();
+        assert_eq!(id.len(), 9);
+        assert!(id.chars().all(|c| c.is_ascii_digit()));
+
+        let formatted = format_host_id("482910331");
+        assert_eq!(formatted, "482 910 331");
+
+        assert_eq!(parse_numeric_id("482 910 331").as_deref(), Some("482910331"));
+        assert_eq!(parse_numeric_id("482-910-331").as_deref(), Some("482910331"));
+        assert_eq!(parse_numeric_id("192.168.1.10"), None);
+        assert_eq!(parse_numeric_id("12345"), None);
     }
 }

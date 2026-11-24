@@ -5,8 +5,8 @@ use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use quinn::{ClientConfig, Endpoint, TransportConfig, VarInt};
 use randydesk_proto::{
-    compute_proof, read_msg, write_msg, ClientMsg, HostMsg, InputEvent, StreamSettings,
-    PROTOCOL_VERSION,
+    compute_proof, parse_numeric_id, read_msg, write_msg, ClientMsg, HostMsg, InputEvent,
+    StreamSettings, PROTOCOL_VERSION,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -26,6 +26,7 @@ pub struct ConnectRequest {
     pub address: String,
     pub password: String,
     pub expected_fingerprint: Option<String>,
+    pub relay_url: Option<String>,
     pub settings: StreamSettings,
 }
 
@@ -295,7 +296,7 @@ async fn session_supervisor(
     }
 }
 
-enum SessionExit {
+pub(crate) enum SessionExit {
     UserRequested,
     AuthFailed(String),
 }
@@ -307,6 +308,24 @@ async fn run_single_session(
     ctx: &egui::Context,
     session_start: Instant,
 ) -> Result<SessionExit> {
+    if let Some(target_id) = parse_numeric_id(&req.address) {
+        let Some(relay_url) = req.relay_url.clone() else {
+            return Ok(SessionExit::AuthFailed(
+                "Para conectar con un ID de 9 dígitos, configura primero la URL del servidor Relay abajo en 'Configurar servidor'.".to_string(),
+            ));
+        };
+        return crate::relay_client::run_relay_session(
+            &relay_url,
+            &target_id,
+            req,
+            cmd_rx,
+            shared,
+            ctx,
+            session_start,
+        )
+        .await;
+    }
+
     let addr: SocketAddr = tokio::net::lookup_host(&req.address)
         .await
         .with_context(|| format!("no se pudo resolver {}", req.address))?
@@ -344,7 +363,11 @@ async fn run_single_session(
     let conn = endpoint
         .connect(addr, "randydesk.local")?
         .await
-        .context("falló conexión QUIC al host")?;
+        .with_context(|| {
+            format!(
+                "sin respuesta en {addr} (si está en otra red usa su ID numérico vía Relay o revisa Firewall UDP)"
+            )
+        })?;
 
     let fingerprint = observed_fp
         .lock()

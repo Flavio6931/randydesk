@@ -1,0 +1,20 @@
+[package]
+name = "randydesk-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+randydesk-proto = { path = "../randydesk-proto" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+randydesk-host = { path = "../randydesk-host" }
+rustls.workspace = true

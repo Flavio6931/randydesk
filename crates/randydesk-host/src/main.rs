@@ -40,6 +40,10 @@ struct Cli {
     /// Calidad JPEG inicial por defecto (35..95).
     #[arg(long, default_value_t = 75)]
     quality: u8,
+
+    /// URL del servidor Relay WebSocket (ej. wss://tu-relay.onrender.com; también lee RANDYDESK_RELAY_URL).
+    #[arg(long)]
+    relay: Option<String>,
 }
 
 #[tokio::main]
@@ -72,12 +76,22 @@ async fn main() -> Result<()> {
     let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-Host".to_string());
     let local_ip = detect_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
 
+    let host_id = randydesk_host::relay_agent::load_or_create_host_id();
+    let relay_url = cli
+        .relay
+        .or_else(|| std::env::var("RANDYDESK_RELAY_URL").ok())
+        .and_then(|u| randydesk_proto::normalize_relay_ws_url(&u));
+
     println!("============================================================");
     println!("  RandyDesk Host v{} - Listo para sesiones ilimitadas", env!("CARGO_PKG_VERSION"));
     println!("============================================================");
     println!("  Equipo      : {host_name}");
+    println!("  ID numérico : {}", randydesk_proto::format_host_id(&host_id));
     println!("  Escucha     : {addr}");
     println!("  IP LAN      : {local_ip}:{}", cli.port);
+    if let Some(ref r) = relay_url {
+        println!("  Relay       : {r}");
+    }
     println!("  Monitor     : {}", cli.monitor);
     println!("  Huella TLS  : {}", identity.fingerprint_sha256);
     if is_ephemeral_pin {
@@ -86,7 +100,7 @@ async fn main() -> Result<()> {
         println!("  Contraseña  : [configurada por parámetro/entorno]");
     }
     println!("============================================================");
-    println!("  Consejo: en redes externas usa la IP de Tailscale + :{}\n", cli.port);
+    println!("  Consejo: con Relay configurado conecta solo con el ID numérico\n");
 
     let monitor_idx = cli.monitor;
     let cfg = HostServerConfig {
@@ -101,11 +115,24 @@ async fn main() -> Result<()> {
         active_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
+    let relay_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let relay_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(r_url) = relay_url {
+        tokio::spawn(randydesk_host::relay_agent::run_relay_loop(
+            r_url,
+            host_id,
+            cfg.clone(),
+            relay_connected,
+            Arc::clone(&relay_stop),
+        ));
+    }
+
     info!("Servidor QUIC iniciado en {addr}. Pulsa Ctrl+C para detener.");
     tokio::select! {
         _ = accept_loop(endpoint.clone(), cfg) => {}
         _ = tokio::signal::ctrl_c() => {
             info!("Señal Ctrl+C recibida; cerrando servidor...");
+            relay_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             endpoint.close(0u32.into(), b"apagado del host");
         }
     }

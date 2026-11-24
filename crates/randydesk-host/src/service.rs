@@ -1,13 +1,14 @@
-//! Servicio embebible del agente host para controlar su ciclo de vida desde la interfaz gráfica.
+//! Servicio embebible del agente host (QUIC directo LAN + agente Relay E2E por Internet).
 
 use crate::capture;
+use crate::relay_agent;
 use crate::session::{accept_loop, HostServerConfig};
 use crate::tls;
 use anyhow::{Context, Result};
 use quinn::Endpoint;
-use randydesk_proto::StreamSettings;
+use randydesk_proto::{normalize_relay_ws_url, StreamSettings};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -16,33 +17,42 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone)]
 pub struct HostRuntimeInfo {
     pub running: bool,
+    pub host_id: String,
     pub port: u16,
     pub lan_ip: Option<String>,
     pub tailscale_ip: Option<String>,
+    pub relay_url: Option<String>,
+    pub relay_connected: bool,
     pub fingerprint_sha256: String,
     pub active_clients: usize,
 }
 
-/// Controlador activo del servidor QUIC del host embebido.
+/// Controlador activo del servidor QUIC y del agente Relay del host embebido.
 pub struct HostService {
     endpoint: Endpoint,
     task: JoinHandle<()>,
+    relay_task: Option<JoinHandle<()>>,
+    relay_stop: Arc<AtomicBool>,
+    relay_connected: Arc<AtomicBool>,
     active_clients: Arc<AtomicUsize>,
+    host_id: String,
     port: u16,
     lan_ip: Option<String>,
     tailscale_ip: Option<String>,
+    relay_url: Option<String>,
     fingerprint_sha256: String,
     stopped: bool,
 }
 
 impl HostService {
-    /// Inicia el servidor QUIC del host sobre el runtime Tokio indicado.
+    /// Inicia el servidor QUIC LAN y, si se indica `relay_url`, registra el ID en el servidor Relay.
     pub fn start(
         rt: &Handle,
         port: u16,
         password: String,
         monitor: usize,
         settings: StreamSettings,
+        relay_url: Option<String>,
     ) -> Result<Self> {
         let identity = tls::load_or_create_server_identity()?;
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
@@ -63,39 +73,67 @@ impl HostService {
             active_clients: Arc::clone(&active_clients),
         };
 
-        let task = rt.spawn(accept_loop(endpoint.clone(), cfg));
+        let host_id = relay_agent::load_or_create_host_id();
+        let normalized_relay = relay_url.and_then(|u| normalize_relay_ws_url(&u));
+        let relay_stop = Arc::new(AtomicBool::new(false));
+        let relay_connected = Arc::new(AtomicBool::new(false));
+
+        let task = rt.spawn(accept_loop(endpoint.clone(), cfg.clone()));
+        let relay_task = normalized_relay.as_ref().map(|url| {
+            rt.spawn(relay_agent::run_relay_loop(
+                url.clone(),
+                host_id.clone(),
+                cfg,
+                Arc::clone(&relay_connected),
+                Arc::clone(&relay_stop),
+            ))
+        });
+
         Ok(Self {
             endpoint,
             task,
+            relay_task,
+            relay_stop,
+            relay_connected,
             active_clients,
+            host_id,
             port: actual_port,
             lan_ip: detect_lan_ip(),
             tailscale_ip: detect_tailscale_ip(),
+            relay_url: normalized_relay,
             fingerprint_sha256: identity.fingerprint_sha256,
             stopped: false,
         })
     }
 
-    /// Devuelve la información actual de red, huella TLS y sesiones conectadas.
+    /// Devuelve la información actual de red, ID numérico, estado Relay y sesiones conectadas.
     pub fn info(&self) -> HostRuntimeInfo {
         HostRuntimeInfo {
             running: !self.stopped && !self.task.is_finished(),
+            host_id: self.host_id.clone(),
             port: self.port,
             lan_ip: self.lan_ip.clone(),
             tailscale_ip: self.tailscale_ip.clone(),
+            relay_url: self.relay_url.clone(),
+            relay_connected: !self.stopped && self.relay_connected.load(Ordering::Relaxed),
             fingerprint_sha256: self.fingerprint_sha256.clone(),
             active_clients: self.active_clients.load(Ordering::Relaxed),
         }
     }
 
-    /// Detiene el servidor cerrando el endpoint QUIC y cancelando el bucle de aceptación.
+    /// Detiene tanto el endpoint QUIC como la conexión saliente al servidor Relay.
     pub fn stop(&mut self) {
         if self.stopped {
             return;
         }
         self.stopped = true;
+        self.relay_stop.store(true, Ordering::Relaxed);
+        self.relay_connected.store(false, Ordering::Relaxed);
         self.endpoint.close(0u32.into(), b"host detenido");
         self.task.abort();
+        if let Some(t) = self.relay_task.take() {
+            t.abort();
+        }
     }
 }
 
@@ -156,12 +194,14 @@ mod tests {
             "clave-prueba".to_string(),
             0,
             StreamSettings::default(),
+            None,
         )
         .expect("iniciar HostService");
 
         let info = svc.info();
         assert!(info.running);
         assert!(info.port > 0);
+        assert_eq!(info.host_id.len(), 9);
         assert_eq!(info.active_clients, 0);
         assert!(!info.fingerprint_sha256.is_empty());
 

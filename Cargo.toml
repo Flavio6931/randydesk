@@ -4,10 +4,11 @@ members = [
     "crates/randydesk-proto",
     "crates/randydesk-host",
     "crates/randydesk-client",
+    "crates/randydesk-relay",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 
@@ -15,9 +16,11 @@ license = "MIT"
 anyhow = "1"
 arboard = "3"
 bincode = "1.3"
+chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 directories = "5"
 eframe = "0.29"
+futures-util = "0.3"
 jpeg-encoder = "0.6"
 lz4_flex = "0.11"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -30,8 +33,11 @@ sha2 = "0.10"
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 zune-jpeg = "0.4"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
