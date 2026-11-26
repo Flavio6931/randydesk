@@ -29,6 +29,7 @@ pub struct ConnectRequest {
     pub expected_fingerprint: Option<String>,
     pub relay_url: Option<String>,
     pub settings: StreamSettings,
+    pub stream_scale: u8,
 }
 
 /// Comandos que la UI envía a la sesión activa en curso.
@@ -36,6 +37,8 @@ pub struct ConnectRequest {
 pub enum NetCommand {
     Input(InputEvent),
     UpdateSettings(StreamSettings),
+    SetStreamScale(u8),
+    LockWorkStation,
     RequestKeyframe,
     ClipboardSet(String),
     ClipboardGet,
@@ -301,6 +304,7 @@ async fn session_supervisor(
                                 break;
                             }
                             Some(NetCommand::UpdateSettings(s)) => req.settings = s,
+                            Some(NetCommand::SetStreamScale(s)) => req.stream_scale = s.clamp(50, 100),
                             _ => {}
                         }
                     }
@@ -433,8 +437,12 @@ async fn run_single_session(
         other => return Err(anyhow!("respuesta inesperada a AuthResponse: {other:?}")),
     }
 
-    // Enviar preferencias iniciales de códec/calidad/FPS
+    // Enviar preferencias iniciales de códec/calidad/FPS y escala si difiere de 100%
     write_msg(&mut ctrl_send, &ClientMsg::UpdateSettings(req.settings)).await?;
+    let initial_scale = req.stream_scale.clamp(50, 100);
+    if initial_scale != 100 {
+        write_msg(&mut ctrl_send, &ClientMsg::SetStreamScale(initial_scale)).await?;
+    }
 
     let mut video_recv = conn
         .accept_uni()
@@ -468,6 +476,14 @@ async fn run_single_session(
                     Some(NetCommand::UpdateSettings(settings)) => {
                         req.settings = settings;
                         write_msg(&mut ctrl_send, &ClientMsg::UpdateSettings(settings)).await?;
+                    }
+                    Some(NetCommand::SetStreamScale(scale)) => {
+                        let clamped = scale.clamp(50, 100);
+                        req.stream_scale = clamped;
+                        write_msg(&mut ctrl_send, &ClientMsg::SetStreamScale(clamped)).await?;
+                    }
+                    Some(NetCommand::LockWorkStation) => {
+                        write_msg(&mut ctrl_send, &ClientMsg::LockWorkStation).await?;
                     }
                     Some(NetCommand::RequestKeyframe) => {
                         write_msg(&mut ctrl_send, &ClientMsg::RequestKeyframe).await?;

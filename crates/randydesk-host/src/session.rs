@@ -11,7 +11,7 @@ use randydesk_proto::{
     PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -275,6 +275,7 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
         .context("no se pudo abrir stream unidireccional de video")?;
 
     let shared_settings = Arc::new(Mutex::new(cfg.default_settings));
+    let scale_percent = Arc::new(AtomicU8::new(100));
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let frame_slot = Arc::new(LatestFrameSlot::new());
@@ -282,6 +283,7 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
     let capture_thread = spawn_capture_worker(
         capturer,
         Arc::clone(&shared_settings),
+        Arc::clone(&scale_percent),
         Arc::clone(&force_keyframe),
         Arc::clone(&stop_flag),
         Arc::clone(&frame_slot),
@@ -295,6 +297,7 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
         &frame_slot,
         monitor,
         &shared_settings,
+        &scale_percent,
         &force_keyframe,
     )
     .await;
@@ -314,6 +317,7 @@ async fn run_session_loops(
     frame_slot: &LatestFrameSlot,
     monitor: MonitorGeometry,
     shared_settings: &Arc<Mutex<StreamSettings>>,
+    scale_percent: &Arc<AtomicU8>,
     force_keyframe: &Arc<AtomicBool>,
 ) -> Result<()> {
     loop {
@@ -331,6 +335,15 @@ async fn run_session_loops(
                             }
                             *guard = new_settings;
                         }
+                    }
+                    Ok(ClientMsg::SetStreamScale(pct)) => {
+                        let clamped = pct.clamp(50, 100);
+                        if scale_percent.swap(clamped, Ordering::Relaxed) != clamped {
+                            force_keyframe.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(ClientMsg::LockWorkStation) => {
+                        let _ = crate::power::lock_workstation();
                     }
                     Ok(ClientMsg::RequestKeyframe) => {
                         force_keyframe.store(true, Ordering::Relaxed);
@@ -382,6 +395,7 @@ impl Drop for SlotCloseGuard {
 pub(crate) fn spawn_capture_worker(
     mut capturer: Box<dyn ScreenCapturer>,
     shared_settings: Arc<Mutex<StreamSettings>>,
+    scale_percent: Arc<AtomicU8>,
     force_keyframe: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     frame_slot: Arc<LatestFrameSlot>,
@@ -399,6 +413,7 @@ pub(crate) fn spawn_capture_worker(
                 .lock()
                 .map(|s| *s)
                 .unwrap_or_default();
+            let scale = scale_percent.load(Ordering::Relaxed);
             let fps = settings.target_fps.clamp(5, 60) as u64;
             let frame_budget = Duration::from_millis(1000 / fps);
             let started = Instant::now();
@@ -407,7 +422,7 @@ pub(crate) fn spawn_capture_worker(
             match capturer.capture(timeout_ms) {
                 Ok(Some(captured)) => {
                     let keyframe = force_keyframe.swap(false, Ordering::Relaxed);
-                    match encoder.encode(&captured, settings, keyframe) {
+                    match encoder.encode_scaled(&captured, settings, scale, keyframe) {
                         Ok(Some(msg)) => {
                             if !frame_slot.push(msg) {
                                 break;

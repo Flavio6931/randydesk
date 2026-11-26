@@ -1,5 +1,18 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.4.6 (Fase 1): Fix escritura/`win_down`/AltGr, barra colapsable y downscale fluido
+- **Resumen técnico:**
+  - Versión subida a `0.4.6` en `Cargo.toml` (y `Cargo.lock`), activando `Win32_System_Shutdown` para `LockWorkStation`.
+  - `crates/randydesk-client/src/win_hook.rs`, `tray.rs`, `app.rs` y `crates/randydesk-host/src/input.rs`: aislada la regresión de escritura en `v0.4.5` (`input_debug.log` mostró `win_down` enclavado si `Win` se soltaba sobre `8488`/`7460` y `fg_pid=8480` de `SearchHost.exe` bloqueando `egui::Event::Text`). Se limpia `win_down` incondicionalmente en todo `WM_KEYUP`/`WM_SYSKEYUP` + resincronización con `GetAsyncKeyState`, se añade fallback `should_hook_capture_all_keys` cuando otra app retiene foreground con cursor encima, `SetActiveWindow`/`SetFocus` en `force_foreground`, soporte AltGr (`@`, `\`, `{}`) y log `[HOST-UNI]` ante fallos UIPI.
+  - `crates/randydesk-client/src/session_bar.rs` y `app.rs`: barra flotante colapsable en pestaña mínima superior (`Ocultar` + `Fijar`), escala personalizada (`50%..=200%`), `Resolución de transmisión` (`100%`/`75%`/`50%`), `Mostrar cursor remoto`, `Bloquear pantalla remota`, `Ctrl+Alt+Del` marcado para Fase 2 (`SYSTEM`), `Invertir dirección de rueda`, `Intercambiar botones de ratón` y `Solo visualización`.
+  - `crates/randydesk-proto/src/message.rs`, `crates/randydesk-host/src/{encoder.rs,power.rs,session.rs,relay_agent.rs}`, `crates/randydesk-client/src/{net.rs,relay_client.rs}`: variantes compatibles `ClientMsg::SetStreamScale(u8)` y `ClientMsg::LockWorkStation`, downscale rápido BGRA en `TileEncoder::encode_scaled` (promedio 2x2 al 50% y punto fijo 16.16), y `yield_now()` bajo saturación de envío en Relay.
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 37 pruebas aprobadas (17 en `randydesk-client`, 10 unit + 1 `quic_loopback` en `randydesk-host`, 8 en `randydesk-proto`, 1 `relay_e2e` en `randydesk-relay`).
+  - `cargo build --workspace --release` + copia a `dist\`: `RandyDesk.exe` (`11,395,072` bytes) y `randydesk-relay.exe` (`2,766,336` bytes).
+- **Pendiente de verificación en vivo y siguiente fase:**
+  - Probar `v0.4.6` en ambas PCs y confirmar inicio de **Fase 2 (`v0.5.0`)**: Servicio de Windows `NT AUTHORITY\SYSTEM` + `SendSAS` + códec H.264/P2P directo.
+
 ## 2026-11-26 — RandyDesk v0.4.5: Barra flotante estilo RustDesk y fix definitivo de foco / tecla `Win`
 - **Resumen técnico:**
   - Versión subida a `0.4.5` en `Cargo.toml` (y `Cargo.lock`).

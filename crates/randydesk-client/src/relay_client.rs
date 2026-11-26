@@ -111,6 +111,10 @@ pub async fn run_relay_session(
     }
 
     send_e2e(&mut ws, &mut cipher, &ClientMsg::UpdateSettings(req.settings)).await?;
+    let initial_scale = req.stream_scale.clamp(50, 100);
+    if initial_scale != 100 {
+        send_e2e(&mut ws, &mut cipher, &ClientMsg::SetStreamScale(initial_scale)).await?;
+    }
 
     if let Ok(mut guard) = shared.lock() {
         guard.status = ConnectionState::Connected {
@@ -172,6 +176,14 @@ pub async fn run_relay_session(
                     Some(NetCommand::UpdateSettings(settings)) => {
                         req.settings = settings;
                         let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::UpdateSettings(settings))).await;
+                    }
+                    Some(NetCommand::SetStreamScale(scale)) => {
+                        let clamped = scale.clamp(50, 100);
+                        req.stream_scale = clamped;
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::SetStreamScale(clamped))).await;
+                    }
+                    Some(NetCommand::LockWorkStation) => {
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::LockWorkStation)).await;
                     }
                     Some(NetCommand::RequestKeyframe) => {
                         let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::RequestKeyframe)).await;

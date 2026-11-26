@@ -169,13 +169,17 @@ fn inject_input_on_current_thread(event: &InputEvent, monitor: MonitorGeometry) 
                 if !down {
                     flags |= KEYEVENTF_KEYUP;
                 }
-                send_keyboard(KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: code_unit,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
-                });
+                dispatch_unicode_with_log(
+                    KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: code_unit,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
+                    },
+                    code_unit,
+                    down,
+                );
             }
         }
     }
@@ -433,12 +437,19 @@ fn send_mouse(mi: MOUSEINPUT) {
     dispatch_input(input);
 }
 
-fn send_keyboard(ki: KEYBDINPUT) {
+fn dispatch_unicode_with_log(ki: KEYBDINPUT, code_unit: u16, down: bool) {
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
     };
-    let _ = dispatch_input(input);
+    let (sent, err_code) = dispatch_input(input);
+    if sent == 0 {
+        let elev = is_process_elevated();
+        let fg_elev = is_foreground_window_elevated();
+        append_input_debug_log(&format!(
+            "[HOST-UNI] ch=U+{code_unit:04X} down={down} sent=0 err={err_code} elev={elev} fg_elev={fg_elev}"
+        ));
+    }
 }
 
 fn dispatch_keyboard_with_log(ki: KEYBDINPUT, vk: u16, scan: u16, extended: bool, down: bool) {

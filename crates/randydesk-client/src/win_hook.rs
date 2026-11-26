@@ -91,6 +91,12 @@ impl KeyboardHookGuard {
         unsafe { is_own_window_foreground(own_pid) }
     }
 
+    /// Indica si el cursor está actualmente sobre la ventana principal de RandyDesk.
+    pub fn is_cursor_over_own_window() -> bool {
+        let own_pid = shared_state().own_pid;
+        own_pid != 0 && unsafe { cursor_window_pid() } == own_pid
+    }
+
     /// Indica si el hook Win32 quedó instalado correctamente.
     pub fn is_installed(&self) -> bool {
         shared_state().installed.load(Ordering::Acquire)
@@ -108,11 +114,15 @@ impl KeyboardHookGuard {
             .store(matches!(mode, KeyboardMode::Map), Ordering::Relaxed);
     }
 
-    /// Indica si el hook está activo capturando todas las teclas físicas (`Modo mapa`).
+    /// Indica si el hook está capturando todas las teclas físicas (`Modo mapa` o fallback sin foreground).
     pub fn is_capturing_all_keys(&self) -> bool {
+        let state = shared_state();
         self.was_active
             && self.is_installed()
-            && shared_state().map_mode.load(Ordering::Relaxed)
+            && (state.map_mode.load(Ordering::Relaxed)
+                || (state.own_pid != 0
+                    && !unsafe { is_own_window_foreground(state.own_pid) }
+                    && unsafe { cursor_window_pid() } == state.own_pid))
     }
 
     /// Activa o desactiva la captura de atajos de sistema hacia `tx`; instala y desinstala el hook dinámicamente.
@@ -302,6 +312,16 @@ pub(crate) fn should_capture_for_pids(own_pid: u32, fg_pid: u32, cursor_pid: u32
     own_pid != 0 && (fg_pid == own_pid || cursor_pid == own_pid)
 }
 
+/// Decide si el hook debe interceptar todas las teclas físicas (`Modo mapa` o cuando otra app como `SearchHost` retiene el foreground con el puntero encima).
+pub(crate) fn should_hook_capture_all_keys(
+    map_mode: bool,
+    own_pid: u32,
+    fg_pid: u32,
+    cursor_pid: u32,
+) -> bool {
+    map_mode || (own_pid != 0 && fg_pid != own_pid && cursor_pid == own_pid)
+}
+
 unsafe extern "system" fn low_level_kb_proc(
     n_code: i32,
     w_param: WPARAM,
@@ -321,6 +341,9 @@ unsafe extern "system" fn low_level_kb_proc(
         let is_self_injected = kb.dwExtraInfo == RANDYDESK_INPUT_EXTRA_INFO;
         let fg_pid = foreground_window_pid();
         let cursor_pid = cursor_window_pid();
+        let can_capture = active
+            && !is_self_injected
+            && should_capture_for_pids(state.own_pid, fg_pid, cursor_pid);
 
         if vk == VK_LWIN_U16 || vk == VK_RWIN_U16 {
             let has_tx = state.tx.try_lock().map(|g| g.is_some()).unwrap_or(false);
@@ -330,19 +353,34 @@ unsafe extern "system" fn low_level_kb_proc(
             ));
         }
 
-        if active
-            && !is_self_injected
-            && should_capture_for_pids(state.own_pid, fg_pid, cursor_pid)
-        {
+        // Limpia win_down SIEMPRE al soltar Win incluso si el cursor o foco salieron de RandyDesk.
+        if !is_self_injected && matches!(vk, VK_LWIN_U16 | VK_RWIN_U16) && down == Some(false) && !can_capture {
+            let was_win_down = state.win_down.swap(false, Ordering::Relaxed);
+            if active && was_win_down {
+                if let Ok(guard) = state.tx.try_lock() {
+                    if let Some(tx) = guard.as_ref() {
+                        let ev = build_hook_key_event(kb.vkCode, kb.scanCode, kb.flags.0, false);
+                        let _ = tx.try_send(NetCommand::Input(ev));
+                    }
+                }
+            }
+        }
+
+        if can_capture {
             if let Some(down) = down {
-                let win_was_down = state.win_down.load(Ordering::Relaxed);
                 let map_mode = state.map_mode.load(Ordering::Relaxed);
-                let intercept = if map_mode {
+                let capture_all =
+                    should_hook_capture_all_keys(map_mode, state.own_pid, fg_pid, cursor_pid);
+                let intercept = if capture_all {
                     if matches!(vk, VK_LWIN_U16 | VK_RWIN_U16) {
                         state.win_down.store(down, Ordering::Relaxed);
                     }
                     true
                 } else {
+                    let win_phys_down = ((GetAsyncKeyState(VK_LWIN_U16 as i32) as u16 & 0x8000) != 0)
+                        || ((GetAsyncKeyState(VK_RWIN_U16 as i32) as u16 & 0x8000) != 0);
+                    let win_was_down = state.win_down.load(Ordering::Relaxed)
+                        && (win_phys_down || matches!(vk, VK_LWIN_U16 | VK_RWIN_U16));
                     let alt_down = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0;
                     let ctrl_down = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0;
                     let (hit, new_win_down) =
@@ -360,7 +398,7 @@ unsafe extern "system" fn low_level_kb_proc(
                                 Ok(()) => {
                                     state.sent_keys.fetch_add(1, Ordering::Relaxed);
                                     append_input_debug_log(&format!(
-                                        "[CLIENT-HOOK] syskey vk=0x{vk:04X} scan=0x{:02X} down={down} -> sent=ok",
+                                        "[CLIENT-HOOK] syskey vk=0x{vk:04X} scan=0x{:02X} down={down} capture_all={capture_all} -> sent=ok",
                                         kb.scanCode & 0xFF
                                     ));
                                     return LRESULT(1);
@@ -483,6 +521,19 @@ mod tests {
         assert!(should_capture_for_pids(12736, 12736, 9999));
         assert!(!should_capture_for_pids(12736, 8496, 9999));
         assert!(!should_capture_for_pids(0, 8496, 0));
+    }
+
+    #[test]
+    fn fallback_captures_all_keys_when_searchhost_steals_foreground() {
+        // Modo traducción con foreground propio: solo hotkeys de sistema (capture_all = false)
+        assert!(!should_hook_capture_all_keys(false, 19184, 19184, 19184));
+        // Modo traducción cuando SearchHost (8480) retiene foreground y cursor está sobre RandyDesk:
+        // captura TODAS las teclas por hook para que no se pierda escritura
+        assert!(should_hook_capture_all_keys(false, 19184, 8480, 19184));
+        // Modo mapa siempre captura todas las teclas
+        assert!(should_hook_capture_all_keys(true, 19184, 19184, 19184));
+        // Cursor y foreground fuera de RandyDesk -> false
+        assert!(!should_hook_capture_all_keys(false, 19184, 8480, 8488));
     }
 
     #[test]

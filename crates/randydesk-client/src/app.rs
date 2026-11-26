@@ -82,10 +82,18 @@ pub struct RandyDeskApp {
     screen_texture: Option<egui::TextureHandle>,
     fullscreen: bool,
     scale_mode: ScaleMode,
+    custom_scale_pct: f32,
+    stream_scale: u8,
     quality_preset: QualityPreset,
     show_monitor_stats: bool,
+    show_remote_cursor: bool,
     keyboard_grab_enabled: bool,
     keyboard_mode: KeyboardMode,
+    invert_wheel: bool,
+    swap_mouse_buttons: bool,
+    view_only: bool,
+    bar_collapsed: bool,
+    bar_pinned: bool,
     was_foreground: bool,
     remote_ctrl_down: bool,
     remote_alt_down: bool,
@@ -133,10 +141,18 @@ impl RandyDeskApp {
             screen_texture: None,
             fullscreen: false,
             scale_mode: ScaleMode::Adaptive,
+            custom_scale_pct: 100.0,
+            stream_scale: 100,
             quality_preset: QualityPreset::Balanced,
             show_monitor_stats: true,
+            show_remote_cursor: true,
             keyboard_grab_enabled: true,
             keyboard_mode: KeyboardMode::Translate,
+            invert_wheel: false,
+            swap_mouse_buttons: false,
+            view_only: false,
+            bar_collapsed: false,
+            bar_pinned: true,
             was_foreground: false,
             remote_ctrl_down: false,
             remote_alt_down: false,
@@ -238,6 +254,7 @@ impl RandyDeskApp {
                     jpeg_quality: prompt.quality,
                     target_fps: prompt.fps,
                 },
+                stream_scale: self.stream_scale,
             },
             ctx.clone(),
         );
@@ -969,19 +986,57 @@ impl RandyDeskApp {
                                 );
                             });
                     }
+                    ScaleMode::Custom(pct) => {
+                        let factor = (pct / 100.0).clamp(0.5, 2.0);
+                        let draw_size = tex_size * factor;
+                        egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let size = draw_size.max(ui.available_size());
+                                let (rect, response) =
+                                    ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                                img_rect = egui::Rect::from_center_size(rect.center(), draw_size);
+                                pointer_in_canvas = response.hovered() || response.dragged();
+                                ui.painter().image(
+                                    tex.id(),
+                                    img_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    Color32::WHITE,
+                                );
+                            });
+                    }
                 }
             });
+
+        if has_texture && pointer_in_canvas {
+            if self.view_only {
+                ctx.set_cursor_icon(egui::CursorIcon::NotAllowed);
+            } else if !self.show_remote_cursor {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
+            }
+        }
 
         let mut bar_state = SessionBarState {
             codec: self.codec_input,
             quality: self.quality_input,
             fps: self.fps_input,
             scale_mode: self.scale_mode,
+            custom_scale_pct: self.custom_scale_pct,
+            stream_scale: self.stream_scale,
             quality_preset: self.quality_preset,
             show_monitor_stats: self.show_monitor_stats,
+            show_remote_cursor: self.show_remote_cursor,
             fullscreen: self.fullscreen,
             keyboard_grab_enabled: self.keyboard_grab_enabled,
             keyboard_mode: self.keyboard_mode,
+            invert_wheel: self.invert_wheel,
+            swap_mouse_buttons: self.swap_mouse_buttons,
+            view_only: self.view_only,
+            bar_collapsed: self.bar_collapsed,
+            bar_pinned: self.bar_pinned,
         };
         let bar_actions = render_session_overlay(
             ctx,
@@ -1001,11 +1056,19 @@ impl RandyDeskApp {
         self.quality_input = bar_state.quality;
         self.fps_input = bar_state.fps;
         self.scale_mode = bar_state.scale_mode;
+        self.custom_scale_pct = bar_state.custom_scale_pct;
+        self.stream_scale = bar_state.stream_scale;
         self.quality_preset = bar_state.quality_preset;
         self.show_monitor_stats = bar_state.show_monitor_stats;
+        self.show_remote_cursor = bar_state.show_remote_cursor;
         self.fullscreen = bar_state.fullscreen;
         self.keyboard_grab_enabled = bar_state.keyboard_grab_enabled;
         self.keyboard_mode = bar_state.keyboard_mode;
+        self.invert_wheel = bar_state.invert_wheel;
+        self.swap_mouse_buttons = bar_state.swap_mouse_buttons;
+        self.view_only = bar_state.view_only;
+        self.bar_collapsed = bar_state.bar_collapsed;
+        self.bar_pinned = bar_state.bar_pinned;
 
         if bar_actions.settings_changed {
             self.net.send_cmd(NetCommand::UpdateSettings(StreamSettings {
@@ -1013,6 +1076,13 @@ impl RandyDeskApp {
                 jpeg_quality: self.quality_input,
                 target_fps: self.fps_input,
             }));
+        }
+        if bar_actions.stream_scale_changed {
+            self.net
+                .send_cmd(NetCommand::SetStreamScale(self.stream_scale));
+        }
+        if bar_actions.lock_remote_screen {
+            self.net.send_cmd(NetCommand::LockWorkStation);
         }
         if bar_actions.send_win_key {
             if let Some(tx) = self.net.cmd_sender() {
@@ -1100,8 +1170,10 @@ impl RandyDeskApp {
         }
 
         let is_fg = KeyboardHookGuard::is_window_foreground();
-        let should_capture_kb =
-            reconnecting.is_none() && self.keyboard_grab_enabled && !self.hidden_to_tray;
+        let should_capture_kb = reconnecting.is_none()
+            && self.keyboard_grab_enabled
+            && !self.hidden_to_tray
+            && !self.view_only;
         if self.was_foreground && !is_fg {
             self.release_remote_modifiers();
             if should_capture_kb {
@@ -1120,28 +1192,36 @@ impl RandyDeskApp {
             },
         );
 
+        if self.view_only {
+            self.release_remote_modifiers();
+            return;
+        }
+
         let hook_blocking_egui = self.kb_hook.is_capturing_all_keys();
 
-        // Sincroniza Ctrl/Alt/Shift con la ventana remota para atajos en Modo traducción
+        // Sincroniza Ctrl/Alt/Shift con la ventana remota para atajos en Modo traducción (sin AltGr)
         if !hook_blocking_egui && is_fg && reconnecting.is_none() {
             let mods = ctx.input(|i| i.modifiers);
-            if mods.ctrl != self.remote_ctrl_down {
+            let altgr = mods.ctrl && mods.alt && !mods.command;
+            let eff_ctrl = mods.ctrl && !altgr;
+            let eff_alt = mods.alt && !altgr;
+            if eff_ctrl != self.remote_ctrl_down {
                 self.net.send_input(InputEvent::Key {
                     vk: 0xA2,
                     scan: 0x1D,
                     extended: false,
-                    down: mods.ctrl,
+                    down: eff_ctrl,
                 });
-                self.remote_ctrl_down = mods.ctrl;
+                self.remote_ctrl_down = eff_ctrl;
             }
-            if mods.alt != self.remote_alt_down {
+            if eff_alt != self.remote_alt_down {
                 self.net.send_input(InputEvent::Key {
                     vk: 0xA4,
                     scan: 0x38,
                     extended: false,
-                    down: mods.alt,
+                    down: eff_alt,
                 });
-                self.remote_alt_down = mods.alt;
+                self.remote_alt_down = eff_alt;
             }
             if mods.shift != self.remote_shift_down {
                 self.net.send_input(InputEvent::Key {
@@ -1176,12 +1256,22 @@ impl RandyDeskApp {
                         if let Some(tray) = self.tray.as_ref() {
                             tray.ensure_foreground();
                         }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     if let Some((x_norm, y_norm)) = normalize_pos(pos, img_rect) {
                         self.net
                             .send_input(InputEvent::MouseMove { x_norm, y_norm });
                     }
-                    if let Some(mb) = map_mouse_button(button) {
+                    let mapped_btn = if self.swap_mouse_buttons {
+                        match button {
+                            egui::PointerButton::Primary => egui::PointerButton::Secondary,
+                            egui::PointerButton::Secondary => egui::PointerButton::Primary,
+                            other => other,
+                        }
+                    } else {
+                        button
+                    };
+                    if let Some(mb) = map_mouse_button(mapped_btn) {
                         self.net.send_input(InputEvent::MouseButton {
                             button: mb,
                             down: pressed,
@@ -1189,8 +1279,9 @@ impl RandyDeskApp {
                     }
                 }
                 egui::Event::MouseWheel { delta, .. } if pointer_in_canvas => {
-                    let dx = (delta.x * 3.0).round() as i16 * 40;
-                    let dy = (delta.y * 3.0).round() as i16 * 40;
+                    let sign = if self.invert_wheel { -1 } else { 1 };
+                    let dx = (delta.x * 3.0).round() as i16 * 40 * sign;
+                    let dy = (delta.y * 3.0).round() as i16 * 40 * sign;
                     if dx != 0 || dy != 0 {
                         self.net.send_input(InputEvent::MouseWheel {
                             delta_x: dx,
@@ -1204,7 +1295,8 @@ impl RandyDeskApp {
                     modifiers,
                     ..
                 } if !hook_blocking_egui => {
-                    let is_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
+                    let is_combo = (modifiers.ctrl || modifiers.alt || modifiers.command)
+                        && !(modifiers.ctrl && modifiers.alt && !modifiers.command);
                     if is_combo || is_control_or_nav_key(key) {
                         if let Some((vk, extended)) = map_egui_key_to_vk(key) {
                             self.net.send_input(InputEvent::Key {
@@ -1218,7 +1310,11 @@ impl RandyDeskApp {
                 }
                 egui::Event::Text(text) if !hook_blocking_egui => {
                     let mods = ctx.input(|i| i.modifiers);
-                    if !mods.ctrl && !mods.alt && !mods.command {
+                    let altgr = mods.ctrl && mods.alt && !mods.command;
+                    if (!mods.ctrl && !mods.alt && !mods.command) || altgr {
+                        if altgr {
+                            self.release_remote_modifiers();
+                        }
                         for ch in text.chars().filter(|c| !c.is_control()) {
                             self.net
                                 .send_input(InputEvent::UnicodeChar { ch, down: true });

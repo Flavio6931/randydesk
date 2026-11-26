@@ -1,19 +1,21 @@
-//! Barra flotante superior estilo RustDesk y tarjeta de métricas en sesión remota.
+//! Barra flotante superior colapsable estilo RustDesk y tarjeta de métricas en sesión remota.
 
 use crate::net::SessionStats;
 use crate::theme::{ACCENT_BLUE, ACCENT_TEAL, BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED};
-use crate::win_hook::KeyboardMode;
-use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
+use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
+use eframe::egui::{self, Color32, Rounding, Shape, Stroke, Vec2};
 use randydesk_proto::CodecKind;
 
 /// Modo de escalado del escritorio remoto dentro de la ventana del visor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ScaleMode {
     /// Ajusta la imagen al área disponible preservando la relación de aspecto.
     #[default]
     Adaptive,
     /// Muestra píxeles 1:1 con barras de desplazamiento si excede la ventana.
     Original,
+    /// Porcentaje manual de zoom en el visor (`50%..=200%`).
+    Custom(f32),
 }
 
 /// Perfil predefinido de calidad/latencia de imagen estilo RustDesk.
@@ -47,19 +49,29 @@ pub struct SessionBarState {
     pub quality: u8,
     pub fps: u8,
     pub scale_mode: ScaleMode,
+    pub custom_scale_pct: f32,
+    pub stream_scale: u8,
     pub quality_preset: QualityPreset,
     pub show_monitor_stats: bool,
+    pub show_remote_cursor: bool,
     pub fullscreen: bool,
     pub keyboard_grab_enabled: bool,
     pub keyboard_mode: KeyboardMode,
+    pub invert_wheel: bool,
+    pub swap_mouse_buttons: bool,
+    pub view_only: bool,
+    pub bar_collapsed: bool,
+    pub bar_pinned: bool,
 }
 
 /// Acciones disparadas por el usuario desde la barra flotante durante un frame.
 #[derive(Default)]
 pub struct SessionBarActions {
     pub settings_changed: bool,
+    pub stream_scale_changed: bool,
     pub send_win_key: bool,
     pub send_task_manager: bool,
+    pub lock_remote_screen: bool,
     pub send_clipboard: bool,
     pub fetch_clipboard: bool,
     pub request_keyframe: bool,
@@ -68,292 +80,485 @@ pub struct SessionBarActions {
     pub keyboard_cfg_changed: bool,
 }
 
-/// Renderiza la barra flotante superior centrada y, si está activa, la tarjeta de métricas.
+/// Normaliza un porcentaje de escala de transmisión al rango permitido (`50..=100`).
+pub fn clamp_stream_scale(pct: u8) -> u8 {
+    pct.clamp(50, 100)
+}
+
+/// Renderiza la barra flotante superior (expandida o colapsada como pestaña) y el monitor de calidad.
 pub fn render_session_overlay(
     ctx: &egui::Context,
     input: SessionBarInput<'_>,
     state: &mut SessionBarState,
 ) -> SessionBarActions {
     let mut actions = SessionBarActions::default();
+    state.stream_scale = clamp_stream_scale(state.stream_scale);
 
-    let bar_fill = Color32::from_rgba_unmultiplied(24, 28, 36, 240);
-    egui::Area::new(egui::Id::new("session_floating_bar"))
-        .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 6.0))
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            egui::Frame::none()
-                .fill(bar_fill)
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                .rounding(Rounding::same(8.0))
-                .inner_margin(egui::Margin::symmetric(10.0, 5.0))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-
-                        let (dot_rect, _) =
-                            ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                        let dot_color = if input.reconnecting.is_some() {
-                            STATUS_ORANGE
-                        } else {
-                            ACCENT_TEAL
-                        };
-                        ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
-
-                        if let Some((attempt, _)) = input.reconnecting {
-                            ui.colored_label(
-                                STATUS_ORANGE,
-                                format!("Reconectando #{attempt}"),
-                            );
-                        } else {
+    if state.bar_collapsed {
+        let resp = egui::Area::new(egui::Id::new("session_floating_tab"))
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 2.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let fill = Color32::from_rgba_unmultiplied(24, 28, 36, 228);
+                let frame_resp = egui::Frame::none()
+                    .fill(fill)
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .rounding(Rounding {
+                        nw: 0.0,
+                        ne: 0.0,
+                        sw: 8.0,
+                        se: 8.0,
+                    })
+                    .inner_margin(egui::Margin::symmetric(12.0, 3.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                            let dot_color = if input.reconnecting.is_some() {
+                                STATUS_ORANGE
+                            } else {
+                                ACCENT_TEAL
+                            };
+                            ui.painter().circle_filled(dot_rect.center(), 3.5, dot_color);
                             ui.label(
-                                egui::RichText::new(input.host_name)
-                                    .size(12.5)
+                                egui::RichText::new("RandyDesk")
+                                    .size(11.0)
                                     .strong()
                                     .color(Color32::WHITE),
                             );
-                        }
+                            let (tri_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(9.0, 6.0), egui::Sense::hover());
+                            let c = tri_rect.center();
+                            ui.painter().add(Shape::convex_polygon(
+                                vec![
+                                    egui::pos2(c.x - 4.0, c.y - 2.0),
+                                    egui::pos2(c.x + 4.0, c.y - 2.0),
+                                    egui::pos2(c.x, c.y + 3.0),
+                                ],
+                                TEXT_MUTED,
+                                Stroke::NONE,
+                            ));
+                        });
+                    });
+                frame_resp.response.interact(egui::Sense::click())
+            })
+            .inner;
 
-                        ui.separator();
+        if resp.clicked() || (!state.bar_pinned && resp.hovered()) {
+            state.bar_collapsed = false;
+        }
+    } else {
+        let bar_fill = Color32::from_rgba_unmultiplied(24, 28, 36, 240);
+        let bar_resp = egui::Area::new(egui::Id::new("session_floating_bar"))
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 6.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(bar_fill)
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
 
-                        ui.menu_button("Pantalla", |ui| {
-                            ui.set_min_width(210.0);
-                            if ui
-                                .selectable_label(
-                                    state.scale_mode == ScaleMode::Adaptive,
-                                    "Escala adaptativa",
-                                )
-                                .clicked()
-                            {
-                                state.scale_mode = ScaleMode::Adaptive;
-                                ui.close_menu();
-                            }
-                            if ui
-                                .selectable_label(
-                                    state.scale_mode == ScaleMode::Original,
-                                    "Escala original",
-                                )
-                                .clicked()
-                            {
-                                state.scale_mode = ScaleMode::Original;
-                                ui.close_menu();
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                            let dot_color = if input.reconnecting.is_some() {
+                                STATUS_ORANGE
+                            } else {
+                                ACCENT_TEAL
+                            };
+                            ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
+
+                            if let Some((attempt, _)) = input.reconnecting {
+                                ui.colored_label(
+                                    STATUS_ORANGE,
+                                    format!("Reconectando #{attempt}"),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(input.host_name)
+                                        .size(12.5)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
                             }
 
                             ui.separator();
 
-                            ui.menu_button("Calidad de imagen", |ui| {
-                                ui.set_min_width(225.0);
+                            ui.menu_button("Pantalla", |ui| {
+                                ui.set_min_width(235.0);
                                 if ui
                                     .selectable_label(
-                                        state.quality_preset == QualityPreset::High
-                                            && state.codec == CodecKind::Jpeg,
-                                        "Buena calidad de imagen",
+                                        matches!(state.scale_mode, ScaleMode::Adaptive),
+                                        "Escala adaptativa",
                                     )
                                     .clicked()
                                 {
-                                    state.codec = CodecKind::Jpeg;
-                                    state.quality = 88;
-                                    state.fps = 30;
-                                    state.quality_preset = QualityPreset::High;
-                                    actions.settings_changed = true;
+                                    state.scale_mode = ScaleMode::Adaptive;
                                     ui.close_menu();
                                 }
                                 if ui
                                     .selectable_label(
-                                        state.quality_preset == QualityPreset::Balanced
-                                            && state.codec == CodecKind::Jpeg,
-                                        "Equilibrado",
+                                        matches!(state.scale_mode, ScaleMode::Original),
+                                        "Escala original",
                                     )
                                     .clicked()
                                 {
-                                    state.codec = CodecKind::Jpeg;
-                                    state.quality = 72;
-                                    state.fps = 30;
-                                    state.quality_preset = QualityPreset::Balanced;
-                                    actions.settings_changed = true;
+                                    state.scale_mode = ScaleMode::Original;
                                     ui.close_menu();
                                 }
                                 if ui
                                     .selectable_label(
-                                        state.quality_preset == QualityPreset::Fast
-                                            && state.codec == CodecKind::Jpeg,
-                                        "Optimizar el tiempo de reacción",
+                                        matches!(state.scale_mode, ScaleMode::Custom(_)),
+                                        "Escala personalizada",
                                     )
                                     .clicked()
                                 {
-                                    state.codec = CodecKind::Jpeg;
-                                    state.quality = 50;
-                                    state.fps = 30;
-                                    state.quality_preset = QualityPreset::Fast;
-                                    actions.settings_changed = true;
+                                    state.scale_mode =
+                                        ScaleMode::Custom(state.custom_scale_pct.clamp(50.0, 200.0));
+                                }
+                                if matches!(state.scale_mode, ScaleMode::Custom(_))
+                                    && ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut state.custom_scale_pct,
+                                                50.0..=200.0,
+                                            )
+                                            .step_by(5.0)
+                                            .suffix("%")
+                                            .text("Zoom"),
+                                        )
+                                        .changed()
+                                {
+                                    state.scale_mode = ScaleMode::Custom(state.custom_scale_pct);
+                                }
+
+                                ui.separator();
+
+                                ui.menu_button("Resolución de transmisión", |ui| {
+                                    ui.set_min_width(195.0);
+                                    for (pct, label) in [
+                                        (100u8, "100% (Nativa)"),
+                                        (75u8, "75% (Fluida)"),
+                                        (50u8, "50% (Ultra rápida)"),
+                                    ] {
+                                        if ui
+                                            .selectable_label(state.stream_scale == pct, label)
+                                            .clicked()
+                                        {
+                                            if state.stream_scale != pct {
+                                                state.stream_scale = pct;
+                                                actions.stream_scale_changed = true;
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+
+                                ui.menu_button("Calidad de imagen", |ui| {
+                                    ui.set_min_width(235.0);
+                                    if ui
+                                        .selectable_label(
+                                            state.quality_preset == QualityPreset::High
+                                                && state.codec == CodecKind::Jpeg,
+                                            "Buena calidad de imagen",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.codec = CodecKind::Jpeg;
+                                        state.quality = 88;
+                                        state.fps = 30;
+                                        state.quality_preset = QualityPreset::High;
+                                        actions.settings_changed = true;
+                                        if state.stream_scale != 100 {
+                                            state.stream_scale = 100;
+                                            actions.stream_scale_changed = true;
+                                        }
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            state.quality_preset == QualityPreset::Balanced
+                                                && state.codec == CodecKind::Jpeg,
+                                            "Equilibrado",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.codec = CodecKind::Jpeg;
+                                        state.quality = 72;
+                                        state.fps = 30;
+                                        state.quality_preset = QualityPreset::Balanced;
+                                        actions.settings_changed = true;
+                                        if state.stream_scale != 100 {
+                                            state.stream_scale = 100;
+                                            actions.stream_scale_changed = true;
+                                        }
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            state.quality_preset == QualityPreset::Fast
+                                                && state.codec == CodecKind::Jpeg,
+                                            "Optimizar el tiempo de reacción",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.codec = CodecKind::Jpeg;
+                                        state.quality = 50;
+                                        state.fps = 30;
+                                        state.quality_preset = QualityPreset::Fast;
+                                        actions.settings_changed = true;
+                                        if state.stream_scale != 75 {
+                                            state.stream_scale = 75;
+                                            actions.stream_scale_changed = true;
+                                        }
+                                        ui.close_menu();
+                                    }
+
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("Personalizado")
+                                            .size(11.5)
+                                            .color(TEXT_MUTED),
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut state.quality, 35..=95)
+                                                .text("Calidad JPEG"),
+                                        )
+                                        .changed()
+                                    {
+                                        state.codec = CodecKind::Jpeg;
+                                        state.quality_preset = QualityPreset::Custom;
+                                        actions.settings_changed = true;
+                                    }
+                                    if ui
+                                        .add(egui::Slider::new(&mut state.fps, 5..=60).text("FPS"))
+                                        .changed()
+                                    {
+                                        state.quality_preset = QualityPreset::Custom;
+                                        actions.settings_changed = true;
+                                    }
+                                });
+
+                                ui.menu_button("Códec", |ui| {
+                                    ui.set_min_width(185.0);
+                                    if ui
+                                        .selectable_label(
+                                            state.codec == CodecKind::Jpeg,
+                                            "Automático (JPEG)",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.codec = CodecKind::Jpeg;
+                                        actions.settings_changed = true;
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            state.codec == CodecKind::Lz4Rgba,
+                                            "Sin pérdida (LZ4 Nítido)",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.codec = CodecKind::Lz4Rgba;
+                                        actions.settings_changed = true;
+                                        ui.close_menu();
+                                    }
+                                });
+
+                                ui.separator();
+
+                                ui.checkbox(
+                                    &mut state.show_remote_cursor,
+                                    "Mostrar cursor remoto",
+                                );
+                                ui.checkbox(
+                                    &mut state.show_monitor_stats,
+                                    "Mostrar calidad del monitor",
+                                );
+                                if ui
+                                    .checkbox(&mut state.fullscreen, "Pantalla completa")
+                                    .changed()
+                                {
+                                    actions.toggle_fullscreen = true;
+                                    ui.close_menu();
+                                }
+                            });
+
+                            ui.menu_button("Acciones", |ui| {
+                                ui.set_min_width(250.0);
+                                if ui.button("Enviar tecla Windows (Inicio)").clicked() {
+                                    actions.send_win_key = true;
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button("Administrador de tareas (Ctrl+Shift+Esc)")
+                                    .clicked()
+                                {
+                                    actions.send_task_manager = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Bloquear pantalla remota").clicked() {
+                                    actions.lock_remote_screen = true;
+                                    ui.close_menu();
+                                }
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new("Ctrl + Alt + Del (Requiere servicio SYSTEM)"),
+                                )
+                                .on_disabled_hover_text(
+                                    "Disponible en Fase 2 al instalar el servicio Windows SYSTEM.",
+                                );
+                                ui.separator();
+                                if ui.button("Enviar portapapeles").clicked() {
+                                    actions.send_clipboard = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Traer portapapeles").clicked() {
+                                    actions.fetch_clipboard = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Actualizar pantalla").clicked() {
+                                    actions.request_keyframe = true;
+                                    ui.close_menu();
+                                }
+                            });
+
+                            ui.menu_button("Teclado y ratón", |ui| {
+                                ui.set_min_width(245.0);
+                                if ui
+                                    .selectable_label(
+                                        state.keyboard_mode == KeyboardMode::Translate,
+                                        "Modo traducción (Texto + Atajos)",
+                                    )
+                                    .clicked()
+                                {
+                                    state.keyboard_mode = KeyboardMode::Translate;
+                                    actions.keyboard_cfg_changed = true;
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .selectable_label(
+                                        state.keyboard_mode == KeyboardMode::Map,
+                                        "Modo mapa (Teclado físico)",
+                                    )
+                                    .clicked()
+                                {
+                                    state.keyboard_mode = KeyboardMode::Map;
+                                    actions.keyboard_cfg_changed = true;
                                     ui.close_menu();
                                 }
 
                                 ui.separator();
-                                ui.label(
-                                    egui::RichText::new("Personalizado")
-                                        .size(11.5)
-                                        .color(TEXT_MUTED),
+
+                                if ui
+                                    .checkbox(
+                                        &mut state.keyboard_grab_enabled,
+                                        "Capturar tecla Win y Alt+Tab",
+                                    )
+                                    .changed()
+                                {
+                                    actions.keyboard_cfg_changed = true;
+                                }
+                                ui.checkbox(&mut state.invert_wheel, "Invertir dirección de rueda");
+                                ui.checkbox(
+                                    &mut state.swap_mouse_buttons,
+                                    "Intercambiar botones de ratón",
                                 );
                                 if ui
-                                    .add(
-                                        egui::Slider::new(&mut state.quality, 35..=95)
-                                            .text("Calidad JPEG"),
+                                    .checkbox(
+                                        &mut state.view_only,
+                                        "Solo visualización (bloquear entrada)",
                                     )
                                     .changed()
                                 {
-                                    state.codec = CodecKind::Jpeg;
-                                    state.quality_preset = QualityPreset::Custom;
-                                    actions.settings_changed = true;
+                                    actions.keyboard_cfg_changed = true;
                                 }
-                                if ui
-                                    .add(egui::Slider::new(&mut state.fps, 5..=60).text("FPS"))
-                                    .changed()
-                                {
-                                    state.quality_preset = QualityPreset::Custom;
-                                    actions.settings_changed = true;
-                                }
-                            });
 
-                            ui.menu_button("Códec", |ui| {
-                                ui.set_min_width(185.0);
-                                if ui
-                                    .selectable_label(
-                                        state.codec == CodecKind::Jpeg,
-                                        "Automático (JPEG)",
+                                ui.separator();
+                                let (status_txt, status_col) = if state.view_only {
+                                    ("Estado entrada: Solo visualización".to_string(), STATUS_ORANGE)
+                                } else if !state.keyboard_grab_enabled {
+                                    ("Estado hook: Desactivado".to_string(), TEXT_MUTED)
+                                } else if input.hook_installed {
+                                    let focus_note = if KeyboardHookGuard::is_window_foreground() {
+                                        "foco activo"
+                                    } else if KeyboardHookGuard::is_cursor_over_own_window() {
+                                        "puntero activo"
+                                    } else {
+                                        "en espera"
+                                    };
+                                    (
+                                        format!(
+                                            "Hook: Activo ({focus_note}, {} teclas)",
+                                            input.hook_hits
+                                        ),
+                                        ACCENT_TEAL,
                                     )
-                                    .clicked()
-                                {
-                                    state.codec = CodecKind::Jpeg;
-                                    actions.settings_changed = true;
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .selectable_label(
-                                        state.codec == CodecKind::Lz4Rgba,
-                                        "Sin pérdida (LZ4 Nítido)",
-                                    )
-                                    .clicked()
-                                {
-                                    state.codec = CodecKind::Lz4Rgba;
-                                    actions.settings_changed = true;
-                                    ui.close_menu();
-                                }
+                                } else {
+                                    ("Estado hook: Hook no disponible".to_string(), STATUS_ORANGE)
+                                };
+                                ui.label(egui::RichText::new(status_txt).size(11.5).color(status_col));
                             });
 
                             ui.separator();
 
-                            ui.checkbox(
-                                &mut state.show_monitor_stats,
-                                "Mostrar calidad del monitor",
-                            );
                             if ui
-                                .checkbox(&mut state.fullscreen, "Pantalla completa")
-                                .changed()
-                            {
-                                actions.toggle_fullscreen = true;
-                                ui.close_menu();
-                            }
-                        });
-
-                        ui.menu_button("Acciones", |ui| {
-                            ui.set_min_width(235.0);
-                            if ui.button("Enviar tecla Windows (Inicio)").clicked() {
-                                actions.send_win_key = true;
-                                ui.close_menu();
-                            }
-                            if ui
-                                .button("Administrador de tareas (Ctrl+Shift+Esc)")
-                                .clicked()
-                            {
-                                actions.send_task_manager = true;
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button("Enviar portapapeles").clicked() {
-                                actions.send_clipboard = true;
-                                ui.close_menu();
-                            }
-                            if ui.button("Traer portapapeles").clicked() {
-                                actions.fetch_clipboard = true;
-                                ui.close_menu();
-                            }
-                            if ui.button("Actualizar pantalla").clicked() {
-                                actions.request_keyframe = true;
-                                ui.close_menu();
-                            }
-                        });
-
-                        ui.menu_button("Teclado", |ui| {
-                            ui.set_min_width(230.0);
-                            if ui
-                                .selectable_label(
-                                    state.keyboard_mode == KeyboardMode::Translate,
-                                    "Modo traducción (Texto + Atajos)",
+                                .selectable_label(state.bar_pinned, "Fijar")
+                                .on_hover_text(
+                                    "Mantener barra fijada arriba (si la desactivas, se oculta al alejar el puntero)",
                                 )
                                 .clicked()
                             {
-                                state.keyboard_mode = KeyboardMode::Translate;
-                                actions.keyboard_cfg_changed = true;
-                                ui.close_menu();
+                                state.bar_pinned = !state.bar_pinned;
                             }
+
                             if ui
-                                .selectable_label(
-                                    state.keyboard_mode == KeyboardMode::Map,
-                                    "Modo mapa (Teclado físico)",
+                                .button("Ocultar")
+                                .on_hover_text(
+                                    "Contraer la barra en una pestaña superior para no tapar pestañas",
                                 )
                                 .clicked()
                             {
-                                state.keyboard_mode = KeyboardMode::Map;
-                                actions.keyboard_cfg_changed = true;
-                                ui.close_menu();
+                                state.bar_collapsed = true;
                             }
-
-                            ui.separator();
 
                             if ui
-                                .checkbox(
-                                    &mut state.keyboard_grab_enabled,
-                                    "Capturar tecla Win y Alt+Tab",
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Desconectar")
+                                            .size(12.0)
+                                            .color(Color32::WHITE)
+                                            .strong(),
+                                    )
+                                    .fill(Color32::from_rgb(198, 56, 56)),
                                 )
-                                .changed()
+                                .clicked()
                             {
-                                actions.keyboard_cfg_changed = true;
+                                actions.disconnect = true;
                             }
-
-                            let (status_txt, status_col) = if !state.keyboard_grab_enabled {
-                                ("Estado hook: Desactivado".to_string(), TEXT_MUTED)
-                            } else if input.hook_installed {
-                                (
-                                    format!("Estado hook: Activo ({})", input.hook_hits),
-                                    ACCENT_TEAL,
-                                )
-                            } else {
-                                ("Estado hook: Hook no disponible".to_string(), STATUS_ORANGE)
-                            };
-                            ui.label(egui::RichText::new(status_txt).size(11.5).color(status_col));
                         });
-
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Desconectar")
-                                        .size(12.0)
-                                        .color(Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(Color32::from_rgb(198, 56, 56)),
-                            )
-                            .clicked()
-                        {
-                            actions.disconnect = true;
-                        }
                     });
-                });
-        });
+            });
+
+        if !state.bar_pinned && !ctx.memory(|m| m.any_popup_open()) {
+            let safe_zone = bar_resp.response.rect.expand2(Vec2::new(20.0, 18.0));
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !safe_zone.contains(pos) {
+                    state.bar_collapsed = true;
+                }
+            }
+        }
+    }
 
     if state.show_monitor_stats {
+        let card_y = if state.bar_collapsed { 14.0 } else { 52.0 };
         egui::Area::new(egui::Id::new("session_monitor_card"))
-            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-12.0, 52.0))
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-12.0, card_y))
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
@@ -377,11 +582,16 @@ pub fn render_session_overlay(
                             CodecKind::Jpeg => format!("JPEG {}%", state.quality),
                             CodecKind::Lz4Rgba => "LZ4 Nítido".to_string(),
                         };
+                        let res_str = if state.stream_scale < 100 {
+                            format!("{}x{} ({}%)", input.width, input.height, state.stream_scale)
+                        } else {
+                            format!("{}x{}", input.width, input.height)
+                        };
 
                         ui.label(
                             egui::RichText::new(format!(
-                                "{}x{} | {:.1} fps | {bw} | {rtt}",
-                                input.width, input.height, input.stats.fps
+                                "{res_str} | {:.1} fps | {bw} | {rtt}",
+                                input.stats.fps
                             ))
                             .size(11.5)
                             .color(ACCENT_BLUE),
@@ -407,4 +617,18 @@ pub fn format_duration(total_secs: u64) -> String {
     let m = (total_secs % 3600) / 60;
     let s = total_secs % 60;
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_session_duration_and_clamps_stream_scale() {
+        assert_eq!(format_duration(0), "00:00:00");
+        assert_eq!(format_duration(3661), "01:01:01");
+        assert_eq!(clamp_stream_scale(10), 50);
+        assert_eq!(clamp_stream_scale(75), 75);
+        assert_eq!(clamp_stream_scale(150), 100);
+    }
 }

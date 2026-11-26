@@ -22,6 +22,7 @@ pub struct TileEncoder {
     degraded_tiles: Vec<bool>,
     frame_id: u64,
     last_jpeg_quality: Option<u8>,
+    scaled_bgra: Vec<u8>,
     rgb_scratch: Vec<u8>,
     rgba_scratch: Vec<u8>,
     jpeg_scratch: Vec<u8>,
@@ -48,6 +49,7 @@ impl TileEncoder {
             degraded_tiles: Vec::new(),
             frame_id: 0,
             last_jpeg_quality: None,
+            scaled_bgra: Vec::new(),
             rgb_scratch: Vec::new(),
             rgba_scratch: Vec::new(),
             jpeg_scratch: Vec::new(),
@@ -72,24 +74,55 @@ impl TileEncoder {
         settings: StreamSettings,
         force_keyframe: bool,
     ) -> Result<Option<HostMsg>> {
-        let stride = (frame.width as usize) * 4;
+        self.encode_scaled(frame, settings, 100, force_keyframe)
+    }
+
+    /// Codifica un cuadro aplicando opcionalmente downscale rápido (`50..=100%`) antes de dividir en tiles.
+    pub fn encode_scaled(
+        &mut self,
+        frame: &CapturedFrame,
+        settings: StreamSettings,
+        scale_percent: u8,
+        force_keyframe: bool,
+    ) -> Result<Option<HostMsg>> {
+        let src_stride = (frame.width as usize) * 4;
         ensure!(
-            frame.bgra.len() >= stride * (frame.height as usize),
+            frame.bgra.len() >= src_stride * (frame.height as usize),
             "buffer BGRA insuficiente ({} < {})",
             frame.bgra.len(),
-            stride * (frame.height as usize)
+            src_stride * (frame.height as usize)
         );
 
-        let cols = frame.width.div_ceil(TILE_SIZE);
-        let rows = frame.height.div_ceil(TILE_SIZE);
+        let pct = scale_percent.clamp(50, 100);
+        let (work_w, work_h, work_bgra): (u32, u32, &[u8]) =
+            if pct < 100 && frame.width >= 128 && frame.height >= 128 {
+                let dst_w = ((frame.width * (pct as u32)) / 100).max(64) & !1;
+                let dst_h = ((frame.height * (pct as u32)) / 100).max(64) & !1;
+                downscale_bgra(
+                    &frame.bgra,
+                    frame.width,
+                    frame.height,
+                    dst_w,
+                    dst_h,
+                    pct == 50,
+                    &mut self.scaled_bgra,
+                );
+                (dst_w, dst_h, self.scaled_bgra.as_slice())
+            } else {
+                (frame.width, frame.height, frame.bgra.as_slice())
+            };
+        let stride = (work_w as usize) * 4;
+
+        let cols = work_w.div_ceil(TILE_SIZE);
+        let rows = work_h.div_ceil(TILE_SIZE);
         let total_tiles = (cols * rows) as usize;
-        let resolution_changed = self.width != frame.width || self.height != frame.height;
+        let resolution_changed = self.width != work_w || self.height != work_h;
         let full_refresh =
             force_keyframe || resolution_changed || self.tile_hashes.len() != total_tiles;
 
         if full_refresh {
-            self.width = frame.width;
-            self.height = frame.height;
+            self.width = work_w;
+            self.height = work_h;
             self.cols = cols;
             self.rows = rows;
             self.tile_hashes.resize(total_tiles, u64::MAX);
@@ -105,11 +138,11 @@ impl TileEncoder {
             for tx in 0..cols {
                 let x = tx * TILE_SIZE;
                 let y = ty * TILE_SIZE;
-                let tw = (frame.width - x).min(TILE_SIZE);
-                let th = (frame.height - y).min(TILE_SIZE);
+                let tw = (work_w - x).min(TILE_SIZE);
+                let th = (work_h - y).min(TILE_SIZE);
                 let idx = (ty * cols + tx) as usize;
 
-                let hash = hash_bgra_tile(&frame.bgra, stride, x, y, tw, th);
+                let hash = hash_bgra_tile(work_bgra, stride, x, y, tw, th);
                 new_hashes[idx] = hash;
                 if full_refresh || self.tile_hashes[idx] != hash {
                     changed_flags[idx] = true;
@@ -139,8 +172,8 @@ impl TileEncoder {
                 if changed_flags[idx] || needs_crisp_refresh {
                     let x = tx * TILE_SIZE;
                     let y = ty * TILE_SIZE;
-                    let tw = (frame.width - x).min(TILE_SIZE);
-                    let th = (frame.height - y).min(TILE_SIZE);
+                    let tw = (work_w - x).min(TILE_SIZE);
+                    let th = (work_h - y).min(TILE_SIZE);
                     jobs.push(TileJob {
                         idx,
                         x,
@@ -160,7 +193,7 @@ impl TileEncoder {
         let encoded_tiles = if jobs.len() == 1 {
             let job = &jobs[0];
             let data = encode_tile_payload(
-                &frame.bgra,
+                work_bgra,
                 stride,
                 job,
                 settings.codec,
@@ -184,7 +217,7 @@ impl TileEncoder {
                 .clamp(1, jobs.len());
             let chunk_size = jobs.len().div_ceil(workers);
             let mut results: Vec<Option<EncodedTile>> = vec![None; jobs.len()];
-            let bgra = &frame.bgra;
+            let bgra = work_bgra;
             let codec = settings.codec;
 
             std::thread::scope(|scope| -> Result<()> {
@@ -241,11 +274,75 @@ impl TileEncoder {
         self.frame_id += 1;
         Ok(Some(HostMsg::VideoFrame {
             frame_id: self.frame_id,
-            width: frame.width,
-            height: frame.height,
+            width: work_w,
+            height: work_h,
             full_refresh,
             tiles: encoded_tiles,
         }))
+    }
+}
+
+/// Reduce un cuadro BGRA usando promedio 2x2 al 50% o punto fijo 16.16 para otros porcentajes.
+fn downscale_bgra(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    box_2x2: bool,
+    out: &mut Vec<u8>,
+) {
+    let dst_len = (dst_w as usize) * (dst_h as usize) * 4;
+    out.resize(dst_len, 0);
+    let src_stride = (src_w as usize) * 4;
+    let dst_stride = (dst_w as usize) * 4;
+
+    if box_2x2 && src_w >= dst_w * 2 && src_h >= dst_h * 2 {
+        for y in 0..(dst_h as usize) {
+            let sy0 = y * 2;
+            let sy1 = sy0 + 1;
+            let row0 = &src[sy0 * src_stride..sy0 * src_stride + src_stride];
+            let row1 = &src[sy1 * src_stride..sy1 * src_stride + src_stride];
+            let dst_row = &mut out[y * dst_stride..(y + 1) * dst_stride];
+            for x in 0..(dst_w as usize) {
+                let sx = x * 8;
+                let dx = x * 4;
+                dst_row[dx] = ((row0[sx] as u16
+                    + row0[sx + 4] as u16
+                    + row1[sx] as u16
+                    + row1[sx + 4] as u16)
+                    >> 2) as u8;
+                dst_row[dx + 1] = ((row0[sx + 1] as u16
+                    + row0[sx + 5] as u16
+                    + row1[sx + 1] as u16
+                    + row1[sx + 5] as u16)
+                    >> 2) as u8;
+                dst_row[dx + 2] = ((row0[sx + 2] as u16
+                    + row0[sx + 6] as u16
+                    + row1[sx + 2] as u16
+                    + row1[sx + 6] as u16)
+                    >> 2) as u8;
+                dst_row[dx + 3] = 255;
+            }
+        }
+        return;
+    }
+
+    let x_step = ((src_w as u64) << 16) / (dst_w as u64);
+    let y_step = ((src_h as u64) << 16) / (dst_h as u64);
+    let mut sy_fp = 0u64;
+    for y in 0..(dst_h as usize) {
+        let sy = ((sy_fp >> 16) as usize).min((src_h - 1) as usize);
+        sy_fp += y_step;
+        let src_row = &src[sy * src_stride..sy * src_stride + src_stride];
+        let dst_row = &mut out[y * dst_stride..(y + 1) * dst_stride];
+        let mut sx_fp = 0u64;
+        for x in 0..(dst_w as usize) {
+            let sx = (((sx_fp >> 16) as usize).min((src_w - 1) as usize)) * 4;
+            sx_fp += x_step;
+            let dx = x * 4;
+            dst_row[dx..dx + 4].copy_from_slice(&src_row[sx..sx + 4]);
+        }
     }
 }
 
@@ -653,5 +750,71 @@ mod tests {
             panic!("mensaje inesperado");
         }
         assert!(enc.encode(&frame, settings, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn downscales_frame_at_75_and_50_percent() {
+        let mut enc = TileEncoder::new();
+        let settings = StreamSettings::default();
+        let frame = synthetic_frame(1920, 1080, 90);
+
+        let msg_75 = enc
+            .encode_scaled(&frame, settings, 75, false)
+            .expect("encode 75%")
+            .expect("debe emitir frame 75%");
+        match msg_75 {
+            HostMsg::VideoFrame {
+                width,
+                height,
+                full_refresh,
+                tiles,
+                ..
+            } => {
+                assert_eq!((width, height), (1440, 810));
+                assert!(full_refresh);
+                assert!(tiles
+                    .iter()
+                    .all(|t| t.x + t.width <= width && t.y + t.height <= height));
+            }
+            _ => panic!("mensaje inesperado"),
+        }
+
+        let msg_50 = enc
+            .encode_scaled(&frame, settings, 50, false)
+            .expect("encode 50%")
+            .expect("debe emitir frame 50%");
+        match msg_50 {
+            HostMsg::VideoFrame {
+                width,
+                height,
+                full_refresh,
+                tiles,
+                ..
+            } => {
+                assert_eq!((width, height), (960, 540));
+                assert!(full_refresh);
+                assert!(tiles
+                    .iter()
+                    .all(|t| t.x + t.width <= width && t.y + t.height <= height));
+            }
+            _ => panic!("mensaje inesperado"),
+        }
+
+        let msg_100 = enc
+            .encode_scaled(&frame, settings, 100, false)
+            .expect("encode 100%")
+            .expect("debe emitir frame 100%");
+        match msg_100 {
+            HostMsg::VideoFrame {
+                width,
+                height,
+                full_refresh,
+                ..
+            } => {
+                assert_eq!((width, height), (1920, 1080));
+                assert!(full_refresh);
+            }
+            _ => panic!("mensaje inesperado"),
+        }
     }
 }

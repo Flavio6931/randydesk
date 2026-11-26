@@ -10,6 +10,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowLongW,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
@@ -334,15 +335,21 @@ unsafe fn force_foreground(hwnd: HWND) {
         let fg_tid = GetWindowThreadProcessId(fg, None);
         let cur_tid = GetCurrentThreadId();
         if fg_tid != 0 && fg_tid != cur_tid {
-            let _ = AttachThreadInput(cur_tid, fg_tid, true);
+            let attached = AttachThreadInput(cur_tid, fg_tid, true).as_bool();
             let _ = BringWindowToTop(hwnd);
             let _ = SetForegroundWindow(hwnd);
-            let _ = AttachThreadInput(cur_tid, fg_tid, false);
+            let _ = SetActiveWindow(hwnd);
+            let _ = SetFocus(hwnd);
+            if attached {
+                let _ = AttachThreadInput(cur_tid, fg_tid, false);
+            }
             return;
         }
     }
     let _ = BringWindowToTop(hwnd);
     let _ = SetForegroundWindow(hwnd);
+    let _ = SetActiveWindow(hwnd);
+    let _ = SetFocus(hwnd);
 }
 
 fn restore_window(

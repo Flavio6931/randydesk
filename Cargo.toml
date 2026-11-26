@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 license = "MIT"
 
@@ -50,6 +50,7 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Power",
+    "Win32_System_Shutdown",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

@@ -102,6 +102,10 @@ pub enum ClientMsg {
     Ping(u64),
     /// Cierre ordenado de sesión.
     Disconnect,
+    /// Porcentaje de escala de transmisión en el host (`50..=100`).
+    SetStreamScale(u8),
+    /// Bloquea la sesión de Windows en el equipo remoto (`LockWorkStation`).
+    LockWorkStation,
 }
 
 /// Mensajes enviados por el host remoto hacia el cliente visor.
@@ -165,5 +169,11 @@ mod tests {
         let encoded_h = bincode::serialize(&host_msg).expect("serialización host");
         let decoded_h: HostMsg = bincode::deserialize(&encoded_h).expect("deserialización host");
         assert_eq!(host_msg, decoded_h);
+
+        for extra in [ClientMsg::SetStreamScale(75), ClientMsg::LockWorkStation] {
+            let bytes = bincode::serialize(&extra).expect("serialización comando");
+            let back: ClientMsg = bincode::deserialize(&bytes).expect("deserialización comando");
+            assert_eq!(extra, back);
+        }
     }
 }

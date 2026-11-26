@@ -17,3 +17,8 @@ pub fn keep_session_awake() {
         let _ = SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
     }
 }
+
+/// Bloquea la estación de trabajo de Windows en el equipo anfitrión.
+pub fn lock_workstation() -> bool {
+    unsafe { windows::Win32::System::Shutdown::LockWorkStation().is_ok() }
+}

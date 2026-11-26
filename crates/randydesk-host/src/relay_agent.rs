@@ -11,9 +11,9 @@ use randydesk_proto::{
     E2eKeypair, HostMsg, PROTOCOL_VERSION,
 };
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -219,6 +219,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     .await?;
 
     let shared_settings = Arc::new(Mutex::new(cfg.default_settings));
+    let scale_percent = Arc::new(AtomicU8::new(100));
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let stop_capture = Arc::new(AtomicBool::new(false));
     let frame_slot = Arc::new(LatestFrameSlot::new());
@@ -227,6 +228,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     let capture_thread = spawn_capture_worker(
         capturer,
         Arc::clone(&shared_settings),
+        Arc::clone(&scale_percent),
         Arc::clone(&force_keyframe),
         Arc::clone(&stop_capture),
         Arc::clone(&frame_slot),
@@ -263,8 +265,12 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
                     match maybe_frame {
                         Some(frame_msg) => {
                             let Ok(bytes) = enc.encrypt_msg(&frame_msg) else { break; };
+                            let started = Instant::now();
                             if ws_tx.send(Message::Binary(bytes)).await.is_err() {
                                 break;
+                            }
+                            if started.elapsed() >= Duration::from_millis(180) {
+                                tokio::task::yield_now().await;
                             }
                         }
                         None => break,
@@ -285,6 +291,15 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
                         }
                         *guard = new_settings;
                     }
+                }
+                Ok(ClientMsg::SetStreamScale(pct)) => {
+                    let clamped = pct.clamp(50, 100);
+                    if scale_percent.swap(clamped, Ordering::Relaxed) != clamped {
+                        force_keyframe.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(ClientMsg::LockWorkStation) => {
+                    let _ = crate::power::lock_workstation();
                 }
                 Ok(ClientMsg::RequestKeyframe) => {
                     force_keyframe.store(true, Ordering::Relaxed);
