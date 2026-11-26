@@ -1,19 +1,20 @@
 # Estado Actual — RandyDesk
 
 - **Proyecto:** RandyDesk (escritorio remoto en Rust puro para Windows, inspirado en RustDesk)
-- **Versión actual:** `0.6.1`
+- **Versión actual:** `0.7.0`
 - **Regla del proyecto:** Cada mejora incrementa la versión en `Cargo.toml` (`[workspace.package].version`) y publica un nuevo Release `vX.Y.Z` en GitHub con `RandyDesk.exe`.
 - **Servidor Relay propio (Render Free):** `wss://randydesk-relay.onrender.com` (preconfigurado por defecto en `RandyDesk.exe`)
 - **GitHub vinculado:** cuenta `Flavio6931` (`Flavio Morales <copiaste2024@gmail.com>`)
 - **Repositorio:** https://github.com/Flavio6931/randydesk
-- **Último Release:** `v0.6.1` — https://github.com/Flavio6931/randydesk/releases/tag/v0.6.1
-- **Descarga directa (`RandyDesk.exe`):** https://github.com/Flavio6931/randydesk/releases/download/v0.6.1/RandyDesk.exe
+- **Último Release:** `v0.7.0` — https://github.com/Flavio6931/randydesk/releases/tag/v0.7.0
+- **Descarga directa (`RandyDesk.exe`):** https://github.com/Flavio6931/randydesk/releases/download/v0.7.0/RandyDesk.exe
 - **Diseño Figma (`Obsidian Craft`):** https://www.figma.com/design/8cPEueVwbe7tsD2wJ5Gq6G
 - **Bóveda Obsidian:** `RandyDesk Vault` (`C:\Users\Flavio\Documents\RandyDesk Vault`)
 
 ## Tareas Pendientes
-- [ ] Actualizar de `v0.6.0` a `v0.6.1` en 1 clic desde la app (`Buscar actualización` -> `Actualizar a v0.6.1`) y validar visualmente los 6 ajustes en pantalla completa (`1920x1080`).
-- [ ] Probar en vivo `Modo mapa (Teclado físico · Recomendado)`, códec `H.264` y promoción `Relay -> QUIC directo`.
+- [ ] Actualizar la app abierta en 1 clic a `v0.7.0` (`Buscar actualización` -> `Actualizar a v0.7.0`) y probar en vivo portapapeles automático, selector multi-monitor, cursor dinámico y botones laterales del ratón.
+- [ ] **Fase 2 (`v0.8.0`):** Transferencia de archivos (gestor dual + Drag & Drop) + Audio remoto (WASAPI Loopback).
+- [ ] **Fase 3 (`v0.9.0`):** P2P por Internet (UDP Hole Punching), H.264 GPU (Media Foundation) y Multi-sesión por pestañas + estado *Online/Offline* real.
 
 ## Ideas Futuras Guardadas (Alternativas \$0 para `randydesk-relay`)
 1. **En tu propia casa (PC vieja, mini-PC o Raspberry Pi) — \$0:**
@@ -24,9 +25,10 @@
    - VM Linux permanente con IP pública fija y **10 TB/mes gratis** que nunca se duerme *(pide tarjeta solo para verificar identidad, cobra \$0)*.
 
 ## Últimas Tareas Completadas
-- Pulido visual definitivo **Obsidian Craft (`v0.6.1`)** en `egui`: fuente nativa `Segoe UI`, grid por filas fijas `272×152` sin efecto escalera (`cards.rs`), degradado vertical continuo por malla (`paint_vertical_gradient_banner`), inputs `42px`/`34px` con borde visible y centrado vertical (`styled_text_input`), píldoras opacas (`PILL_*` en `theme.rs`, `host_panel.rs`, `session_bar.rs`), ancho máximo `1180px` en `app.rs` y botón `...` de una sola capa.
+- **Fase 1 (`v0.7.0`):** Portapapeles automático bidireccional anti-eco (`GetClipboardSequenceNumber` + `ClipboardWatcher`), soporte multi-monitor DXGI/GDI en vivo (`SelectMonitor`/`MonitorList`), cursor remoto dinámico (`GetCursorInfo` -> `CursorShape`), botones laterales del ratón (`Extra1`/`Extra2` -> `MOUSEEVENTF_XDOWN`/`XUP`) y logs de diagnóstico de teclado desactivados por defecto (toggle bajo demanda + `RANDYDESK_INPUT_LOG`).
+- Pulido visual definitivo **Obsidian Craft (`v0.6.1`)** en `egui`: fuente nativa `Segoe UI`, grid por filas fijas `272×152` sin efecto escalera (`cards.rs`), degradado vertical continuo por malla (`paint_vertical_gradient_banner`), inputs `42px`/`34px` con borde visible y píldoras opacas.
 - Rediseño visual completo **Obsidian Craft** en Figma (`RandyDesk — UI Redesign`) y portado inicial a `egui` (`v0.6.0`).
-- Fix definitivo de `Modo mapa (Teclado físico)` estilo RustDesk (`REA + Ghidra`) y Auto-Actualizador en 1 clic (`v0.5.3`): inyección física pura por scan code (`KEYEVENTF_SCANCODE`, `wVk = 0`) con filtro `0x021D` (`AltGr`), bloqueo local solo en `KeyDown`, `AllowSetForegroundWindow` y auto-actualizador GitHub Releases (`updater.rs`).
+- Fix definitivo de `Modo mapa (Teclado físico)` estilo RustDesk (`REA + Ghidra`) y Auto-Actualizador en 1 clic (`v0.5.3`).
 - Captura estricta de teclado por foco de ventana de `RandyDesk` y `Modo mapa` por defecto (`v0.5.2`).
 - Fix definitivo de teclado cliente + host `SYSTEM` estilo RustDesk (`v0.5.1`).
 - Servicio Windows `NT AUTHORITY\SYSTEM` + `SendSAS`, códec `H.264` inter-frame y promoción automática Relay → QUIC directo (`v0.5.0`).

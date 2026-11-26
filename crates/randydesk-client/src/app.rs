@@ -22,11 +22,31 @@ use crate::updater::{UpdateState, UpdaterHandle};
 use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
-use randydesk_host::input::append_input_debug_log;
+use randydesk_host::clipboard::ClipboardWatcher;
+use randydesk_host::input::{append_input_debug_log, set_input_debug_logging};
 use randydesk_proto::{
-    normalize_relay_ws_url, CodecKind, InputEvent, StreamSettings, DEFAULT_RELAY_URL,
+    normalize_relay_ws_url, CodecKind, CursorKind, InputEvent, MonitorInfo, StreamSettings,
+    DEFAULT_RELAY_URL,
 };
 use std::time::{Duration, Instant};
+
+fn map_remote_cursor(kind: CursorKind) -> egui::CursorIcon {
+    match kind {
+        CursorKind::Default => egui::CursorIcon::Default,
+        CursorKind::Text => egui::CursorIcon::Text,
+        CursorKind::PointingHand => egui::CursorIcon::PointingHand,
+        CursorKind::Crosshair => egui::CursorIcon::Crosshair,
+        CursorKind::Move => egui::CursorIcon::Move,
+        CursorKind::ResizeHorizontal => egui::CursorIcon::ResizeHorizontal,
+        CursorKind::ResizeVertical => egui::CursorIcon::ResizeVertical,
+        CursorKind::ResizeNeSw => egui::CursorIcon::ResizeNeSw,
+        CursorKind::ResizeNwSe => egui::CursorIcon::ResizeNwSe,
+        CursorKind::NotAllowed => egui::CursorIcon::NotAllowed,
+        CursorKind::Wait => egui::CursorIcon::Wait,
+        CursorKind::Progress => egui::CursorIcon::Progress,
+        CursorKind::Hidden => egui::CursorIcon::None,
+    }
+}
 
 /// Datos para pedir contraseña solo si el host remoto tiene contraseña opcional activada.
 #[derive(Clone)]
@@ -98,6 +118,10 @@ pub struct RandyDeskApp {
     view_only: bool,
     bar_collapsed: bool,
     bar_pinned: bool,
+    auto_clipboard: bool,
+    input_debug_log: bool,
+    clip_watcher: ClipboardWatcher,
+    last_clip_poll: Instant,
     was_foreground: bool,
     focused_on_connect: bool,
     remote_ctrl_down: bool,
@@ -160,6 +184,10 @@ impl RandyDeskApp {
             view_only: false,
             bar_collapsed: false,
             bar_pinned: true,
+            auto_clipboard: true,
+            input_debug_log: false,
+            clip_watcher: ClipboardWatcher::new(),
+            last_clip_poll: Instant::now(),
             was_foreground: false,
             focused_on_connect: false,
             remote_ctrl_down: false,
@@ -283,6 +311,8 @@ impl RandyDeskApp {
         self.focused_on_connect = false;
         self.last_error_handled = None;
         self.ui_notice = None;
+        self.clip_watcher.reset();
+        self.last_clip_poll = Instant::now();
         self.last_attempt = Some(prompt.clone());
         self.net.connect(
             ConnectRequest {
@@ -296,6 +326,7 @@ impl RandyDeskApp {
                     target_fps: prompt.fps,
                 },
                 stream_scale: self.stream_scale,
+                monitor_index: 0,
             },
             ctx.clone(),
         );
@@ -393,7 +424,7 @@ impl eframe::App for RandyDeskApp {
         }
 
         // 2. Lectura del estado compartido de red
-        let (status, stats, updates, incoming_clip) = {
+        let (status, stats, updates, incoming_clip, monitors, active_monitor, remote_cursor) = {
             let mut guard = self.net.shared.lock().expect("lock estado red");
             let clip = guard.incoming_clipboard.take();
             let updates: Vec<FrameUpdate> = guard.pending_updates.drain(..).collect();
@@ -402,12 +433,28 @@ impl eframe::App for RandyDeskApp {
                 guard.stats.clone(),
                 updates,
                 clip,
+                guard.monitors.clone(),
+                guard.active_monitor,
+                guard.remote_cursor,
             )
         };
 
         if let Some(clip_text) = incoming_clip {
             if let Ok(mut cb) = Clipboard::new() {
-                let _ = cb.set_text(clip_text);
+                let _ = cb.set_text(clip_text.clone());
+            }
+            self.clip_watcher.mark_applied(&clip_text);
+        }
+
+        if matches!(status, ConnectionState::Connected { .. })
+            && self.auto_clipboard
+            && !self.view_only
+            && !self.hidden_to_tray
+            && self.last_clip_poll.elapsed() >= Duration::from_millis(350)
+        {
+            self.last_clip_poll = Instant::now();
+            if let Some(text) = self.clip_watcher.poll_changed() {
+                self.net.send_cmd(NetCommand::ClipboardSet(text));
             }
         }
 
@@ -475,7 +522,17 @@ impl eframe::App for RandyDeskApp {
                 width,
                 height,
             } => {
-                self.render_remote_session(ctx, host_name, width, height, &stats, None);
+                self.render_remote_session(
+                    ctx,
+                    host_name,
+                    width,
+                    height,
+                    &stats,
+                    None,
+                    &monitors,
+                    active_monitor,
+                    remote_cursor,
+                );
             }
             ConnectionState::Reconnecting {
                 attempt,
@@ -490,6 +547,9 @@ impl eframe::App for RandyDeskApp {
                     0,
                     &stats,
                     Some((attempt, reason.as_str())),
+                    &monitors,
+                    active_monitor,
+                    remote_cursor,
                 );
             }
         }
@@ -1180,6 +1240,7 @@ impl RandyDeskApp {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_remote_session(
         &mut self,
         ctx: &egui::Context,
@@ -1188,6 +1249,9 @@ impl RandyDeskApp {
         height: u32,
         stats: &crate::net::SessionStats,
         reconnecting: Option<(u32, &str)>,
+        monitors: &[MonitorInfo],
+        active_monitor: u8,
+        remote_cursor: CursorKind,
     ) {
         let mut img_rect = egui::Rect::NOTHING;
         let mut pointer_in_canvas = false;
@@ -1273,6 +1337,8 @@ impl RandyDeskApp {
                 ctx.set_cursor_icon(egui::CursorIcon::NotAllowed);
             } else if !self.show_remote_cursor {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
+            } else {
+                ctx.set_cursor_icon(map_remote_cursor(remote_cursor));
             }
         }
 
@@ -1294,6 +1360,8 @@ impl RandyDeskApp {
             view_only: self.view_only,
             bar_collapsed: self.bar_collapsed,
             bar_pinned: self.bar_pinned,
+            auto_clipboard: self.auto_clipboard,
+            input_debug_log: self.input_debug_log,
         };
         let bar_actions = render_session_overlay(
             ctx,
@@ -1305,6 +1373,8 @@ impl RandyDeskApp {
                 reconnecting,
                 hook_installed: self.kb_hook.is_installed(),
                 hook_hits: self.kb_hook.sent_key_count(),
+                monitors,
+                active_monitor,
             },
             &mut bar_state,
         );
@@ -1326,6 +1396,8 @@ impl RandyDeskApp {
         self.view_only = bar_state.view_only;
         self.bar_collapsed = bar_state.bar_collapsed;
         self.bar_pinned = bar_state.bar_pinned;
+        self.auto_clipboard = bar_state.auto_clipboard;
+        self.input_debug_log = bar_state.input_debug_log;
 
         if bar_actions.settings_changed {
             self.net.send_cmd(NetCommand::UpdateSettings(StreamSettings {
@@ -1337,6 +1409,12 @@ impl RandyDeskApp {
         if bar_actions.stream_scale_changed {
             self.net
                 .send_cmd(NetCommand::SetStreamScale(self.stream_scale));
+        }
+        if let Some(mon_idx) = bar_actions.select_monitor {
+            self.net.send_cmd(NetCommand::SelectMonitor(mon_idx));
+        }
+        if bar_actions.debug_log_changed {
+            set_input_debug_logging(self.input_debug_log);
         }
         if bar_actions.lock_remote_screen {
             self.net.send_cmd(NetCommand::LockWorkStation);
@@ -1396,6 +1474,7 @@ impl RandyDeskApp {
         }
         if bar_actions.send_clipboard {
             if let Ok(text) = Clipboard::new().and_then(|mut c| c.get_text()) {
+                self.clip_watcher.mark_applied(&text);
                 self.net.send_cmd(NetCommand::ClipboardSet(text));
             }
         }

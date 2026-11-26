@@ -82,7 +82,8 @@ impl HostService {
             password,
             host_name,
             default_settings: settings,
-            capturer_factory: Arc::new(move || capture::create_capturer(monitor)),
+            default_monitor: monitor,
+            capturer_factory: Arc::new(capture::create_capturer),
             active_clients: Arc::clone(&active_clients),
             direct_endpoints,
         };

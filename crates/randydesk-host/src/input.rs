@@ -34,7 +34,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MAPVK_VK_TO_VSC_EX,
     MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, VIRTUAL_KEY,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -49,8 +50,29 @@ const VK_PACKET_U16: u16 = 0x00E7;
 const DESKTOP_SWITCH_ACCESS: u32 = 0x01FF | GENERIC_WRITE.0;
 
 static UIPI_BLOCK_DETECTED: AtomicBool = AtomicBool::new(false);
+static INPUT_DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
 static INPUT_WORKER_TX: OnceLock<SyncSender<(InputEvent, MonitorGeometry)>> = OnceLock::new();
 static DEBUG_LOG_TX: OnceLock<SyncSender<String>> = OnceLock::new();
+
+fn env_debug_log_enabled() -> bool {
+    static FROM_ENV: OnceLock<bool> = OnceLock::new();
+    *FROM_ENV.get_or_init(|| {
+        matches!(
+            std::env::var("RANDYDESK_INPUT_LOG").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// Activa o desactiva el registro de diagnóstico de entrada en disco bajo demanda.
+pub fn set_input_debug_logging(enabled: bool) {
+    INPUT_DEBUG_LOGGING.store(enabled, Ordering::Relaxed);
+}
+
+/// Indica si el registro de diagnóstico de teclado en disco está habilitado actualmente.
+pub fn is_input_debug_logging_enabled() -> bool {
+    INPUT_DEBUG_LOGGING.load(Ordering::Relaxed) || env_debug_log_enabled()
+}
 
 fn resolve_input_debug_log_path() -> Option<PathBuf> {
     if crate::win_service::is_running_as_system() {
@@ -60,8 +82,11 @@ fn resolve_input_debug_log_path() -> Option<PathBuf> {
         .map(|proj| proj.config_dir().join("input_debug.log"))
 }
 
-/// Registra eventos de teclado en segundo plano sin bloquear el hilo invocador (`ProgramData\host_input_debug.log` en `SYSTEM` o `%APPDATA%\input_debug.log`).
+/// Registra eventos de teclado en segundo plano solo si el diagnóstico bajo demanda está habilitado.
 pub fn append_input_debug_log(line: &str) {
+    if !is_input_debug_logging_enabled() {
+        return;
+    }
     let tx = DEBUG_LOG_TX.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel::<String>(256);
         let _ = std::thread::Builder::new()
@@ -126,22 +151,7 @@ fn inject_input_on_current_thread(event: &InputEvent, monitor: MonitorGeometry) 
             });
         }
         InputEvent::MouseButton { button, down } => {
-            let flag = match (button, down) {
-                (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
-                (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
-                (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
-                (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
-                (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
-                (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
-            };
-            send_mouse(MOUSEINPUT {
-                dx: 0,
-                dy: 0,
-                mouseData: 0,
-                dwFlags: flag,
-                time: 0,
-                dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
-            });
+            send_mouse(build_mouse_button_input(button, down));
         }
         InputEvent::MouseWheel { delta_x, delta_y } => {
             if delta_y != 0 {
@@ -543,9 +553,50 @@ fn dispatch_input(input: INPUT) -> (u32, u32) {
     (sent, err)
 }
 
+/// Construye la estructura `MOUSEINPUT` para cualquiera de los 5 botones del ratón (`Left..Extra2`).
+pub(crate) fn build_mouse_button_input(button: MouseButton, down: bool) -> MOUSEINPUT {
+    let (flag, mouse_data) = match (button, down) {
+        (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0u32),
+        (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0u32),
+        (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0u32),
+        (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0u32),
+        (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0u32),
+        (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0u32),
+        (MouseButton::Extra1, true) => (MOUSEEVENTF_XDOWN, 0x0001u32),
+        (MouseButton::Extra1, false) => (MOUSEEVENTF_XUP, 0x0001u32),
+        (MouseButton::Extra2, true) => (MOUSEEVENTF_XDOWN, 0x0002u32),
+        (MouseButton::Extra2, false) => (MOUSEEVENTF_XUP, 0x0002u32),
+    };
+    MOUSEINPUT {
+        dx: 0,
+        dy: 0,
+        mouseData: mouse_data,
+        dwFlags: flag,
+        time: 0,
+        dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_extra_buttons_use_xdown_xup_and_xbutton_data() {
+        let x1_down = build_mouse_button_input(MouseButton::Extra1, true);
+        assert_eq!(x1_down.dwFlags, MOUSEEVENTF_XDOWN);
+        assert_eq!(x1_down.mouseData, 0x0001);
+
+        let x2_up = build_mouse_button_input(MouseButton::Extra2, false);
+        assert_eq!(x2_up.dwFlags, MOUSEEVENTF_XUP);
+        assert_eq!(x2_up.mouseData, 0x0002);
+
+        set_input_debug_logging(false);
+        assert!(!INPUT_DEBUG_LOGGING.load(Ordering::Relaxed));
+        set_input_debug_logging(true);
+        assert!(is_input_debug_logging_enabled());
+        set_input_debug_logging(false);
+    }
 
     #[test]
     fn win_keys_use_enigo_vk_and_extended_flag() {

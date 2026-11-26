@@ -147,8 +147,8 @@ fn merge_video_frames(prev: HostMsg, next: &mut HostMsg) {
     *next_tiles = out;
 }
 
-/// Fábrica de capturadores de pantalla inyectable para producción o pruebas.
-pub type CapturerFactory = Arc<dyn Fn() -> Result<Box<dyn ScreenCapturer>> + Send + Sync>;
+/// Fábrica de capturadores de pantalla inyectable por índice de monitor.
+pub type CapturerFactory = Arc<dyn Fn(usize) -> Result<Box<dyn ScreenCapturer>> + Send + Sync>;
 
 /// Configuración compartida para ejecutar el servidor de sesiones del host.
 #[derive(Clone)]
@@ -156,6 +156,7 @@ pub struct HostServerConfig {
     pub password: String,
     pub host_name: String,
     pub default_settings: StreamSettings,
+    pub default_monitor: usize,
     pub capturer_factory: CapturerFactory,
     pub active_clients: Arc<AtomicUsize>,
     pub direct_endpoints: Vec<String>,
@@ -209,9 +210,12 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
         .context("cliente cerró antes de abrir stream de control")?;
 
     // 1. Saludo inicial del cliente
-    match read_msg::<_, ClientMsg>(&mut ctrl_recv).await? {
+    let client_version = match read_msg::<_, ClientMsg>(&mut ctrl_recv).await? {
         ClientMsg::Hello { version }
-            if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) => {}
+            if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) =>
+        {
+            version
+        }
         ClientMsg::Hello { version } => {
             let _ = write_msg(
                 &mut ctrl_send,
@@ -228,10 +232,10 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
         other => {
             return Err(anyhow!("se esperaba ClientMsg::Hello, llegó {other:?}"));
         }
-    }
+    };
 
     // 2. Inicializar capturador para conocer dimensiones del monitor
-    let capturer = (cfg.capturer_factory)()?;
+    let capturer = (cfg.capturer_factory)(cfg.default_monitor)?;
     let monitor = capturer.dimensions();
     let nonce = generate_nonce();
 
@@ -281,6 +285,18 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
     )
     .await?;
 
+    if client_version >= 3 {
+        let monitors = crate::capture::list_monitors();
+        write_msg(
+            &mut ctrl_send,
+            &HostMsg::MonitorList {
+                monitors,
+                active_index: cfg.default_monitor as u8,
+            },
+        )
+        .await?;
+    }
+
     // 4. Abrir stream dedicado unidireccional para video (sin Head-of-Line con control)
     let mut video_send = conn
         .open_uni()
@@ -292,9 +308,18 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let frame_slot = Arc::new(LatestFrameSlot::new());
+    let active_monitor = Arc::new(Mutex::new(monitor));
+    let requested_monitor = Arc::new(AtomicU8::new(cfg.default_monitor as u8));
+    let (aux_tx, mut aux_rx) = tokio::sync::mpsc::channel::<HostMsg>(32);
 
     let capture_thread = spawn_capture_worker(
         capturer,
+        Arc::clone(&cfg.capturer_factory),
+        cfg.default_monitor,
+        Arc::clone(&active_monitor),
+        Arc::clone(&requested_monitor),
+        aux_tx,
+        client_version >= 3,
         Arc::clone(&shared_settings),
         Arc::clone(&scale_percent),
         Arc::clone(&force_keyframe),
@@ -309,6 +334,9 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
         &mut video_send,
         &frame_slot,
         monitor,
+        &active_monitor,
+        &requested_monitor,
+        &mut aux_rx,
         &shared_settings,
         &scale_percent,
         &force_keyframe,
@@ -328,18 +356,29 @@ async fn run_session_loops(
     ctrl_recv: &mut quinn::RecvStream,
     video_send: &mut quinn::SendStream,
     frame_slot: &LatestFrameSlot,
-    monitor: MonitorGeometry,
+    fallback_monitor: MonitorGeometry,
+    active_monitor: &Arc<Mutex<MonitorGeometry>>,
+    requested_monitor: &Arc<AtomicU8>,
+    aux_rx: &mut tokio::sync::mpsc::Receiver<HostMsg>,
     shared_settings: &Arc<Mutex<StreamSettings>>,
     scale_percent: &Arc<AtomicU8>,
     force_keyframe: &Arc<AtomicBool>,
 ) -> Result<()> {
+    let mut clip_watcher = clipboard::ClipboardWatcher::new();
+    let mut clip_ticker = tokio::time::interval(Duration::from_millis(350));
+    clip_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             biased;
             msg_res = read_msg::<_, ClientMsg>(ctrl_recv) => {
                 match msg_res {
                     Ok(ClientMsg::Input(ev)) => {
-                        input::inject_input(&ev, monitor);
+                        let geom = active_monitor
+                            .lock()
+                            .map(|g| *g)
+                            .unwrap_or(fallback_monitor);
+                        input::inject_input(&ev, geom);
                     }
                     Ok(ClientMsg::UpdateSettings(new_settings)) => {
                         if let Ok(mut guard) = shared_settings.lock() {
@@ -355,6 +394,9 @@ async fn run_session_loops(
                             force_keyframe.store(true, Ordering::Relaxed);
                         }
                     }
+                    Ok(ClientMsg::SelectMonitor(idx)) => {
+                        requested_monitor.store(idx, Ordering::Relaxed);
+                    }
                     Ok(ClientMsg::LockWorkStation) => {
                         let _ = crate::power::lock_workstation();
                     }
@@ -366,9 +408,11 @@ async fn run_session_loops(
                     }
                     Ok(ClientMsg::ClipboardSet(text)) => {
                         clipboard::set_text(&text);
+                        clip_watcher.mark_applied(&text);
                     }
                     Ok(ClientMsg::ClipboardGet) => {
                         let text = clipboard::get_text();
+                        clip_watcher.mark_applied(&text);
                         write_msg(ctrl_send, &HostMsg::ClipboardData(text)).await?;
                     }
                     Ok(ClientMsg::Ping(ts)) => {
@@ -384,6 +428,14 @@ async fn run_session_loops(
                     Err(err) => {
                         return Err(anyhow!("stream de control cerrado: {err}"));
                     }
+                }
+            }
+            Some(aux_msg) = aux_rx.recv() => {
+                write_msg(ctrl_send, &aux_msg).await?;
+            }
+            _ = clip_ticker.tick() => {
+                if let Some(text) = clip_watcher.poll_changed() {
+                    write_msg(ctrl_send, &HostMsg::ClipboardData(text)).await?;
                 }
             }
             maybe_frame = frame_slot.recv() => {
@@ -408,8 +460,15 @@ impl Drop for SlotCloseGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_capture_worker(
     mut capturer: Box<dyn ScreenCapturer>,
+    capturer_factory: CapturerFactory,
+    initial_monitor: usize,
+    active_monitor: Arc<Mutex<MonitorGeometry>>,
+    requested_monitor: Arc<AtomicU8>,
+    aux_tx: tokio::sync::mpsc::Sender<HostMsg>,
+    emit_cursor: bool,
     shared_settings: Arc<Mutex<StreamSettings>>,
     scale_percent: Arc<AtomicU8>,
     force_keyframe: Arc<AtomicBool>,
@@ -417,15 +476,55 @@ pub(crate) fn spawn_capture_worker(
     frame_slot: Arc<LatestFrameSlot>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        use randydesk_proto::CursorKind;
         let _slot_guard = SlotCloseGuard(Arc::clone(&frame_slot));
         let mut encoder = TileEncoder::new();
         let mut h264_encoder: Option<H264FrameEncoder> = None;
         let mut prev_codec = StreamSettings::default().codec;
+        let mut current_monitor_idx = initial_monitor;
+        let mut last_cursor = CursorKind::Default;
+        let mut last_cursor_poll = Instant::now() - Duration::from_secs(1);
         let mut last_awake = Instant::now() - Duration::from_secs(60);
         while !stop_flag.load(Ordering::Relaxed) {
             if last_awake.elapsed() >= Duration::from_secs(30) {
                 crate::power::keep_session_awake();
                 last_awake = Instant::now();
+            }
+
+            let target_mon = requested_monitor.load(Ordering::Relaxed) as usize;
+            if target_mon != current_monitor_idx {
+                match (capturer_factory)(target_mon) {
+                    Ok(new_cap) => {
+                        let new_geom = new_cap.dimensions();
+                        capturer = new_cap;
+                        current_monitor_idx = target_mon;
+                        if let Ok(mut g) = active_monitor.lock() {
+                            *g = new_geom;
+                        }
+                        encoder.invalidate();
+                        if let Some(h264) = h264_encoder.as_mut() {
+                            h264.invalidate();
+                        }
+                        force_keyframe.store(true, Ordering::Relaxed);
+                        let _ = aux_tx.try_send(HostMsg::MonitorList {
+                            monitors: crate::capture::list_monitors(),
+                            active_index: current_monitor_idx as u8,
+                        });
+                    }
+                    Err(err) => {
+                        warn!("No se pudo cambiar al monitor {target_mon}: {err:#}");
+                        requested_monitor.store(current_monitor_idx as u8, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            if emit_cursor && last_cursor_poll.elapsed() >= Duration::from_millis(50) {
+                last_cursor_poll = Instant::now();
+                let cur = crate::capture::query_system_cursor();
+                if cur != last_cursor {
+                    last_cursor = cur;
+                    let _ = aux_tx.try_send(HostMsg::CursorShape(cur));
+                }
             }
             let settings = shared_settings
                 .lock()

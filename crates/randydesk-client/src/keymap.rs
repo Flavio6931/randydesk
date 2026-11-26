@@ -19,7 +19,8 @@ pub fn map_mouse_button(btn: egui::PointerButton) -> Option<MouseButton> {
         egui::PointerButton::Primary => Some(MouseButton::Left),
         egui::PointerButton::Secondary => Some(MouseButton::Right),
         egui::PointerButton::Middle => Some(MouseButton::Middle),
-        _ => None,
+        egui::PointerButton::Extra1 => Some(MouseButton::Extra1),
+        egui::PointerButton::Extra2 => Some(MouseButton::Extra2),
     }
 }
 
@@ -126,4 +127,33 @@ pub fn map_egui_key_to_vk(key: egui::Key) -> Option<(u16, bool)> {
         _ => return None,
     };
     Some(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_all_pointer_buttons_including_extra_side_buttons() {
+        assert_eq!(
+            map_mouse_button(egui::PointerButton::Primary),
+            Some(MouseButton::Left)
+        );
+        assert_eq!(
+            map_mouse_button(egui::PointerButton::Secondary),
+            Some(MouseButton::Right)
+        );
+        assert_eq!(
+            map_mouse_button(egui::PointerButton::Middle),
+            Some(MouseButton::Middle)
+        );
+        assert_eq!(
+            map_mouse_button(egui::PointerButton::Extra1),
+            Some(MouseButton::Extra1)
+        );
+        assert_eq!(
+            map_mouse_button(egui::PointerButton::Extra2),
+            Some(MouseButton::Extra2)
+        );
+    }
 }

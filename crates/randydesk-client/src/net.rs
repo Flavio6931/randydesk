@@ -5,8 +5,8 @@ use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use quinn::{ClientConfig, Endpoint, TransportConfig, VarInt};
 use randydesk_proto::{
-    compute_proof, parse_numeric_id, read_msg, write_msg, ClientMsg, HostMsg, InputEvent,
-    StreamSettings, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    compute_proof, parse_numeric_id, read_msg, write_msg, ClientMsg, CursorKind, HostMsg,
+    InputEvent, MonitorInfo, StreamSettings, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -30,6 +30,7 @@ pub struct ConnectRequest {
     pub relay_url: Option<String>,
     pub settings: StreamSettings,
     pub stream_scale: u8,
+    pub monitor_index: u8,
 }
 
 /// Comandos que la UI envía a la sesión activa en curso.
@@ -38,6 +39,7 @@ pub enum NetCommand {
     Input(InputEvent),
     UpdateSettings(StreamSettings),
     SetStreamScale(u8),
+    SelectMonitor(u8),
     LockWorkStation,
     SendSas,
     RequestKeyframe,
@@ -73,6 +75,9 @@ pub struct SharedSessionState {
     pub stats: SessionStats,
     pub pending_updates: VecDeque<FrameUpdate>,
     pub incoming_clipboard: Option<String>,
+    pub monitors: Vec<MonitorInfo>,
+    pub active_monitor: u8,
+    pub remote_cursor: CursorKind,
 }
 
 impl Default for SharedSessionState {
@@ -82,6 +87,9 @@ impl Default for SharedSessionState {
             stats: SessionStats::default(),
             pending_updates: VecDeque::new(),
             incoming_clipboard: None,
+            monitors: Vec::new(),
+            active_monitor: 0,
+            remote_cursor: CursorKind::Default,
         }
     }
 }
@@ -326,6 +334,7 @@ async fn session_supervisor(
                             }
                             Some(NetCommand::UpdateSettings(s)) => req.settings = s,
                             Some(NetCommand::SetStreamScale(s)) => req.stream_scale = s.clamp(50, 100),
+                            Some(NetCommand::SelectMonitor(m)) => req.monitor_index = m,
                             _ => {}
                         }
                     }
@@ -505,11 +514,14 @@ async fn run_single_session(
         other => return Err(anyhow!("respuesta inesperada a AuthResponse: {other:?}")),
     }
 
-    // Enviar preferencias iniciales de códec/calidad/FPS y escala si difiere de 100%
+    // Enviar preferencias iniciales de códec/calidad/FPS y escala/monitor si difieren de default
     write_msg(&mut ctrl_send, &ClientMsg::UpdateSettings(req.settings)).await?;
     let initial_scale = req.stream_scale.clamp(50, 100);
     if initial_scale != 100 {
         write_msg(&mut ctrl_send, &ClientMsg::SetStreamScale(initial_scale)).await?;
+    }
+    if req.monitor_index != 0 {
+        write_msg(&mut ctrl_send, &ClientMsg::SelectMonitor(req.monitor_index)).await?;
     }
 
     let mut video_recv = conn
@@ -552,6 +564,10 @@ async fn run_single_session(
                         req.stream_scale = clamped;
                         write_msg(&mut ctrl_send, &ClientMsg::SetStreamScale(clamped)).await?;
                     }
+                    Some(NetCommand::SelectMonitor(idx)) => {
+                        req.monitor_index = idx;
+                        write_msg(&mut ctrl_send, &ClientMsg::SelectMonitor(idx)).await?;
+                    }
                     Some(NetCommand::LockWorkStation) => {
                         write_msg(&mut ctrl_send, &ClientMsg::LockWorkStation).await?;
                     }
@@ -591,20 +607,53 @@ async fn run_single_session(
                         }
                         ctx.request_repaint();
                     }
+                    HostMsg::MonitorList { monitors, active_index } => {
+                        if let Ok(mut guard) = shared.lock() {
+                            guard.monitors = monitors;
+                            guard.active_monitor = active_index;
+                        }
+                        ctx.request_repaint();
+                    }
+                    HostMsg::CursorShape(kind) => {
+                        if let Ok(mut guard) = shared.lock() {
+                            guard.remote_cursor = kind;
+                        }
+                        ctx.request_repaint();
+                    }
                     _ => {}
                 }
             }
             video_msg = read_msg::<_, HostMsg>(&mut video_recv) => {
                 let msg = video_msg?;
-                if let HostMsg::VideoFrame { tiles, .. } = &msg {
+                let (frame_w, frame_h) = if let HostMsg::VideoFrame {
+                    width,
+                    height,
+                    tiles,
+                    ..
+                } = &msg
+                {
                     bytes_in_window += tiles.iter().map(|t| t.data.len()).sum::<usize>();
-                }
+                    (*width, *height)
+                } else {
+                    (0, 0)
+                };
                 let update = frame_decoder.decode(&msg)?;
                 frames_in_window += 1;
 
                 let elapsed_win = stat_window_start.elapsed().as_secs_f32();
                 if let Ok(mut guard) = shared.lock() {
                     push_frame_update(&mut guard.pending_updates, update);
+                    if frame_w > 0 && frame_h > 0 {
+                        if let ConnectionState::Connected {
+                            width: ref mut w,
+                            height: ref mut h,
+                            ..
+                        } = guard.status
+                        {
+                            *w = frame_w;
+                            *h = frame_h;
+                        }
+                    }
                     guard.stats.elapsed_secs = session_start.elapsed().as_secs();
                     if elapsed_win >= 1.0 {
                         guard.stats.fps = frames_in_window as f32 / elapsed_win;

@@ -117,6 +117,14 @@ pub async fn run_relay_session(
     if initial_scale != 100 {
         send_e2e(&mut ws, &mut cipher, &ClientMsg::SetStreamScale(initial_scale)).await?;
     }
+    if req.monitor_index != 0 {
+        send_e2e(
+            &mut ws,
+            &mut cipher,
+            &ClientMsg::SelectMonitor(req.monitor_index),
+        )
+        .await?;
+    }
 
     if let Ok(mut guard) = shared.lock() {
         guard.status = ConnectionState::Connected {
@@ -189,6 +197,10 @@ pub async fn run_relay_session(
                         req.stream_scale = clamped;
                         let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::SetStreamScale(clamped))).await;
                     }
+                    Some(NetCommand::SelectMonitor(idx)) => {
+                        req.monitor_index = idx;
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::SelectMonitor(idx))).await;
+                    }
                     Some(NetCommand::LockWorkStation) => {
                         let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::LockWorkStation)).await;
                     }
@@ -231,6 +243,19 @@ pub async fn run_relay_session(
                                 }
                                 ctx.request_repaint();
                             }
+                            HostMsg::MonitorList { monitors, active_index } => {
+                                if let Ok(mut guard) = shared.lock() {
+                                    guard.monitors = monitors;
+                                    guard.active_monitor = active_index;
+                                }
+                                ctx.request_repaint();
+                            }
+                            HostMsg::CursorShape(kind) => {
+                                if let Ok(mut guard) = shared.lock() {
+                                    guard.remote_cursor = kind;
+                                }
+                                ctx.request_repaint();
+                            }
                             HostMsg::DirectEndpoints(candidates)
                                 if !direct_probe_started && !candidates.is_empty() =>
                             {
@@ -244,15 +269,35 @@ pub async fn run_relay_session(
                                 });
                             }
                             video @ HostMsg::VideoFrame { .. } => {
-                                if let HostMsg::VideoFrame { tiles, .. } = &video {
+                                let (frame_w, frame_h) = if let HostMsg::VideoFrame {
+                                    width,
+                                    height,
+                                    tiles,
+                                    ..
+                                } = &video
+                                {
                                     bytes_in_window += tiles.iter().map(|t| t.data.len()).sum::<usize>();
-                                }
+                                    (*width, *height)
+                                } else {
+                                    (0, 0)
+                                };
                                 let update = frame_decoder.decode(&video)?;
                                 frames_in_window += 1;
 
                                 let elapsed_win = stat_window_start.elapsed().as_secs_f32();
                                 if let Ok(mut guard) = shared.lock() {
                                     push_frame_update(&mut guard.pending_updates, update);
+                                    if frame_w > 0 && frame_h > 0 {
+                                        if let ConnectionState::Connected {
+                                            width: ref mut w,
+                                            height: ref mut h,
+                                            ..
+                                        } = guard.status
+                                        {
+                                            *w = frame_w;
+                                            *h = frame_h;
+                                        }
+                                    }
                                     guard.stats.elapsed_secs = session_start.elapsed().as_secs();
                                     if elapsed_win >= 1.0 {
                                         guard.stats.fps = frames_in_window as f32 / elapsed_win;

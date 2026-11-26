@@ -1,5 +1,19 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.7.0 (Fase 1): Portapapeles automático, Multi-monitor, Cursor dinámico, Botones extra y Logs bajo demanda
+- **Resumen técnico:**
+  - `Cargo.toml` (+ `Cargo.lock`): versión `0.7.0` y feature `Win32_System_DataExchange`.
+  - [lib.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-proto/src/lib.rs) y [message.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-proto/src/message.rs): `PROTOCOL_VERSION = 3` (compatible `>= 1`), variantes al final para mantener compatibilidad `bincode` (`MouseButton::Extra1/Extra2`, `ClientMsg::SelectMonitor`, `HostMsg::MonitorList`, `HostMsg::CursorShape`), tipos `MonitorInfo` y `CursorKind`.
+  - [clipboard.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/clipboard.rs): `sequence_number()` vía `GetClipboardSequenceNumber()`, `hash_text()` FNV-1a y `ClipboardWatcher` anti-eco con límite `256 KiB`.
+  - [capture.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/capture.rs): `list_monitors()` DXGI/GDI con índices 1:1 y `query_system_cursor()` vía `GetCursorInfo` + `LoadCursorW` cacheados.
+  - [input.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/input.rs): `build_mouse_button_input` con `MOUSEEVENTF_XDOWN/XUP` (`0x0001`/`0x0002`) y `INPUT_DEBUG_LOGGING` apagado por defecto (`set_input_debug_logging`, `RANDYDESK_INPUT_LOG`).
+  - [session.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/session.rs), [relay_agent.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/relay_agent.rs), [service.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/service.rs), [main.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/main.rs): `CapturerFactory` parametrizada por monitor, cambio de monitor en caliente sin cortar sesión, streaming de cambios de cursor y sincronización automática de portapapeles en ambos transportes.
+  - [keymap.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/keymap.rs), [net.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/net.rs), [relay_client.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/relay_client.rs), [session_bar.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/session_bar.rs), [app.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/app.rs): mapeo `Extra1/Extra2`, selector `Monitor` en `Pantalla`, checkbox de portapapeles automático en `Acciones`, toggle de log en `Teclado y ratón` y replicación `CursorIcon`.
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 51 pruebas aprobadas (23 `randydesk-client`, 18 unit + 1 `quic_loopback` `randydesk-host`, 8 `randydesk-proto`, 1 `relay_e2e` `randydesk-relay`).
+  - `cargo build --workspace --release` + Release `v0.7.0` en GitHub (`RandyDesk.exe` y `randydesk-relay.exe`).
+
 ## 2026-11-26 — RandyDesk v0.6.1: Fix visual Obsidian Craft (`Segoe UI`, grid por filas, degradado suave y píldoras opacas)
 - **Causa raíz visual observada en vivo (`v0.6.0`):**
   1. `ui.horizontal_wrapped` + `allocate_ui` generaba desplazamiento en escalera entre tarjetas vecinas.

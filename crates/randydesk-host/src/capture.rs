@@ -1,7 +1,9 @@
 //! Captura de pantalla de baja latencia mediante DXGI Desktop Duplication con fallback a GDI.
 
 use anyhow::{anyhow, Context, Result};
+use randydesk_proto::{CursorKind, MonitorInfo};
 use std::mem::size_of;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use windows::core::Interface;
@@ -23,7 +25,9 @@ use windows::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, HBITMAP, HDC, HMONITOR, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    GetCursorInfo, GetSystemMetrics, LoadCursorW, CURSORINFO, CURSOR_SHOWING, IDC_APPSTARTING,
+    IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
+    IDC_SIZEWE, IDC_WAIT, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 /// Geometría en coordenadas del escritorio virtual del monitor capturado.
@@ -502,4 +506,160 @@ fn enumerate_monitor_rects() -> Vec<RECT> {
         let _ = EnumDisplayMonitors(None, None, Some(monitor_enum_proc), LPARAM(ptr));
     }
     rects
+}
+
+fn list_dxgi_monitors() -> Result<Vec<MonitorInfo>> {
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            None,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )?;
+    }
+    let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice nulo"))?;
+    let dxgi_device: IDXGIDevice = device.cast()?;
+    let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter()? };
+
+    let mut monitors = Vec::new();
+    for idx in 0u32..16u32 {
+        let Ok(output) = (unsafe { adapter.EnumOutputs(idx) }) else {
+            break;
+        };
+        let Ok(desc) = (unsafe { output.GetDesc() }) else {
+            continue;
+        };
+        let rect = desc.DesktopCoordinates;
+        let width = (rect.right - rect.left).max(1) as u32;
+        let height = (rect.bottom - rect.top).max(1) as u32;
+        monitors.push(MonitorInfo {
+            index: idx as u8,
+            name: format!("Monitor {}", idx + 1),
+            width,
+            height,
+            primary: rect.left == 0 && rect.top == 0,
+        });
+    }
+    Ok(monitors)
+}
+
+/// Enumera los monitores activos en el sistema coincidiendo 1:1 con el índice DXGI/GDI.
+pub fn list_monitors() -> Vec<MonitorInfo> {
+    if let Ok(dxgi_list) = list_dxgi_monitors() {
+        if !dxgi_list.is_empty() {
+            return dxgi_list;
+        }
+    }
+    let rects = enumerate_monitor_rects();
+    if !rects.is_empty() {
+        return rects
+            .into_iter()
+            .enumerate()
+            .map(|(idx, r)| MonitorInfo {
+                index: idx as u8,
+                name: format!("Monitor {}", idx + 1),
+                width: (r.right - r.left).max(1) as u32,
+                height: (r.bottom - r.top).max(1) as u32,
+                primary: r.left == 0 && r.top == 0,
+            })
+            .collect();
+    }
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1) as u32;
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1) as u32;
+    vec![MonitorInfo {
+        index: 0,
+        name: "Monitor 1".to_string(),
+        width,
+        height,
+        primary: true,
+    }]
+}
+
+struct SystemCursors {
+    ibeam: usize,
+    hand: usize,
+    cross: usize,
+    size_all: usize,
+    size_we: usize,
+    size_ns: usize,
+    size_nesw: usize,
+    size_nwse: usize,
+    no: usize,
+    wait: usize,
+    app_starting: usize,
+}
+
+fn system_cursors() -> &'static SystemCursors {
+    static CURSORS: OnceLock<SystemCursors> = OnceLock::new();
+    CURSORS.get_or_init(|| unsafe {
+        let load = |id| -> usize {
+            LoadCursorW(None, id)
+                .map(|h| h.0 as usize)
+                .unwrap_or(0)
+        };
+        SystemCursors {
+            ibeam: load(IDC_IBEAM),
+            hand: load(IDC_HAND),
+            cross: load(IDC_CROSS),
+            size_all: load(IDC_SIZEALL),
+            size_we: load(IDC_SIZEWE),
+            size_ns: load(IDC_SIZENS),
+            size_nesw: load(IDC_SIZENESW),
+            size_nwse: load(IDC_SIZENWSE),
+            no: load(IDC_NO),
+            wait: load(IDC_WAIT),
+            app_starting: load(IDC_APPSTARTING),
+        }
+    })
+}
+
+/// Consulta la forma estándar del cursor activo de Windows para replicarla en el visor remoto.
+pub fn query_system_cursor() -> CursorKind {
+    let mut info = CURSORINFO {
+        cbSize: size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetCursorInfo(&mut info) }.is_err() {
+        return CursorKind::Default;
+    }
+    if (info.flags.0 & CURSOR_SHOWING.0) == 0 {
+        return CursorKind::Hidden;
+    }
+    let h = info.hCursor.0 as usize;
+    if h == 0 {
+        return CursorKind::Default;
+    }
+    let sys = system_cursors();
+    if h == sys.ibeam {
+        CursorKind::Text
+    } else if h == sys.hand {
+        CursorKind::PointingHand
+    } else if h == sys.cross {
+        CursorKind::Crosshair
+    } else if h == sys.size_all {
+        CursorKind::Move
+    } else if h == sys.size_we {
+        CursorKind::ResizeHorizontal
+    } else if h == sys.size_ns {
+        CursorKind::ResizeVertical
+    } else if h == sys.size_nesw {
+        CursorKind::ResizeNeSw
+    } else if h == sys.size_nwse {
+        CursorKind::ResizeNwSe
+    } else if h == sys.no {
+        CursorKind::NotAllowed
+    } else if h == sys.wait {
+        CursorKind::Wait
+    } else if h == sys.app_starting {
+        CursorKind::Progress
+    } else {
+        CursorKind::Default
+    }
 }

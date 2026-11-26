@@ -78,7 +78,8 @@ async fn relay_healthcheck_and_e2e_session_work_end_to_end() -> Result<()> {
             jpeg_quality: 80,
             target_fps: 30,
         },
-        capturer_factory: Arc::new(|| Ok(Box::new(MockCapturer { emitted: false }))),
+        default_monitor: 0,
+        capturer_factory: Arc::new(|_| Ok(Box::new(MockCapturer { emitted: false }))),
         active_clients: Arc::new(AtomicUsize::new(0)),
         direct_endpoints: Vec::new(),
     };
@@ -227,7 +228,8 @@ async fn relay_healthcheck_and_e2e_session_work_end_to_end() -> Result<()> {
         password: String::new(),
         host_name: "PC-ABIERTA".to_string(),
         default_settings: StreamSettings::default(),
-        capturer_factory: Arc::new(|| Ok(Box::new(MockCapturer { emitted: false }))),
+        default_monitor: 0,
+        capturer_factory: Arc::new(|_| Ok(Box::new(MockCapturer { emitted: false }))),
         active_clients: Arc::new(AtomicUsize::new(0)),
         direct_endpoints: Vec::new(),
     };

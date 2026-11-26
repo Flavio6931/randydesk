@@ -172,7 +172,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     };
 
     // 3. Capturador y autenticación (acceso directo si password está vacío)
-    let capturer = (cfg.capturer_factory)()?;
+    let capturer = (cfg.capturer_factory)(cfg.default_monitor)?;
     let monitor = capturer.dimensions();
     let nonce = generate_nonce();
     send_e2e(
@@ -218,6 +218,19 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     )
     .await?;
 
+    if client_version >= 3 {
+        let monitors = crate::capture::list_monitors();
+        let _ = send_e2e(
+            &mut ws,
+            &mut cipher,
+            &HostMsg::MonitorList {
+                monitors,
+                active_index: cfg.default_monitor as u8,
+            },
+        )
+        .await;
+    }
+
     if client_version >= 2 && !cfg.direct_endpoints.is_empty() {
         let _ = send_e2e(
             &mut ws,
@@ -232,10 +245,19 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let stop_capture = Arc::new(AtomicBool::new(false));
     let frame_slot = Arc::new(LatestFrameSlot::new());
+    let active_monitor = Arc::new(Mutex::new(monitor));
+    let requested_monitor = Arc::new(AtomicU8::new(cfg.default_monitor as u8));
+    let (aux_tx, mut aux_rx) = mpsc::channel::<HostMsg>(32);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<OutboundItem>(64);
 
     let capture_thread = spawn_capture_worker(
         capturer,
+        Arc::clone(&cfg.capturer_factory),
+        cfg.default_monitor,
+        Arc::clone(&active_monitor),
+        Arc::clone(&requested_monitor),
+        aux_tx,
+        client_version >= 3,
         Arc::clone(&shared_settings),
         Arc::clone(&scale_percent),
         Arc::clone(&force_keyframe),
@@ -289,54 +311,81 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
         }
     });
 
+    let mut clip_watcher = clipboard::ClipboardWatcher::new();
+    let mut clip_ticker = tokio::time::interval(Duration::from_millis(350));
+    clip_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let session_res: Result<()> = loop {
-        match ws_rx.next().await {
-            Some(Ok(Message::Binary(data))) => match dec.decrypt_msg::<ClientMsg>(&data) {
-                Ok(ClientMsg::Input(ev)) => input::inject_input(&ev, monitor),
-                Ok(ClientMsg::UpdateSettings(new_settings)) => {
-                    if let Ok(mut guard) = shared_settings.lock() {
-                        if guard.codec != new_settings.codec {
+        tokio::select! {
+            biased;
+            incoming = ws_rx.next() => {
+                match incoming {
+                    Some(Ok(Message::Binary(data))) => match dec.decrypt_msg::<ClientMsg>(&data) {
+                        Ok(ClientMsg::Input(ev)) => {
+                            let geom = active_monitor.lock().map(|g| *g).unwrap_or(monitor);
+                            input::inject_input(&ev, geom);
+                        }
+                        Ok(ClientMsg::UpdateSettings(new_settings)) => {
+                            if let Ok(mut guard) = shared_settings.lock() {
+                                if guard.codec != new_settings.codec {
+                                    force_keyframe.store(true, Ordering::Relaxed);
+                                }
+                                *guard = new_settings;
+                            }
+                        }
+                        Ok(ClientMsg::SetStreamScale(pct)) => {
+                            let clamped = pct.clamp(50, 100);
+                            if scale_percent.swap(clamped, Ordering::Relaxed) != clamped {
+                                force_keyframe.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        Ok(ClientMsg::SelectMonitor(idx)) => {
+                            requested_monitor.store(idx, Ordering::Relaxed);
+                        }
+                        Ok(ClientMsg::LockWorkStation) => {
+                            let _ = crate::power::lock_workstation();
+                        }
+                        Ok(ClientMsg::SendSas) => {
+                            let _ = crate::power::send_sas();
+                        }
+                        Ok(ClientMsg::RequestKeyframe) => {
                             force_keyframe.store(true, Ordering::Relaxed);
                         }
-                        *guard = new_settings;
+                        Ok(ClientMsg::ClipboardSet(text)) => {
+                            clipboard::set_text(&text);
+                            clip_watcher.mark_applied(&text);
+                        }
+                        Ok(ClientMsg::ClipboardGet) => {
+                            let text = clipboard::get_text();
+                            clip_watcher.mark_applied(&text);
+                            let _ = ctrl_tx.try_send(OutboundItem::Host(HostMsg::ClipboardData(text)));
+                        }
+                        Ok(ClientMsg::Ping(ts)) => {
+                            let _ = ctrl_tx.try_send(OutboundItem::Host(HostMsg::Pong(ts)));
+                        }
+                        Ok(ClientMsg::Disconnect) => {
+                            let _ = ctrl_tx.send(OutboundItem::Close).await;
+                            break Ok(());
+                        }
+                        Ok(other) => warn!("Mensaje inesperado en sesión Relay: {other:?}"),
+                        Err(err) => break Err(anyhow!("error descifrando mensaje cliente: {err}")),
+                    },
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ctrl_tx.try_send(OutboundItem::Pong(p));
                     }
+                    Some(Ok(Message::Close(_))) | None => break Ok(()),
+                    Some(Err(err)) => break Err(anyhow!("error WS Relay host: {err}")),
+                    _ => {}
                 }
-                Ok(ClientMsg::SetStreamScale(pct)) => {
-                    let clamped = pct.clamp(50, 100);
-                    if scale_percent.swap(clamped, Ordering::Relaxed) != clamped {
-                        force_keyframe.store(true, Ordering::Relaxed);
-                    }
-                }
-                Ok(ClientMsg::LockWorkStation) => {
-                    let _ = crate::power::lock_workstation();
-                }
-                Ok(ClientMsg::SendSas) => {
-                    let _ = crate::power::send_sas();
-                }
-                Ok(ClientMsg::RequestKeyframe) => {
-                    force_keyframe.store(true, Ordering::Relaxed);
-                }
-                Ok(ClientMsg::ClipboardSet(text)) => clipboard::set_text(&text),
-                Ok(ClientMsg::ClipboardGet) => {
-                    let text = clipboard::get_text();
+            }
+            Some(aux_msg) = aux_rx.recv() => {
+                let _ = ctrl_tx.try_send(OutboundItem::Host(aux_msg));
+            }
+            _ = clip_ticker.tick() => {
+                if let Some(text) = clip_watcher.poll_changed() {
                     let _ = ctrl_tx.try_send(OutboundItem::Host(HostMsg::ClipboardData(text)));
                 }
-                Ok(ClientMsg::Ping(ts)) => {
-                    let _ = ctrl_tx.try_send(OutboundItem::Host(HostMsg::Pong(ts)));
-                }
-                Ok(ClientMsg::Disconnect) => {
-                    let _ = ctrl_tx.send(OutboundItem::Close).await;
-                    break Ok(());
-                }
-                Ok(other) => warn!("Mensaje inesperado en sesión Relay: {other:?}"),
-                Err(err) => break Err(anyhow!("error descifrando mensaje cliente: {err}")),
-            },
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ctrl_tx.try_send(OutboundItem::Pong(p));
             }
-            Some(Ok(Message::Close(_))) | None => break Ok(()),
-            Some(Err(err)) => break Err(anyhow!("error WS Relay host: {err}")),
-            _ => {}
         }
     };
 

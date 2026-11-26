@@ -61,6 +61,44 @@ pub enum MouseButton {
     Right,
     /// Botón central / rueda.
     Middle,
+    /// Botón lateral Atrás (`XBUTTON1`).
+    Extra1,
+    /// Botón lateral Adelante (`XBUTTON2`).
+    Extra2,
+}
+
+/// Información de un monitor disponible en el host remoto.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    /// Índice del monitor compatible con el capturador DXGI/GDI.
+    pub index: u8,
+    /// Nombre legible (`Monitor 1`, `Monitor 2`, ...).
+    pub name: String,
+    /// Ancho nativo en píxeles.
+    pub width: u32,
+    /// Alto nativo en píxeles.
+    pub height: u32,
+    /// Indica si es el monitor principal en coordenadas `(0, 0)`.
+    pub primary: bool,
+}
+
+/// Forma visual estándar del cursor del sistema remoto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CursorKind {
+    #[default]
+    Default,
+    Text,
+    PointingHand,
+    Crosshair,
+    Move,
+    ResizeHorizontal,
+    ResizeVertical,
+    ResizeNeSw,
+    ResizeNwSe,
+    NotAllowed,
+    Wait,
+    Progress,
+    Hidden,
 }
 
 /// Eventos de entrada remota enviados del cliente hacia el host.
@@ -110,6 +148,8 @@ pub enum ClientMsg {
     LockWorkStation,
     /// Envía la secuencia de atención segura (`Ctrl+Alt+Del`) mediante `SendSAS` del servicio `SYSTEM`.
     SendSas,
+    /// Selecciona en vivo el índice de monitor a capturar en el host.
+    SelectMonitor(u8),
 }
 
 /// Mensajes enviados por el host remoto hacia el cliente visor.
@@ -142,6 +182,13 @@ pub enum HostMsg {
     Pong(u64),
     /// Lista de endpoints directos LAN/Tailscale (`ip:puerto`) del host para promover sesión Relay a QUIC directo.
     DirectEndpoints(Vec<String>),
+    /// Lista de monitores disponibles en el host e índice activo.
+    MonitorList {
+        monitors: Vec<MonitorInfo>,
+        active_index: u8,
+    },
+    /// Cambio en la forma actual del cursor remoto.
+    CursorShape(CursorKind),
 }
 
 #[cfg(test)]
@@ -180,6 +227,15 @@ mod tests {
             ClientMsg::SetStreamScale(75),
             ClientMsg::LockWorkStation,
             ClientMsg::SendSas,
+            ClientMsg::SelectMonitor(1),
+            ClientMsg::Input(InputEvent::MouseButton {
+                button: MouseButton::Extra1,
+                down: true,
+            }),
+            ClientMsg::Input(InputEvent::MouseButton {
+                button: MouseButton::Extra2,
+                down: false,
+            }),
         ] {
             let bytes = bincode::serialize(&extra).expect("serialización comando");
             let back: ClientMsg = bincode::deserialize(&bytes).expect("deserialización comando");
@@ -208,5 +264,24 @@ mod tests {
         let enc_ep = bincode::serialize(&endpoints).expect("serialización endpoints");
         let dec_ep: HostMsg = bincode::deserialize(&enc_ep).expect("deserialización endpoints");
         assert_eq!(endpoints, dec_ep);
+
+        let mon_list = HostMsg::MonitorList {
+            monitors: vec![MonitorInfo {
+                index: 0,
+                name: "Monitor 1".to_string(),
+                width: 1920,
+                height: 1080,
+                primary: true,
+            }],
+            active_index: 0,
+        };
+        let enc_m = bincode::serialize(&mon_list).expect("serialización monitor_list");
+        let dec_m: HostMsg = bincode::deserialize(&enc_m).expect("deserialización monitor_list");
+        assert_eq!(mon_list, dec_m);
+
+        let cur = HostMsg::CursorShape(CursorKind::PointingHand);
+        let enc_c = bincode::serialize(&cur).expect("serialización cursor");
+        let dec_c: HostMsg = bincode::deserialize(&enc_c).expect("deserialización cursor");
+        assert_eq!(cur, dec_c);
     }
 }

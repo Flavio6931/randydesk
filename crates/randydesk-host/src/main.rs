@@ -102,7 +102,6 @@ async fn main() -> Result<()> {
     println!("============================================================");
     println!("  Consejo: con Relay configurado conecta solo con el ID numérico\n");
 
-    let monitor_idx = cli.monitor;
     let cfg = HostServerConfig {
         password,
         host_name,
@@ -111,7 +110,8 @@ async fn main() -> Result<()> {
             jpeg_quality: cli.quality.clamp(35, 95),
             target_fps: cli.fps.clamp(5, 60),
         },
-        capturer_factory: Arc::new(move || capture::create_capturer(monitor_idx)),
+        default_monitor: cli.monitor,
+        capturer_factory: Arc::new(capture::create_capturer),
         active_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         direct_endpoints: vec![format!("{local_ip}:{}", cli.port)],
     };

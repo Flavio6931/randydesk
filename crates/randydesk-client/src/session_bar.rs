@@ -9,7 +9,7 @@ use crate::theme::{
 };
 use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
 use eframe::egui::{self, Color32, Rounding, Shape, Stroke, Vec2};
-use randydesk_proto::CodecKind;
+use randydesk_proto::{CodecKind, MonitorInfo};
 
 /// Modo de escalado del escritorio remoto dentro de la ventana del visor.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -46,6 +46,8 @@ pub struct SessionBarInput<'a> {
     pub reconnecting: Option<(u32, &'a str)>,
     pub hook_installed: bool,
     pub hook_hits: u64,
+    pub monitors: &'a [MonitorInfo],
+    pub active_monitor: u8,
 }
 
 /// Estado mutable compartido entre la UI de sesión y la barra flotante.
@@ -67,6 +69,8 @@ pub struct SessionBarState {
     pub view_only: bool,
     pub bar_collapsed: bool,
     pub bar_pinned: bool,
+    pub auto_clipboard: bool,
+    pub input_debug_log: bool,
 }
 
 /// Acciones disparadas por el usuario desde la barra flotante durante un frame.
@@ -74,6 +78,7 @@ pub struct SessionBarState {
 pub struct SessionBarActions {
     pub settings_changed: bool,
     pub stream_scale_changed: bool,
+    pub select_monitor: Option<u8>,
     pub send_win_key: bool,
     pub send_task_manager: bool,
     pub send_sas: bool,
@@ -84,6 +89,7 @@ pub struct SessionBarActions {
     pub toggle_fullscreen: bool,
     pub disconnect: bool,
     pub keyboard_cfg_changed: bool,
+    pub debug_log_changed: bool,
 }
 
 /// Normaliza un porcentaje de escala de transmisión al rango permitido (`50..=100`).
@@ -420,6 +426,30 @@ pub fn render_session_overlay(
 
                                 ui.separator();
 
+                                if !input.monitors.is_empty() {
+                                    ui.menu_button("Monitor", |ui| {
+                                        ui.set_min_width(215.0);
+                                        for m in input.monitors {
+                                            let suffix = if m.primary { " · Principal" } else { "" };
+                                            let lbl = format!(
+                                                "{} ({}x{}{suffix})",
+                                                m.name, m.width, m.height
+                                            );
+                                            if ui
+                                                .selectable_label(
+                                                    m.index == input.active_monitor,
+                                                    lbl,
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.select_monitor = Some(m.index);
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+
                                 ui.checkbox(
                                     &mut state.show_remote_cursor,
                                     "Mostrar cursor remoto",
@@ -463,6 +493,10 @@ pub fn render_session_overlay(
                                     ui.close_menu();
                                 }
                                 ui.separator();
+                                ui.checkbox(
+                                    &mut state.auto_clipboard,
+                                    "Sincronizar portapapeles automático",
+                                );
                                 if ui.button("Enviar portapapeles").clicked() {
                                     actions.send_clipboard = true;
                                     ui.close_menu();
@@ -526,6 +560,15 @@ pub fn render_session_overlay(
                                     .changed()
                                 {
                                     actions.keyboard_cfg_changed = true;
+                                }
+                                if ui
+                                    .checkbox(
+                                        &mut state.input_debug_log,
+                                        "Activar log de diagnóstico de teclado",
+                                    )
+                                    .changed()
+                                {
+                                    actions.debug_log_changed = true;
                                 }
 
                                 ui.separator();

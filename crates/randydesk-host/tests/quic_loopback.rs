@@ -116,7 +116,8 @@ async fn quic_loopback_rejects_bad_password_and_streams_frame_on_valid_auth() ->
             jpeg_quality: 80,
             target_fps: 30,
         },
-        capturer_factory: Arc::new(|| Ok(Box::new(MockCapturer { emitted: false }))),
+        default_monitor: 0,
+        capturer_factory: Arc::new(|_| Ok(Box::new(MockCapturer { emitted: false }))),
         active_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         direct_endpoints: Vec::new(),
     };
@@ -177,10 +178,15 @@ async fn quic_loopback_rejects_bad_password_and_streams_frame_on_valid_auth() ->
         let res: HostMsg = read_msg(&mut rx).await?;
         assert!(matches!(res, HostMsg::AuthResult { ok: true, .. }));
 
-        // Ping -> Pong
+        // Ping -> Pong (ignorando mensajes auxiliares como MonitorList/CursorShape)
         write_msg(&mut tx, &ClientMsg::Ping(12345)).await?;
-        let pong: HostMsg = read_msg(&mut rx).await?;
-        assert_eq!(pong, HostMsg::Pong(12345));
+        loop {
+            match read_msg::<_, HostMsg>(&mut rx).await? {
+                HostMsg::Pong(12345) => break,
+                HostMsg::MonitorList { .. } | HostMsg::CursorShape(_) => continue,
+                other => panic!("se esperaba Pong(12345), llegó {other:?}"),
+            }
+        }
 
         // Recibir VideoFrame por el stream unidireccional de video
         let mut video_rx = conn.accept_uni().await?;

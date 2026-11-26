@@ -12,7 +12,8 @@ pub use auth::{
 pub use e2e::{E2eCipher, E2eDecryptor, E2eEncryptor, E2eError, E2eKeypair};
 pub use framing::{read_msg, write_msg, FramingError};
 pub use message::{
-    ClientMsg, CodecKind, EncodedTile, HostMsg, InputEvent, MouseButton, StreamSettings,
+    ClientMsg, CodecKind, CursorKind, EncodedTile, HostMsg, InputEvent, MonitorInfo, MouseButton,
+    StreamSettings,
 };
 
 /// Puerto UDP/QUIC por defecto para conexiones directas del agente host.
@@ -25,7 +26,7 @@ pub const DEFAULT_RELAY_PORT: u16 = 21119;
 pub const DEFAULT_RELAY_URL: &str = "wss://randydesk-relay.onrender.com";
 
 /// Versión actual del protocolo de comunicación.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Versión mínima compatible del protocolo para interoperar con versiones `v0.4.x`.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
