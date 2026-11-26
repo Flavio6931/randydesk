@@ -5,15 +5,18 @@ use anyhow::{anyhow, Result};
 use directories::ProjectDirs;
 use randydesk_proto::{InputEvent, MouseButton};
 use std::ffi::c_void;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::mem::size_of;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use tracing::warn;
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, HANDLE, HWND};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, GENERIC_WRITE, HANDLE, HWND,
+};
 use windows::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
@@ -26,12 +29,12 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, MapVirtualKeyExW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
-    KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC_EX, MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, VIRTUAL_KEY,
+    GetAsyncKeyState, GetKeyboardLayout, MapVirtualKeyExW, SendInput, INPUT, INPUT_0,
+    INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MAPVK_VK_TO_VSC_EX,
+    MOUSEINPUT, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -43,34 +46,48 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const RANDYDESK_INPUT_EXTRA_INFO: usize = 0x5244_4B01;
 
 const VK_PACKET_U16: u16 = 0x00E7;
-const DESKTOP_SWITCH_ACCESS: u32 = 0x01FF;
+const DESKTOP_SWITCH_ACCESS: u32 = 0x01FF | GENERIC_WRITE.0;
 
 static UIPI_BLOCK_DETECTED: AtomicBool = AtomicBool::new(false);
 static INPUT_WORKER_TX: OnceLock<SyncSender<(InputEvent, MonitorGeometry)>> = OnceLock::new();
-static DEBUG_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+static DEBUG_LOG_TX: OnceLock<SyncSender<String>> = OnceLock::new();
 
-/// Registra eventos de teclado en `%APPDATA%\RandyDesk\input_debug.log` para diagnóstico local.
-pub fn append_input_debug_log(line: &str) {
-    let mutex = DEBUG_LOG_FILE.get_or_init(|| {
-        let opened = ProjectDirs::from("com", "RandyDesk", "RandyDesk").and_then(|proj| {
-            let dir = proj.config_dir();
-            fs::create_dir_all(dir).ok()?;
-            let path = dir.join("input_debug.log");
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(path)
-                .ok()
-        });
-        Mutex::new(opened)
-    });
-    if let Ok(mut guard) = mutex.lock() {
-        if let Some(file) = guard.as_mut() {
-            let _ = writeln!(file, "{line}");
-            let _ = file.flush();
-        }
+fn resolve_input_debug_log_path() -> Option<PathBuf> {
+    if crate::win_service::is_running_as_system() {
+        return Some(crate::win_service::program_data_dir().join("host_input_debug.log"));
     }
+    ProjectDirs::from("com", "RandyDesk", "RandyDesk")
+        .map(|proj| proj.config_dir().join("input_debug.log"))
+}
+
+/// Registra eventos de teclado en segundo plano sin bloquear el hilo invocador (`ProgramData\host_input_debug.log` en `SYSTEM` o `%APPDATA%\input_debug.log`).
+pub fn append_input_debug_log(line: &str) {
+    let tx = DEBUG_LOG_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<String>(256);
+        let _ = std::thread::Builder::new()
+            .name("randydesk-input-log".into())
+            .spawn(move || {
+                let mut file = resolve_input_debug_log_path().and_then(|path| {
+                    if let Some(parent) = path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(path)
+                        .ok()
+                });
+                while let Ok(msg) = rx.recv() {
+                    if let Some(f) = file.as_mut() {
+                        let _ = writeln!(f, "{msg}");
+                        let _ = f.flush();
+                    }
+                }
+            });
+        tx
+    });
+    let _ = tx.try_send(line.to_string());
 }
 
 fn input_worker_sender() -> &'static SyncSender<(InputEvent, MonitorGeometry)> {
@@ -163,6 +180,9 @@ fn inject_input_on_current_thread(event: &InputEvent, monitor: MonitorGeometry) 
             dispatch_keyboard_with_log(ki, vk, scan, extended, down);
         }
         InputEvent::UnicodeChar { ch, down } => {
+            if down {
+                release_physical_shift_if_down();
+            }
             let mut buf = [0u16; 2];
             for code_unit in ch.encode_utf16(&mut buf).iter().copied() {
                 let mut flags = KEYEVENTF_UNICODE;
@@ -185,12 +205,39 @@ fn inject_input_on_current_thread(event: &InputEvent, monitor: MonitorGeometry) 
     }
 }
 
+/// Libera `Shift` izquierdo/derecho si está activo antes de inyectar un carácter Unicode (estilo RustDesk).
+fn release_physical_shift_if_down() {
+    for (vk, scan) in [(0xA0u16, 0x2Au16), (0xA1u16, 0x36u16)] {
+        let is_down = (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0;
+        if is_down {
+            let input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: scan,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: RANDYDESK_INPUT_EXTRA_INFO,
+                    },
+                },
+            };
+            let _ = dispatch_input(input);
+        }
+    }
+}
+
 /// Resuelve un Virtual-Key a scan code usando el `HKL` real de la ventana activa en primer plano.
 fn resolve_vk_to_vsc_ex(vk: u16) -> u32 {
     unsafe {
         let fg_tid = GetWindowThreadProcessId(GetForegroundWindow(), None);
         let layout = GetKeyboardLayout(fg_tid);
-        MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, layout)
+        let vsc = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, layout);
+        if vsc != 0 {
+            vsc
+        } else {
+            MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, layout)
+        }
     }
 }
 
@@ -297,6 +344,11 @@ fn ensure_input_desktop() {
     let _ = sync_thread_to_input_desktop();
 }
 
+/// Compara dos nombres de escritorio Win32 exigiendo que ambos existan (`None == None` devuelve `false`).
+pub(crate) fn desktop_names_match(current: Option<Vec<u16>>, input: Option<Vec<u16>>) -> bool {
+    matches!((current, input), (Some(a), Some(b)) if a == b)
+}
+
 /// Sincroniza el hilo actual con el escritorio de entrada activo de Windows (`WinSta0\Default` o `Winlogon`).
 pub fn sync_thread_to_input_desktop() -> bool {
     unsafe {
@@ -312,8 +364,9 @@ pub fn sync_thread_to_input_desktop() -> bool {
             return false;
         };
 
-        let same = desktop_name(current_desk) == desktop_name(input_desk);
+        let same = desktop_names_match(desktop_name(current_desk), desktop_name(input_desk));
         if !same && SetThreadDesktop(input_desk).is_ok() {
+            let _ = CloseDesktop(current_desk);
             return true;
         }
         let _ = CloseDesktop(input_desk);
@@ -449,11 +502,11 @@ fn dispatch_unicode_with_log(ki: KEYBDINPUT, code_unit: u16, down: bool) {
         Anonymous: INPUT_0 { ki },
     };
     let (sent, err_code) = dispatch_input(input);
-    if sent == 0 {
+    if sent == 0 || down {
         let elev = is_process_elevated();
         let fg_elev = is_foreground_window_elevated();
         append_input_debug_log(&format!(
-            "[HOST-UNI] ch=U+{code_unit:04X} down={down} sent=0 err={err_code} elev={elev} fg_elev={fg_elev}"
+            "[HOST-UNI] ch=U+{code_unit:04X} down={down} sent={sent} err={err_code} elev={elev} fg_elev={fg_elev}"
         ));
     }
 }
@@ -528,5 +581,13 @@ mod tests {
         assert_eq!(scan_only.wVk, VIRTUAL_KEY(0));
         assert_eq!(scan_only.wScan, 0x1E);
         assert_eq!(scan_only.dwFlags, KEYEVENTF_SCANCODE);
+    }
+
+    #[test]
+    fn desktop_names_match_requires_two_known_equal_names() {
+        assert!(!desktop_names_match(None, None));
+        assert!(!desktop_names_match(Some(vec![68]), None));
+        assert!(!desktop_names_match(Some(vec![68]), Some(vec![87])));
+        assert!(desktop_names_match(Some(vec![68, 101]), Some(vec![68, 101])));
     }
 }

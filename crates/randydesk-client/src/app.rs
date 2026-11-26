@@ -20,6 +20,7 @@ use crate::tray::TrayController;
 use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
+use randydesk_host::input::append_input_debug_log;
 use randydesk_proto::{
     normalize_relay_ws_url, CodecKind, InputEvent, StreamSettings, DEFAULT_RELAY_URL,
 };
@@ -190,6 +191,38 @@ impl RandyDeskApp {
                 down: false,
             });
             self.remote_shift_down = false;
+        }
+    }
+
+    fn send_remote_ctrl_shortcut(&mut self, vk: u16, scan: u16) {
+        let need_temp_ctrl = !self.remote_ctrl_down;
+        if need_temp_ctrl {
+            self.net.send_input(InputEvent::Key {
+                vk: 0xA2,
+                scan: 0x1D,
+                extended: false,
+                down: true,
+            });
+        }
+        self.net.send_input(InputEvent::Key {
+            vk,
+            scan,
+            extended: false,
+            down: true,
+        });
+        self.net.send_input(InputEvent::Key {
+            vk,
+            scan,
+            extended: false,
+            down: false,
+        });
+        if need_temp_ctrl {
+            self.net.send_input(InputEvent::Key {
+                vk: 0xA2,
+                scan: 0x1D,
+                extended: false,
+                down: false,
+            });
         }
     }
 
@@ -1212,7 +1245,7 @@ impl RandyDeskApp {
         // Sincroniza Ctrl/Alt/Shift con la ventana remota para atajos en Modo traducción (sin AltGr)
         if !hook_blocking_egui && is_fg && reconnecting.is_none() {
             let mods = ctx.input(|i| i.modifiers);
-            let altgr = mods.ctrl && mods.alt && !mods.command;
+            let altgr = mods.ctrl && mods.alt && KeyboardHookGuard::is_altgr_down();
             let eff_ctrl = mods.ctrl && !altgr;
             let eff_alt = mods.alt && !altgr;
             if eff_ctrl != self.remote_ctrl_down {
@@ -1299,16 +1332,31 @@ impl RandyDeskApp {
                         });
                     }
                 }
+                egui::Event::Copy if !hook_blocking_egui => {
+                    append_input_debug_log("[CLIENT-EGUI] shortcut Copy (Ctrl+C)");
+                    self.send_remote_ctrl_shortcut(0x43, 0x2E);
+                }
+                egui::Event::Cut if !hook_blocking_egui => {
+                    append_input_debug_log("[CLIENT-EGUI] shortcut Cut (Ctrl+X)");
+                    self.send_remote_ctrl_shortcut(0x58, 0x2D);
+                }
+                egui::Event::Paste(_) if !hook_blocking_egui => {
+                    append_input_debug_log("[CLIENT-EGUI] shortcut Paste (Ctrl+V)");
+                    self.send_remote_ctrl_shortcut(0x56, 0x2F);
+                }
                 egui::Event::Key {
                     key,
                     pressed,
                     modifiers,
                     ..
                 } if !hook_blocking_egui => {
-                    let is_combo = (modifiers.ctrl || modifiers.alt || modifiers.command)
-                        && !(modifiers.ctrl && modifiers.alt && !modifiers.command);
+                    let altgr = modifiers.ctrl && modifiers.alt && KeyboardHookGuard::is_altgr_down();
+                    let is_combo = (modifiers.ctrl || modifiers.alt || modifiers.command) && !altgr;
                     if is_combo || is_control_or_nav_key(key) {
                         if let Some((vk, extended)) = map_egui_key_to_vk(key) {
+                            append_input_debug_log(&format!(
+                                "[CLIENT-EGUI] key vk=0x{vk:04X} ext={extended} down={pressed} combo={is_combo}"
+                            ));
                             self.net.send_input(InputEvent::Key {
                                 vk,
                                 scan: 0,
@@ -1320,12 +1368,19 @@ impl RandyDeskApp {
                 }
                 egui::Event::Text(text) if !hook_blocking_egui => {
                     let mods = ctx.input(|i| i.modifiers);
-                    let altgr = mods.ctrl && mods.alt && !mods.command;
+                    let altgr = mods.ctrl && mods.alt && KeyboardHookGuard::is_altgr_down();
                     if (!mods.ctrl && !mods.alt && !mods.command) || altgr {
                         if altgr {
                             self.release_remote_modifiers();
                         }
-                        for ch in text.chars().filter(|c| !c.is_control()) {
+                        let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
+                        if !chars.is_empty() {
+                            append_input_debug_log(&format!(
+                                "[CLIENT-EGUI] text count={} altgr={altgr}",
+                                chars.len()
+                            ));
+                        }
+                        for ch in chars {
                             self.net
                                 .send_input(InputEvent::UnicodeChar { ch, down: true });
                             self.net

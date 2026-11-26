@@ -1,5 +1,21 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.5.1: Fix definitivo de teclado cliente y host `SYSTEM` estilo RustDesk
+- **Causa raíz identificada (comparando código RustDesk y trazas reales en Windows 11):**
+  1. `win_service.rs`: `spawn_worker_in_session` duplicaba el token de Session 0 con `SecurityIdentification` + `TokenSessionId` + `CREATE_NO_WINDOW`, en lugar de usar el token interactivo de `winlogon.exe` de la sesión activa (`DETACHED_PROCESS`), bloqueando `INPUT_KEYBOARD` bajo Windows 11 aunque el ratón funcionaba.
+  2. `input.rs`: `sync_thread_to_input_desktop()` no pedía `GENERIC_WRITE`, consideraba `(None, None)` como escritorios iguales sin cambiar al Input Desktop y enviaba `KEYEVENTF_UNICODE` con `Shift` potencialmente retenido; además el log del servicio iba a `systemprofile\AppData` y hacía `flush()` síncrono.
+  3. `win_hook.rs`: `low_level_kb_proc` hacía escritura y `flush()` síncronos a disco dentro del callback `WH_KEYBOARD_LL` (riesgo de `LowLevelHooksTimeout`) y `set_capture` no actualizaba `state.tx` al cambiar de canal abierto.
+  4. `app.rs` + `egui-winit 0.29.1`: `mods.command == mods.ctrl` en Windows anulaba `AltGr`, y `egui-winit` convertía `Ctrl+C/X/V` en `egui::Event::Copy/Cut/Paste` sin emitir `Event::Key`.
+- **Resumen técnico:**
+  - `Cargo.toml` (+ `Cargo.lock`): versión subida a `0.5.1` y agregada feature `Win32_System_Diagnostics_ToolHelp`.
+  - [win_service.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/win_service.rs): `find_winlogon_pid_in_session` + `open_session_system_token` (token de `winlogon.exe` con `SecurityImpersonation`, fallback a Session 0) y `CreateProcessAsUserW` con `DETACHED_PROCESS`.
+  - [input.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/input.rs): logger asíncrono en segundo plano sin bloqueo (`C:\ProgramData\RandyDesk\host_input_debug.log` en `SYSTEM`), `desktop_names_match`, `GENERIC_WRITE` + `CloseDesktop(current_desk)`, liberación de `Shift` en `UnicodeChar` y fallback `MAPVK_VK_TO_VSC`.
+  - [win_hook.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/win_hook.rs) y [app.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydesk-client/src/app.rs): refresco de `state.tx` vía `same_channel`, `is_altgr_down()` (`VK_RMENU`), reenvío de `Copy`/`Cut`/`Paste` (`send_remote_ctrl_shortcut`) y trazas `[CLIENT-EGUI]` no bloqueantes.
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 44 pruebas aprobadas (19 `randydesk-client`, 15 unit + 1 `quic_loopback` `randydesk-host`, 8 `randydesk-proto`, 1 `relay_e2e` `randydesk-relay`).
+  - `cargo build --workspace --release`: compilación limpia de `target\release\RandyDesk.exe` (`12,352,512` bytes) y `target\release\randydesk-relay.exe` (`2,768,384` bytes, copiado a `dist\`; `dist\RandyDesk.exe` en uso por `v0.5.0` abierta).
+
 ## 2026-11-26 — RandyDesk v0.5.0 (Fase 2): Servicio `SYSTEM` (`SendSAS` / UAC), códec H.264 y promoción directa LAN/Tailscale
 - **Resumen técnico:**
   - Versión subida a `0.5.0` en `Cargo.toml` (y `Cargo.lock`), agregando `openh264 = "0.9"` (`openh264 v0.9.10` compilado sin NASM externo vía MSVC) y features Win32 `Win32_Security_Authorization`, `Win32_System_Registry`, `Win32_System_RemoteDesktop`, `Win32_System_Services`.

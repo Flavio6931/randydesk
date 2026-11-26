@@ -16,15 +16,18 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, FILETIME, HANDLE, HWND, STILL_ACTIVE, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, DuplicateTokenEx, SecurityIdentification,
-    SetTokenInformation, TokenSessionId, WinLocalSystemSid, PSID, TOKEN_ALL_ACCESS,
+    CheckTokenMembership, CreateWellKnownSid, DuplicateTokenEx, SecurityImpersonation,
+    SetTokenInformation, TokenPrimary, TokenSessionId, WinLocalSystemSid, PSID, TOKEN_ALL_ACCESS,
     TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE,
     REG_DWORD, REG_OPTION_NON_VOLATILE,
 };
-use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
     OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, RegisterServiceCtrlHandlerExW,
@@ -38,9 +41,9 @@ use windows::Win32::System::Services::{
     SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+    TerminateProcess, WaitForSingleObject, DETACHED_PROCESS, PROCESS_ALL_ACCESS,
+    PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -702,7 +705,68 @@ fn terminate_and_wait(handle: &HANDLE) {
     }
 }
 
-fn spawn_worker_in_session(exe_path: &Path, session_id: u32) -> Result<HANDLE> {
+pub(crate) fn is_winlogon_exe_name(wide: &[u16]) -> bool {
+    let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..len]).eq_ignore_ascii_case("winlogon.exe")
+}
+
+/// Busca el PID de `winlogon.exe` dentro de la sesión interactiva indicada (estilo RustDesk `GetLogonPid`).
+fn find_winlogon_pid_in_session(session_id: u32) -> Option<u32> {
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
+    let _snap_guard = HandleGuard(snap);
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(snap, &mut entry) }.is_err() {
+        return None;
+    }
+
+    loop {
+        if is_winlogon_exe_name(&entry.szExeFile) {
+            let mut proc_sid = 0u32;
+            if unsafe { ProcessIdToSessionId(entry.th32ProcessID, &mut proc_sid) }.is_ok()
+                && proc_sid == session_id
+            {
+                return Some(entry.th32ProcessID);
+            }
+        }
+        if unsafe { Process32NextW(snap, &mut entry) }.is_err() {
+            break;
+        }
+    }
+    None
+}
+
+/// Obtiene un token `SYSTEM` interactivo desde `winlogon.exe` de la sesión activa (con fallback duplicando el token del servicio).
+fn open_session_system_token(session_id: u32) -> Result<HandleGuard> {
+    if let Some(winlogon_pid) = find_winlogon_pid_in_session(session_id) {
+        if let Ok(winlogon_proc) = unsafe { OpenProcess(PROCESS_ALL_ACCESS, false, winlogon_pid) } {
+            let _proc_guard = HandleGuard(winlogon_proc);
+            let mut raw_token = HANDLE::default();
+            if unsafe { OpenProcessToken(winlogon_proc, TOKEN_ALL_ACCESS, &mut raw_token) }.is_ok()
+            {
+                let _raw_guard = HandleGuard(raw_token);
+                let mut primary_token = HANDLE::default();
+                if unsafe {
+                    DuplicateTokenEx(
+                        raw_token,
+                        TOKEN_ALL_ACCESS,
+                        None,
+                        SecurityImpersonation,
+                        TokenPrimary,
+                        &mut primary_token,
+                    )
+                }
+                .is_ok()
+                {
+                    return Ok(HandleGuard(primary_token));
+                }
+            }
+        }
+    }
+
     let mut proc_token = HANDLE::default();
     unsafe {
         OpenProcessToken(
@@ -720,23 +784,29 @@ fn spawn_worker_in_session(exe_path: &Path, session_id: u32) -> Result<HANDLE> {
             proc_token,
             TOKEN_ALL_ACCESS,
             None,
-            SecurityIdentification,
-            windows::Win32::Security::TokenPrimary,
+            SecurityImpersonation,
+            TokenPrimary,
             &mut dup_token,
         )
     }
     .context("DuplicateTokenEx falló")?;
-    let _dup_tok_guard = HandleGuard(dup_token);
+    let dup_guard = HandleGuard(dup_token);
 
     unsafe {
         SetTokenInformation(
-            dup_token,
+            dup_guard.0,
             TokenSessionId,
             (&session_id as *const u32).cast(),
             size_of::<u32>() as u32,
         )
     }
     .context("SetTokenInformation(TokenSessionId) falló")?;
+
+    Ok(dup_guard)
+}
+
+fn spawn_worker_in_session(exe_path: &Path, session_id: u32) -> Result<HANDLE> {
+    let token_guard = open_session_system_token(session_id)?;
 
     let mut desktop_w: Vec<u16> = r"winsta0\default".encode_utf16().chain([0]).collect();
     let mut cmd_w: Vec<u16> = build_worker_command_line(exe_path)
@@ -754,19 +824,21 @@ fn spawn_worker_in_session(exe_path: &Path, session_id: u32) -> Result<HANDLE> {
     let si = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         lpDesktop: PWSTR(desktop_w.as_mut_ptr()),
+        dwFlags: STARTF_USESHOWWINDOW,
+        wShowWindow: SW_HIDE.0 as u16,
         ..Default::default()
     };
     let mut pi = PROCESS_INFORMATION::default();
 
     unsafe {
         CreateProcessAsUserW(
-            dup_token,
+            token_guard.0,
             PCWSTR::null(),
             PWSTR(cmd_w.as_mut_ptr()),
             None,
             None,
             false,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            DETACHED_PROCESS,
             None,
             PCWSTR::from_raw(work_dir_w.as_ptr()),
             &si,
@@ -857,5 +929,13 @@ mod tests {
     fn formats_quoted_worker_command_line() {
         let cmd = build_worker_command_line(Path::new(r"C:\Program Files\RandyDesk\RandyDesk.exe"));
         assert_eq!(cmd, r#""C:\Program Files\RandyDesk\RandyDesk.exe" --host-worker"#);
+    }
+
+    #[test]
+    fn matches_winlogon_name_case_insensitive() {
+        let winlogon: Vec<u16> = "WinLogon.EXE\0other".encode_utf16().collect();
+        let explorer: Vec<u16> = "explorer.exe\0".encode_utf16().collect();
+        assert!(is_winlogon_exe_name(&winlogon));
+        assert!(!is_winlogon_exe_name(&explorer));
     }
 }

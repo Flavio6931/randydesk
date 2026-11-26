@@ -97,6 +97,11 @@ impl KeyboardHookGuard {
         own_pid != 0 && unsafe { cursor_window_pid() } == own_pid
     }
 
+    /// Indica si la tecla `AltGr` (`VK_RMENU`) está pulsada físicamente en Windows.
+    pub fn is_altgr_down() -> bool {
+        ((unsafe { GetAsyncKeyState(0xA5) } as u16) & 0x8000) != 0
+    }
+
     /// Indica si el hook Win32 quedó instalado correctamente.
     pub fn is_installed(&self) -> bool {
         shared_state().installed.load(Ordering::Acquire)
@@ -137,9 +142,15 @@ impl KeyboardHookGuard {
                 self.thread_id.store(0, Ordering::SeqCst);
             }
 
-            if let Ok(mut guard) = state.tx.lock() {
-                if !self.was_active || (guard.as_ref().is_none_or(|old| old.is_closed()) && tx.is_some()) {
-                    *guard = tx;
+            if let Some(new_tx) = tx {
+                if let Ok(mut guard) = state.tx.lock() {
+                    let needs_update = match guard.as_ref() {
+                        None => true,
+                        Some(old) => old.is_closed() || !old.same_channel(&new_tx),
+                    };
+                    if needs_update {
+                        *guard = Some(new_tx);
+                    }
                 }
             }
             state.active.store(true, Ordering::SeqCst);
@@ -350,6 +361,17 @@ unsafe extern "system" fn low_level_kb_proc(
             append_input_debug_log(&format!(
                 "[CLIENT-HOOK] win_key vk=0x{vk:04X} active={active} fg_pid={fg_pid} cursor_pid={cursor_pid} own_pid={} has_tx={has_tx} down={:?} self_injected={is_self_injected}",
                 state.own_pid, down
+            ));
+        } else if active
+            && !is_self_injected
+            && !can_capture
+            && state.map_mode.load(Ordering::Relaxed)
+            && down == Some(true)
+            && matches!(vk, 0x0D | 0x20)
+        {
+            append_input_debug_log(&format!(
+                "[CLIENT-HOOK] map_skip vk=0x{vk:04X} fg_pid={fg_pid} cursor_pid={cursor_pid} own_pid={}",
+                state.own_pid
             ));
         }
 
@@ -606,5 +628,24 @@ mod tests {
 
         guard.set_capture(false, None);
         assert!(!guard.is_installed());
+    }
+
+    #[test]
+    fn set_capture_refreshes_open_sender_when_channel_changes() {
+        let _lock = LIFECYCLE_LOCK.lock().expect("lifecycle lock");
+        let mut guard = KeyboardHookGuard::new();
+        let (tx1, _rx1) = mpsc::channel(16);
+        let (tx2, mut rx2) = mpsc::channel(16);
+
+        guard.set_capture(true, Some(tx1));
+        guard.set_capture(true, Some(tx2));
+        guard.release_modifiers_now();
+
+        let mut received = 0usize;
+        while rx2.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, MODIFIER_VKS.len());
+        guard.set_capture(false, None);
     }
 }
