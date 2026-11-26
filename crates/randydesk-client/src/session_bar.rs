@@ -71,6 +71,9 @@ pub struct SessionBarState {
     pub bar_pinned: bool,
     pub auto_clipboard: bool,
     pub input_debug_log: bool,
+    pub audio_enabled: bool,
+    pub audio_volume: u8,
+    pub show_file_manager: bool,
 }
 
 /// Acciones disparadas por el usuario desde la barra flotante durante un frame.
@@ -90,6 +93,8 @@ pub struct SessionBarActions {
     pub disconnect: bool,
     pub keyboard_cfg_changed: bool,
     pub debug_log_changed: bool,
+    pub audio_changed: bool,
+    pub toggle_file_manager: bool,
 }
 
 /// Normaliza un porcentaje de escala de transmisión al rango permitido (`50..=100`).
@@ -626,6 +631,53 @@ pub fn render_session_overlay(
                                         );
                                     });
                             });
+
+                            ui.separator();
+
+                            ui.menu_button("Audio", |ui| {
+                                ui.set_min_width(210.0);
+                                if ui
+                                    .checkbox(&mut state.audio_enabled, "Escuchar audio remoto")
+                                    .changed()
+                                {
+                                    actions.audio_changed = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        state.audio_enabled,
+                                        egui::Slider::new(&mut state.audio_volume, 0..=100)
+                                            .suffix("%")
+                                            .text("Volumen"),
+                                    )
+                                    .changed()
+                                {
+                                    actions.audio_changed = true;
+                                }
+                            });
+
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Archivos").size(11.5).color(
+                                            if state.show_file_manager {
+                                                Color32::WHITE
+                                            } else {
+                                                TEXT_PRIMARY
+                                            },
+                                        ),
+                                    )
+                                    .fill(if state.show_file_manager {
+                                        ACCENT_BLUE
+                                    } else {
+                                        BG_SURFACE_ELEVATED
+                                    })
+                                    .rounding(Rounding::same(6.0)),
+                                )
+                                .on_hover_text("Abrir gestor de transferencia de archivos (o arrastra archivos aquí)")
+                                .clicked()
+                            {
+                                actions.toggle_file_manager = true;
+                            }
 
                             ui.separator();
 

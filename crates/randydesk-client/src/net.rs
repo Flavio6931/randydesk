@@ -1,6 +1,10 @@
 //! Cliente QUIC con verificación TLS TOFU, keep-alive para sesiones largas y reconexión automática.
 
+use crate::audio::AudioPlayer;
 use crate::decoder::{FrameDecoder, FrameUpdate};
+use crate::file_manager::{
+    ClientFileTransfers, HandledFileCommand, RemoteDirListing, TransferItem,
+};
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use quinn::{ClientConfig, Endpoint, TransportConfig, VarInt};
@@ -14,6 +18,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -31,6 +36,7 @@ pub struct ConnectRequest {
     pub settings: StreamSettings,
     pub stream_scale: u8,
     pub monitor_index: u8,
+    pub audio_enabled: bool,
 }
 
 /// Comandos que la UI envía a la sesión activa en curso.
@@ -40,6 +46,23 @@ pub enum NetCommand {
     UpdateSettings(StreamSettings),
     SetStreamScale(u8),
     SelectMonitor(u8),
+    SetAudioEnabled(bool),
+    FileListReq(String),
+    FileMkdir {
+        parent_dir: String,
+        name: String,
+    },
+    UploadLocalFile {
+        transfer_id: u64,
+        local_path: PathBuf,
+        remote_dir: String,
+    },
+    DownloadRemoteFile {
+        transfer_id: u64,
+        remote_path: String,
+        local_dir: PathBuf,
+    },
+    CancelTransfer(u64),
     LockWorkStation,
     SendSas,
     RequestKeyframe,
@@ -78,6 +101,8 @@ pub struct SharedSessionState {
     pub monitors: Vec<MonitorInfo>,
     pub active_monitor: u8,
     pub remote_cursor: CursorKind,
+    pub remote_dir: Option<RemoteDirListing>,
+    pub transfers: Vec<TransferItem>,
 }
 
 impl Default for SharedSessionState {
@@ -90,6 +115,8 @@ impl Default for SharedSessionState {
             monitors: Vec::new(),
             active_monitor: 0,
             remote_cursor: CursorKind::Default,
+            remote_dir: None,
+            transfers: Vec::new(),
         }
     }
 }
@@ -175,19 +202,31 @@ pub struct NetworkHandle {
     rt_handle: tokio::runtime::Handle,
     active_task: Option<tokio::task::JoinHandle<()>>,
     cmd_tx: Option<mpsc::Sender<NetCommand>>,
+    audio_player: Arc<AudioPlayer>,
     last_mouse_move: Instant,
 }
 
 impl NetworkHandle {
-    /// Inicializa el controlador asociado al runtime Tokio de fondo.
+    /// Inicializa el controlador asociado al runtime Tokio de fondo y reproductor WASAPI.
     pub fn new(rt_handle: tokio::runtime::Handle) -> Self {
         Self {
             shared: Arc::new(Mutex::new(SharedSessionState::default())),
             rt_handle,
             active_task: None,
             cmd_tx: None,
+            audio_player: Arc::new(AudioPlayer::new()),
             last_mouse_move: Instant::now() - Duration::from_secs(1),
         }
+    }
+
+    /// Silencia o reactiva localmente el reproductor de audio WASAPI.
+    pub fn set_audio_muted(&self, muted: bool) {
+        self.audio_player.set_muted(muted);
+    }
+
+    /// Ajusta el volumen local (`0..=100`) del audio remoto.
+    pub fn set_audio_volume(&self, volume: u8) {
+        self.audio_player.set_volume(volume);
     }
 
     /// Inicia una nueva conexión (cancelando cualquier sesión previa).
@@ -195,6 +234,7 @@ impl NetworkHandle {
         self.disconnect();
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         self.cmd_tx = Some(cmd_tx);
+        self.audio_player.set_muted(!req.audio_enabled);
         let shared = Arc::clone(&self.shared);
         if let Ok(mut guard) = shared.lock() {
             *guard = SharedSessionState {
@@ -206,9 +246,10 @@ impl NetworkHandle {
         }
         ctx.request_repaint();
 
+        let audio_player = Arc::clone(&self.audio_player);
         let handle = self
             .rt_handle
-            .spawn(async move { session_supervisor(req, cmd_rx, &shared, &ctx).await });
+            .spawn(async move { session_supervisor(req, cmd_rx, &shared, &ctx, audio_player).await });
         self.active_task = Some(handle);
     }
 
@@ -256,6 +297,7 @@ async fn session_supervisor(
     mut cmd_rx: mpsc::Receiver<NetCommand>,
     shared: &Arc<Mutex<SharedSessionState>>,
     ctx: &egui::Context,
+    audio_player: Arc<AudioPlayer>,
 ) {
     let mut attempt: u32 = 0;
     let session_start = Instant::now();
@@ -275,6 +317,7 @@ async fn session_supervisor(
             shared,
             ctx,
             session_start,
+            Arc::clone(&audio_player),
         )
         .await;
 
@@ -335,6 +378,10 @@ async fn session_supervisor(
                             Some(NetCommand::UpdateSettings(s)) => req.settings = s,
                             Some(NetCommand::SetStreamScale(s)) => req.stream_scale = s.clamp(50, 100),
                             Some(NetCommand::SelectMonitor(m)) => req.monitor_index = m,
+                            Some(NetCommand::SetAudioEnabled(en)) => {
+                                req.audio_enabled = en;
+                                audio_player.set_muted(!en);
+                            }
                             _ => {}
                         }
                     }
@@ -417,6 +464,7 @@ async fn run_single_session(
     shared: &Arc<Mutex<SharedSessionState>>,
     ctx: &egui::Context,
     session_start: Instant,
+    audio_player: Arc<AudioPlayer>,
 ) -> Result<SessionExit> {
     if let Some(target_id) = parse_numeric_id(&req.address) {
         let Some(relay_url) = req.relay_url.clone() else {
@@ -432,6 +480,7 @@ async fn run_single_session(
             shared,
             ctx,
             session_start,
+            &audio_player,
         )
         .await;
     }
@@ -514,7 +563,7 @@ async fn run_single_session(
         other => return Err(anyhow!("respuesta inesperada a AuthResponse: {other:?}")),
     }
 
-    // Enviar preferencias iniciales de códec/calidad/FPS y escala/monitor si difieren de default
+    // Enviar preferencias iniciales de códec/calidad/FPS y escala/monitor/audio si difieren de default
     write_msg(&mut ctrl_send, &ClientMsg::UpdateSettings(req.settings)).await?;
     let initial_scale = req.stream_scale.clamp(50, 100);
     if initial_scale != 100 {
@@ -522,6 +571,9 @@ async fn run_single_session(
     }
     if req.monitor_index != 0 {
         write_msg(&mut ctrl_send, &ClientMsg::SelectMonitor(req.monitor_index)).await?;
+    }
+    if !req.audio_enabled {
+        write_msg(&mut ctrl_send, &ClientMsg::SetAudioEnabled(false)).await?;
     }
 
     let mut video_recv = conn
@@ -542,6 +594,8 @@ async fn run_single_session(
     info!("Sesión QUIC autenticada con {}", req.address);
 
     let mut frame_decoder = FrameDecoder::new();
+    let mut xfers = ClientFileTransfers::new();
+    let (xfer_tx, mut xfer_rx) = mpsc::channel::<ClientMsg>(32);
     let mut ping_ticker = tokio::time::interval(Duration::from_secs(2));
     let mut stat_window_start = Instant::now();
     let mut frames_in_window: u32 = 0;
@@ -568,6 +622,11 @@ async fn run_single_session(
                         req.monitor_index = idx;
                         write_msg(&mut ctrl_send, &ClientMsg::SelectMonitor(idx)).await?;
                     }
+                    Some(NetCommand::SetAudioEnabled(enabled)) => {
+                        req.audio_enabled = enabled;
+                        audio_player.set_muted(!enabled);
+                        write_msg(&mut ctrl_send, &ClientMsg::SetAudioEnabled(enabled)).await?;
+                    }
                     Some(NetCommand::LockWorkStation) => {
                         write_msg(&mut ctrl_send, &ClientMsg::LockWorkStation).await?;
                     }
@@ -588,7 +647,17 @@ async fn run_single_session(
                         conn.close(0u32.into(), b"cierre de usuario");
                         return Ok(SessionExit::UserRequested);
                     }
+                    Some(other) => {
+                        if let HandledFileCommand::Direct(msg) =
+                            xfers.handle_command(other, &xfer_tx, shared, ctx)
+                        {
+                            write_msg(&mut ctrl_send, &msg).await?;
+                        }
+                    }
                 }
+            }
+            Some(fmsg) = xfer_rx.recv() => {
+                write_msg(&mut ctrl_send, &fmsg).await?;
             }
             ctrl_msg = read_msg::<_, HostMsg>(&mut ctrl_recv) => {
                 match ctrl_msg? {
@@ -620,7 +689,12 @@ async fn run_single_session(
                         }
                         ctx.request_repaint();
                     }
-                    _ => {}
+                    HostMsg::AudioData(frame) => {
+                        audio_player.push_frame(&frame);
+                    }
+                    other => {
+                        let _ = xfers.handle_host_msg(other, shared, ctx);
+                    }
                 }
             }
             video_msg = read_msg::<_, HostMsg>(&mut video_recv) => {

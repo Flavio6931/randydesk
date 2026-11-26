@@ -1,6 +1,8 @@
 //! Sesión remota de cliente a través del servidor Relay E2E con `TCP_NODELAY` y `ws.split()`.
 
+use crate::audio::AudioPlayer;
 use crate::decoder::FrameDecoder;
+use crate::file_manager::{ClientFileTransfers, HandledFileCommand};
 use crate::net::{
     probe_direct_quic, push_frame_update, ConnectRequest, ConnectionState, NetCommand, SessionExit,
     SharedSessionState,
@@ -27,6 +29,7 @@ enum OutboundClientItem {
 }
 
 /// Conecta con un host remoto identificado por `target_id` vía `relay_url` usando X25519 + ChaCha20.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_relay_session(
     relay_url: &str,
     target_id: &str,
@@ -35,6 +38,7 @@ pub async fn run_relay_session(
     shared: &Arc<Mutex<SharedSessionState>>,
     ctx: &egui::Context,
     session_start: Instant,
+    audio_player: &AudioPlayer,
 ) -> Result<SessionExit> {
     let base = relay_url.trim_end_matches('/');
     let ws_endpoint = format!("{base}/ws/client/{target_id}");
@@ -125,6 +129,9 @@ pub async fn run_relay_session(
         )
         .await?;
     }
+    if !req.audio_enabled {
+        send_e2e(&mut ws, &mut cipher, &ClientMsg::SetAudioEnabled(false)).await?;
+    }
 
     if let Ok(mut guard) = shared.lock() {
         guard.status = ConnectionState::Connected {
@@ -138,6 +145,8 @@ pub async fn run_relay_session(
     info!("Sesión Relay E2E autenticada con ID {target_id}");
 
     let mut frame_decoder = FrameDecoder::new();
+    let mut xfers = ClientFileTransfers::new();
+    let (xfer_tx, mut xfer_rx) = mpsc::channel::<ClientMsg>(32);
     let (direct_tx, mut direct_rx) = mpsc::channel::<String>(1);
     let mut direct_probe_started = false;
 
@@ -201,6 +210,11 @@ pub async fn run_relay_session(
                         req.monitor_index = idx;
                         let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::SelectMonitor(idx))).await;
                     }
+                    Some(NetCommand::SetAudioEnabled(enabled)) => {
+                        req.audio_enabled = enabled;
+                        audio_player.set_muted(!enabled);
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::SetAudioEnabled(enabled))).await;
+                    }
                     Some(NetCommand::LockWorkStation) => {
                         let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::LockWorkStation)).await;
                     }
@@ -221,7 +235,17 @@ pub async fn run_relay_session(
                         let _ = out_tx.send(OutboundClientItem::Close).await;
                         break Ok(SessionExit::UserRequested);
                     }
+                    Some(other) => {
+                        if let HandledFileCommand::Direct(msg) =
+                            xfers.handle_command(other, &xfer_tx, shared, ctx)
+                        {
+                            let _ = out_tx.send(OutboundClientItem::Client(msg)).await;
+                        }
+                    }
                 }
+            }
+            Some(fmsg) = xfer_rx.recv() => {
+                let _ = out_tx.send(OutboundClientItem::Client(fmsg)).await;
             }
             incoming = ws_rx.next() => {
                 match incoming {
@@ -255,6 +279,9 @@ pub async fn run_relay_session(
                                     guard.remote_cursor = kind;
                                 }
                                 ctx.request_repaint();
+                            }
+                            HostMsg::AudioData(frame) => {
+                                audio_player.push_frame(&frame);
                             }
                             HostMsg::DirectEndpoints(candidates)
                                 if !direct_probe_started && !candidates.is_empty() =>
@@ -309,7 +336,9 @@ pub async fn run_relay_session(
                                 }
                                 ctx.request_repaint();
                             }
-                            _ => {}
+                            other => {
+                                let _ = xfers.handle_host_msg(other, shared, ctx);
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(p))) => {

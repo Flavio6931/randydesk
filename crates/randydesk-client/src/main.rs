@@ -3,9 +3,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod cards;
 mod config;
 mod decoder;
+mod file_manager;
 mod host_panel;
 mod keymap;
 mod net;

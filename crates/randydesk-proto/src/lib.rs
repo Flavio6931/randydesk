@@ -1,10 +1,12 @@
 //! Protocolo binario, framing seguro, cifrado E2E y autenticación de RandyDesk.
 
+pub mod audio_codec;
 pub mod auth;
 pub mod e2e;
 pub mod framing;
 pub mod message;
 
+pub use audio_codec::{decode_stereo_ima_adpcm, encode_stereo_ima_adpcm};
 pub use auth::{
     compute_proof, format_host_id, generate_host_id, generate_nonce, generate_session_pin,
     parse_numeric_id, verify_proof,
@@ -12,8 +14,8 @@ pub use auth::{
 pub use e2e::{E2eCipher, E2eDecryptor, E2eEncryptor, E2eError, E2eKeypair};
 pub use framing::{read_msg, write_msg, FramingError};
 pub use message::{
-    ClientMsg, CodecKind, CursorKind, EncodedTile, HostMsg, InputEvent, MonitorInfo, MouseButton,
-    StreamSettings,
+    AudioCodec, AudioFrame, ClientMsg, CodecKind, CursorKind, EncodedTile, FileEntry, HostMsg,
+    InputEvent, MonitorInfo, MouseButton, StreamSettings,
 };
 
 /// Puerto UDP/QUIC por defecto para conexiones directas del agente host.
@@ -26,7 +28,10 @@ pub const DEFAULT_RELAY_PORT: u16 = 21119;
 pub const DEFAULT_RELAY_URL: &str = "wss://randydesk-relay.onrender.com";
 
 /// Versión actual del protocolo de comunicación.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
+
+/// Tamaño de bloque usado en transferencias de archivos cifradas (128 KiB).
+pub const FILE_CHUNK_SIZE: usize = 128 * 1024;
 
 /// Versión mínima compatible del protocolo para interoperar con versiones `v0.4.x`.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;

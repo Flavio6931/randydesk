@@ -6,6 +6,9 @@ use crate::config::{
     upsert_recent, AppSettings, SavedHost,
 };
 use crate::decoder::FrameUpdate;
+use crate::file_manager::{
+    FileManagerAction, FileManagerWindowState, RemoteDirListing, TransferItem, TransferStatus,
+};
 use crate::host_panel::HostPanelState;
 use crate::keymap::{is_control_or_nav_key, map_egui_key_to_vk, map_mouse_button, normalize_pos};
 use crate::net::{ConnectRequest, ConnectionState, NetCommand, NetworkHandle};
@@ -122,6 +125,11 @@ pub struct RandyDeskApp {
     input_debug_log: bool,
     clip_watcher: ClipboardWatcher,
     last_clip_poll: Instant,
+    audio_enabled: bool,
+    audio_volume: u8,
+    show_file_manager: bool,
+    file_mgr_ui: FileManagerWindowState,
+    next_transfer_id: u64,
     was_foreground: bool,
     focused_on_connect: bool,
     remote_ctrl_down: bool,
@@ -188,6 +196,11 @@ impl RandyDeskApp {
             input_debug_log: false,
             clip_watcher: ClipboardWatcher::new(),
             last_clip_poll: Instant::now(),
+            audio_enabled: true,
+            audio_volume: 100,
+            show_file_manager: false,
+            file_mgr_ui: FileManagerWindowState::new(),
+            next_transfer_id: 1,
             was_foreground: false,
             focused_on_connect: false,
             remote_ctrl_down: false,
@@ -311,9 +324,11 @@ impl RandyDeskApp {
         self.focused_on_connect = false;
         self.last_error_handled = None;
         self.ui_notice = None;
+        self.show_file_manager = false;
         self.clip_watcher.reset();
         self.last_clip_poll = Instant::now();
         self.last_attempt = Some(prompt.clone());
+        self.net.set_audio_volume(self.audio_volume);
         self.net.connect(
             ConnectRequest {
                 address: prompt.address,
@@ -327,6 +342,7 @@ impl RandyDeskApp {
                 },
                 stream_scale: self.stream_scale,
                 monitor_index: 0,
+                audio_enabled: self.audio_enabled,
             },
             ctx.clone(),
         );
@@ -424,7 +440,17 @@ impl eframe::App for RandyDeskApp {
         }
 
         // 2. Lectura del estado compartido de red
-        let (status, stats, updates, incoming_clip, monitors, active_monitor, remote_cursor) = {
+        let (
+            status,
+            stats,
+            updates,
+            incoming_clip,
+            monitors,
+            active_monitor,
+            remote_cursor,
+            remote_dir,
+            transfers,
+        ) = {
             let mut guard = self.net.shared.lock().expect("lock estado red");
             let clip = guard.incoming_clipboard.take();
             let updates: Vec<FrameUpdate> = guard.pending_updates.drain(..).collect();
@@ -436,6 +462,8 @@ impl eframe::App for RandyDeskApp {
                 guard.monitors.clone(),
                 guard.active_monitor,
                 guard.remote_cursor,
+                guard.remote_dir.clone(),
+                guard.transfers.clone(),
             )
         };
 
@@ -532,6 +560,8 @@ impl eframe::App for RandyDeskApp {
                     &monitors,
                     active_monitor,
                     remote_cursor,
+                    remote_dir.as_ref(),
+                    &transfers,
                 );
             }
             ConnectionState::Reconnecting {
@@ -550,6 +580,8 @@ impl eframe::App for RandyDeskApp {
                     &monitors,
                     active_monitor,
                     remote_cursor,
+                    remote_dir.as_ref(),
+                    &transfers,
                 );
             }
         }
@@ -1252,6 +1284,8 @@ impl RandyDeskApp {
         monitors: &[MonitorInfo],
         active_monitor: u8,
         remote_cursor: CursorKind,
+        remote_dir: Option<&RemoteDirListing>,
+        transfers: &[TransferItem],
     ) {
         let mut img_rect = egui::Rect::NOTHING;
         let mut pointer_in_canvas = false;
@@ -1362,6 +1396,9 @@ impl RandyDeskApp {
             bar_pinned: self.bar_pinned,
             auto_clipboard: self.auto_clipboard,
             input_debug_log: self.input_debug_log,
+            audio_enabled: self.audio_enabled,
+            audio_volume: self.audio_volume,
+            show_file_manager: self.show_file_manager,
         };
         let bar_actions = render_session_overlay(
             ctx,
@@ -1398,6 +1435,8 @@ impl RandyDeskApp {
         self.bar_pinned = bar_state.bar_pinned;
         self.auto_clipboard = bar_state.auto_clipboard;
         self.input_debug_log = bar_state.input_debug_log;
+        self.audio_enabled = bar_state.audio_enabled;
+        self.audio_volume = bar_state.audio_volume;
 
         if bar_actions.settings_changed {
             self.net.send_cmd(NetCommand::UpdateSettings(StreamSettings {
@@ -1415,6 +1454,18 @@ impl RandyDeskApp {
         }
         if bar_actions.debug_log_changed {
             set_input_debug_logging(self.input_debug_log);
+        }
+        if bar_actions.audio_changed {
+            self.net.set_audio_muted(!self.audio_enabled);
+            self.net.set_audio_volume(self.audio_volume);
+            self.net
+                .send_cmd(NetCommand::SetAudioEnabled(self.audio_enabled));
+        }
+        if bar_actions.toggle_file_manager {
+            self.show_file_manager = !self.show_file_manager;
+            if self.show_file_manager && remote_dir.is_none() {
+                self.net.send_cmd(NetCommand::FileListReq(String::new()));
+            }
         }
         if bar_actions.lock_remote_screen {
             self.net.send_cmd(NetCommand::LockWorkStation);
@@ -1505,11 +1556,92 @@ impl RandyDeskApp {
                 self.fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
+            self.show_file_manager = false;
             self.focused_on_connect = false;
             self.release_remote_modifiers();
             self.kb_hook.set_capture(false, None);
             self.net.disconnect();
             return;
+        }
+
+        // Arrastrar y soltar archivos locales sobre la ventana para subirlos al equipo remoto
+        if !self.view_only {
+            let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+            if !dropped.is_empty() {
+                let target_remote = self.file_mgr_ui.current_remote_dir(remote_dir);
+                let mut uploaded_any = false;
+                for file in dropped {
+                    if let Some(path) = file.path {
+                        if path.is_file() {
+                            let id = self.next_transfer_id;
+                            self.next_transfer_id += 1;
+                            self.net.send_cmd(NetCommand::UploadLocalFile {
+                                transfer_id: id,
+                                local_path: path,
+                                remote_dir: target_remote.clone(),
+                            });
+                            uploaded_any = true;
+                        }
+                    }
+                }
+                if uploaded_any {
+                    self.show_file_manager = true;
+                    if remote_dir.is_none() {
+                        self.net.send_cmd(NetCommand::FileListReq(String::new()));
+                    }
+                }
+            }
+        }
+
+        let fm_actions = self.file_mgr_ui.show(
+            ctx,
+            &mut self.show_file_manager,
+            remote_dir,
+            transfers,
+        );
+        for act in fm_actions {
+            match act {
+                FileManagerAction::ListRemote(path) => {
+                    self.net.send_cmd(NetCommand::FileListReq(path));
+                }
+                FileManagerAction::MkdirRemote { parent, name } => {
+                    self.net
+                        .send_cmd(NetCommand::FileMkdir { parent_dir: parent, name });
+                }
+                FileManagerAction::UploadFile {
+                    local_path,
+                    remote_dir,
+                } => {
+                    let id = self.next_transfer_id;
+                    self.next_transfer_id += 1;
+                    self.net.send_cmd(NetCommand::UploadLocalFile {
+                        transfer_id: id,
+                        local_path,
+                        remote_dir,
+                    });
+                }
+                FileManagerAction::DownloadFile {
+                    remote_path,
+                    local_dir,
+                } => {
+                    let id = self.next_transfer_id;
+                    self.next_transfer_id += 1;
+                    self.net.send_cmd(NetCommand::DownloadRemoteFile {
+                        transfer_id: id,
+                        remote_path,
+                        local_dir,
+                    });
+                }
+                FileManagerAction::CancelTransfer(id) => {
+                    self.net.send_cmd(NetCommand::CancelTransfer(id));
+                }
+                FileManagerAction::ClearCompleted => {
+                    if let Ok(mut g) = self.net.shared.lock() {
+                        g.transfers
+                            .retain(|t| matches!(t.status, TransferStatus::InProgress));
+                    }
+                }
+            }
         }
 
         if !has_texture {
@@ -1527,10 +1659,12 @@ impl RandyDeskApp {
         let egui_focused = ctx.input(|i| i.focused);
         self.kb_hook.set_window_focused(egui_focused);
         let is_fg = KeyboardHookGuard::is_window_foreground();
+        let typing_in_local_ui = ctx.wants_keyboard_input();
         let should_capture_kb = reconnecting.is_none()
             && self.keyboard_grab_enabled
             && !self.hidden_to_tray
-            && !self.view_only;
+            && !self.view_only
+            && !typing_in_local_ui;
         if self.was_foreground && !is_fg {
             self.release_remote_modifiers();
             if should_capture_kb {
@@ -1549,7 +1683,7 @@ impl RandyDeskApp {
             },
         );
 
-        if self.view_only {
+        if self.view_only || typing_in_local_ui {
             self.release_remote_modifiers();
             return;
         }

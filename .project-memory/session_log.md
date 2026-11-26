@@ -1,5 +1,17 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.8.0 (Fase 2): Transferencia de archivos (gestor dual + Drag & Drop) y Audio remoto WASAPI
+- **Resumen técnico:**
+  - `Cargo.toml` (+ `Cargo.lock`): versión `0.8.0` y features `Win32_Media_Audio`, `Win32_System_Com`.
+  - [audio_codec.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-proto/src/audio_codec.rs), [lib.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-proto/src/lib.rs) y [message.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-proto/src/message.rs): `PROTOCOL_VERSION = 4`, códec IMA-ADPCM estéreo 4:1 puro en Rust, `FILE_CHUNK_SIZE = 128 KiB`, variantes al final de `ClientMsg`/`HostMsg` (`SetAudioEnabled`, `FileListReq/Resp`, `FileUploadStart/Chunk/Finish`, `FileDownloadReq/Meta/Chunk`, `FileTransferDone/Error/Cancel`, `FileMkdir`, `AudioData`).
+  - [audio.rs (host)](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/audio.rs) y [files.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/files.rs): captura WASAPI Loopback `48 kHz` estéreo con supresión de silencio (`AUDCLNT_BUFFERFLAGS_SILENT`), navegación segura (unidades Windows, `sanitize_file_name`), `.rdpart` con limpieza RAII en `Drop` y renombrado sin sobrescritura (`unique_dest_path`).
+  - [session.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/session.rs) y [relay_agent.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/relay_agent.rs): worker de audio opcional (`client_version >= 4`), envío sin bloqueos y despacho compartido `HostFileManager::handle_client_msg`.
+  - [audio.rs (client)](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/audio.rs), [file_manager.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/file_manager.rs), [net.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/net.rs), [relay_client.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/relay_client.rs), [session_bar.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/session_bar.rs) y [app.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/app.rs): reproductor WASAPI independiente del FPS de `egui`, ventana dual local/remota con progreso y cancelación, Drag & Drop directo sobre la sesión, controles `Archivos` y `Audio` en el HUD.
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 55 pruebas aprobadas (23 `randydesk-client`, 20 unit + 1 `quic_loopback` `randydesk-host`, 10 `randydesk-proto`, 1 `relay_e2e` `randydesk-relay`).
+  - `cargo build --workspace --release` + Release `v0.8.0` en GitHub.
+
 ## 2026-11-26 — RandyDesk v0.7.0 (Fase 1): Portapapeles automático, Multi-monitor, Cursor dinámico, Botones extra y Logs bajo demanda
 - **Resumen técnico:**
   - `Cargo.toml` (+ `Cargo.lock`): versión `0.7.0` y feature `Win32_System_DataExchange`.

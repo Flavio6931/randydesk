@@ -247,8 +247,11 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     let frame_slot = Arc::new(LatestFrameSlot::new());
     let active_monitor = Arc::new(Mutex::new(monitor));
     let requested_monitor = Arc::new(AtomicU8::new(cfg.default_monitor as u8));
+    let audio_enabled = Arc::new(AtomicBool::new(client_version >= 4));
     let (aux_tx, mut aux_rx) = mpsc::channel::<HostMsg>(32);
-    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<OutboundItem>(64);
+    let (file_tx, mut file_rx) = mpsc::channel::<HostMsg>(32);
+    let (audio_tx, mut audio_rx) = mpsc::channel::<HostMsg>(16);
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<OutboundItem>(128);
 
     let capture_thread = spawn_capture_worker(
         capturer,
@@ -264,6 +267,16 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
         Arc::clone(&stop_capture),
         Arc::clone(&frame_slot),
     );
+
+    let audio_thread = if client_version >= 4 {
+        Some(crate::audio::spawn_audio_capture_worker(
+            Arc::clone(&audio_enabled),
+            Arc::clone(&stop_capture),
+            audio_tx,
+        ))
+    } else {
+        None
+    };
 
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (mut enc, mut dec) = cipher.split();
@@ -314,6 +327,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     let mut clip_watcher = clipboard::ClipboardWatcher::new();
     let mut clip_ticker = tokio::time::interval(Duration::from_millis(350));
     clip_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut file_mgr = crate::files::HostFileManager::new();
 
     let session_res: Result<()> = loop {
         tokio::select! {
@@ -342,6 +356,9 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
                         Ok(ClientMsg::SelectMonitor(idx)) => {
                             requested_monitor.store(idx, Ordering::Relaxed);
                         }
+                        Ok(ClientMsg::SetAudioEnabled(enabled)) => {
+                            audio_enabled.store(enabled, Ordering::Relaxed);
+                        }
                         Ok(ClientMsg::LockWorkStation) => {
                             let _ = crate::power::lock_workstation();
                         }
@@ -367,7 +384,11 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
                             let _ = ctrl_tx.send(OutboundItem::Close).await;
                             break Ok(());
                         }
-                        Ok(other) => warn!("Mensaje inesperado en sesión Relay: {other:?}"),
+                        Ok(other) => {
+                            if let Some(unhandled) = file_mgr.handle_client_msg(other, &file_tx) {
+                                warn!("Mensaje inesperado en sesión Relay: {unhandled:?}");
+                            }
+                        }
                         Err(err) => break Err(anyhow!("error descifrando mensaje cliente: {err}")),
                     },
                     Some(Ok(Message::Ping(p))) => {
@@ -381,6 +402,14 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
             Some(aux_msg) = aux_rx.recv() => {
                 let _ = ctrl_tx.try_send(OutboundItem::Host(aux_msg));
             }
+            Some(file_msg) = file_rx.recv() => {
+                if ctrl_tx.send(OutboundItem::Host(file_msg)).await.is_err() {
+                    break Ok(());
+                }
+            }
+            Some(audio_msg) = audio_rx.recv() => {
+                let _ = ctrl_tx.try_send(OutboundItem::Host(audio_msg));
+            }
             _ = clip_ticker.tick() => {
                 if let Some(text) = clip_watcher.poll_changed() {
                     let _ = ctrl_tx.try_send(OutboundItem::Host(HostMsg::ClipboardData(text)));
@@ -393,6 +422,9 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     frame_slot.close();
     writer_task.abort();
     let _ = capture_thread.join();
+    if let Some(t) = audio_thread {
+        let _ = t.join();
+    }
     session_res
 }
 

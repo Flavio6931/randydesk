@@ -101,6 +101,39 @@ pub enum CursorKind {
     Hidden,
 }
 
+/// Códec aplicado a un paquete de audio remoto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    /// IMA-ADPCM estéreo 4:1 sobre PCM `16-bit`.
+    ImaAdpcm,
+}
+
+/// Bloque de audio estéreo capturado y comprimido en el host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFrame {
+    /// Frecuencia de muestreo en Hz (típicamente `48_000`).
+    pub sample_rate: u32,
+    /// Número de canales (`2` estéreo).
+    pub channels: u8,
+    /// Códec utilizado en `data`.
+    pub codec: AudioCodec,
+    /// Payload comprimido del bloque de audio.
+    pub data: Vec<u8>,
+}
+
+/// Entrada de archivo o carpeta reportada por el navegador de archivos remoto.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// Nombre visible de la entrada (o letra de unidad si está en raíz de unidades).
+    pub name: String,
+    /// `true` si corresponde a una carpeta o unidad.
+    pub is_dir: bool,
+    /// Tamaño en bytes (0 para carpetas).
+    pub size: u64,
+    /// Última modificación en segundos Unix.
+    pub modified_unix: u64,
+}
+
 /// Eventos de entrada remota enviados del cliente hacia el host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
@@ -150,6 +183,31 @@ pub enum ClientMsg {
     SendSas,
     /// Selecciona en vivo el índice de monitor a capturar en el host.
     SelectMonitor(u8),
+    /// Activa o pausa la captura y envío de audio WASAPI desde el host.
+    SetAudioEnabled(bool),
+    /// Solicita listar el contenido de un directorio remoto (vacío = escritorio por defecto).
+    FileListReq { path: String },
+    /// Inicia una transferencia de subida hacia una carpeta remota.
+    FileUploadStart {
+        transfer_id: u64,
+        remote_dir: String,
+        file_name: String,
+        total_size: u64,
+    },
+    /// Bloque secuencial de archivo subido hacia el host.
+    FileUploadChunk {
+        transfer_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// Confirma fin de subida para renombrar `.rdpart` a destino definitivo.
+    FileUploadFinish { transfer_id: u64 },
+    /// Solicita descargar un archivo remoto en bloques hacia el cliente.
+    FileDownloadReq { transfer_id: u64, remote_path: String },
+    /// Cancela una transferencia de archivo activa (subida o descarga).
+    FileTransferCancel { transfer_id: u64 },
+    /// Crea una nueva carpeta dentro de `parent_dir`.
+    FileMkdir { parent_dir: String, name: String },
 }
 
 /// Mensajes enviados por el host remoto hacia el cliente visor.
@@ -189,6 +247,31 @@ pub enum HostMsg {
     },
     /// Cambio en la forma actual del cursor remoto.
     CursorShape(CursorKind),
+    /// Bloque comprimido de audio del sistema remoto.
+    AudioData(AudioFrame),
+    /// Respuesta con entradas de carpeta o error al listar archivos remotos.
+    FileListResp {
+        path: String,
+        parent: Option<String>,
+        entries: Vec<FileEntry>,
+        error: Option<String>,
+    },
+    /// Metadatos iniciales de una descarga iniciada desde el host.
+    FileDownloadMeta {
+        transfer_id: u64,
+        file_name: String,
+        total_size: u64,
+    },
+    /// Bloque secuencial de archivo descargado desde el host.
+    FileDownloadChunk {
+        transfer_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// Confirmación de transferencia completada correctamente.
+    FileTransferDone { transfer_id: u64, saved_path: String },
+    /// Error o cancelación de una transferencia de archivos.
+    FileTransferError { transfer_id: u64, message: String },
 }
 
 #[cfg(test)]
@@ -283,5 +366,62 @@ mod tests {
         let enc_c = bincode::serialize(&cur).expect("serialización cursor");
         let dec_c: HostMsg = bincode::deserialize(&enc_c).expect("deserialización cursor");
         assert_eq!(cur, dec_c);
+
+        let audio = HostMsg::AudioData(AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            codec: AudioCodec::ImaAdpcm,
+            data: vec![0, 0, 0, 0, 1, 2, 3, 4, 0xAB],
+        });
+        let enc_a = bincode::serialize(&audio).expect("serialización audio");
+        let dec_a: HostMsg = bincode::deserialize(&enc_a).expect("deserialización audio");
+        assert_eq!(audio, dec_a);
+
+        for fmsg in [
+            ClientMsg::SetAudioEnabled(true),
+            ClientMsg::FileListReq {
+                path: String::new(),
+            },
+            ClientMsg::FileUploadStart {
+                transfer_id: 9,
+                remote_dir: "C:\\Users".to_string(),
+                file_name: "demo.zip".to_string(),
+                total_size: 4096,
+            },
+            ClientMsg::FileUploadChunk {
+                transfer_id: 9,
+                offset: 0,
+                data: vec![1, 2, 3],
+            },
+            ClientMsg::FileUploadFinish { transfer_id: 9 },
+            ClientMsg::FileDownloadReq {
+                transfer_id: 10,
+                remote_path: "C:\\a.txt".to_string(),
+            },
+            ClientMsg::FileTransferCancel { transfer_id: 10 },
+            ClientMsg::FileMkdir {
+                parent_dir: "C:\\".to_string(),
+                name: "Nueva".to_string(),
+            },
+        ] {
+            let enc = bincode::serialize(&fmsg).expect("serialización archivo cliente");
+            let dec: ClientMsg = bincode::deserialize(&enc).expect("deserialización archivo cliente");
+            assert_eq!(fmsg, dec);
+        }
+
+        let flist = HostMsg::FileListResp {
+            path: "C:\\".to_string(),
+            parent: Some("__DRIVES__".to_string()),
+            entries: vec![FileEntry {
+                name: "readme.txt".to_string(),
+                is_dir: false,
+                size: 42,
+                modified_unix: 1_700_000_000,
+            }],
+            error: None,
+        };
+        let enc_fl = bincode::serialize(&flist).expect("serialización file list");
+        let dec_fl: HostMsg = bincode::deserialize(&enc_fl).expect("deserialización file list");
+        assert_eq!(flist, dec_fl);
     }
 }

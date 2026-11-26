@@ -183,7 +183,9 @@ async fn quic_loopback_rejects_bad_password_and_streams_frame_on_valid_auth() ->
         loop {
             match read_msg::<_, HostMsg>(&mut rx).await? {
                 HostMsg::Pong(12345) => break,
-                HostMsg::MonitorList { .. } | HostMsg::CursorShape(_) => continue,
+                HostMsg::MonitorList { .. } | HostMsg::CursorShape(_) | HostMsg::AudioData(_) => {
+                    continue
+                }
                 other => panic!("se esperaba Pong(12345), llegó {other:?}"),
             }
         }
