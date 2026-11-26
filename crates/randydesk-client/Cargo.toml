@@ -19,6 +19,7 @@ openh264.workspace = true
 quinn.workspace = true
 randydesk-host = { path = "../randydesk-host" }
 randydesk-proto = { path = "../randydesk-proto" }
+reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

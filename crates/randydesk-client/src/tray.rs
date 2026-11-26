@@ -12,10 +12,10 @@ use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowLongW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
-    SetForegroundWindow, ShowWindow, GW_OWNER, GWL_EXSTYLE, SW_HIDE, SW_RESTORE, WM_CLOSE,
-    WS_EX_TOOLWINDOW,
+    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow,
+    GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindow, ASFW_ANY, GW_OWNER,
+    GWL_EXSTYLE, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE, WS_EX_TOOLWINDOW,
 };
 
 /// Genera el icono RGBA8 32x32 de RandyDesk (fondo azul `#0078FF` con pantalla blanca).
@@ -330,6 +330,22 @@ fn find_main_hwnd() -> Option<HWND> {
 }
 
 unsafe fn force_foreground(hwnd: HWND) {
+    let _ = AllowSetForegroundWindow(ASFW_ANY);
+    let _ = ShowWindow(
+        hwnd,
+        if IsIconic(hwnd).as_bool() {
+            SW_RESTORE
+        } else {
+            SW_SHOW
+        },
+    );
+    if SetForegroundWindow(hwnd).as_bool() {
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(hwnd);
+        return;
+    }
+
     let fg = GetForegroundWindow();
     if !fg.is_invalid() && fg != hwnd {
         let fg_tid = GetWindowThreadProcessId(fg, None);

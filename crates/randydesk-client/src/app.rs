@@ -17,6 +17,7 @@ use crate::theme::{
     BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED,
 };
 use crate::tray::TrayController;
+use crate::updater::{UpdateState, UpdaterHandle};
 use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
@@ -55,6 +56,7 @@ pub struct RandyDeskApp {
     hosts: Vec<SavedHost>,
     settings: AppSettings,
     tray: Option<TrayController>,
+    updater: UpdaterHandle,
     kb_hook: KeyboardHookGuard,
 
     // Estado de bandeja
@@ -114,6 +116,7 @@ impl RandyDeskApp {
         let relay_url_input = settings.relay_url.clone();
         let host_panel = HostPanelState::new(&rt_handle, settings.normalized_relay_url());
         let tray = TrayController::new(cc.egui_ctx.clone());
+        let updater = UpdaterHandle::new(rt_handle.clone(), cc.egui_ctx.clone());
         let kb_hook = KeyboardHookGuard::new();
 
         Self {
@@ -123,6 +126,7 @@ impl RandyDeskApp {
             hosts,
             settings,
             tray,
+            updater,
             kb_hook,
             hidden_to_tray: false,
             restored_at: Instant::now() - Duration::from_secs(5),
@@ -360,6 +364,14 @@ impl RandyDeskApp {
 
 impl eframe::App for RandyDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.updater.take_exit_requested() {
+            self.kb_hook.set_capture(false, None);
+            self.net.disconnect();
+            self.host_panel.stop_host();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         // 1. Gestión de minimizar / restaurar desde la bandeja del sistema
         if let Some(tray) = self.tray.as_ref() {
             if tray.take_restore_requested() {
@@ -564,6 +576,82 @@ impl RandyDeskApp {
                                 .size(11.5)
                                 .color(TEXT_MUTED),
                         );
+
+                        ui.label(egui::RichText::new("|").size(12.0).color(BORDER_SUBTLE));
+
+                        match self.updater.state() {
+                            UpdateState::Idle => {
+                                if ui
+                                    .link(egui::RichText::new("Buscar actualización").size(12.0))
+                                    .clicked()
+                                {
+                                    self.updater.check_now(false);
+                                }
+                            }
+                            UpdateState::Checking => {
+                                ui.label(
+                                    egui::RichText::new("Buscando...")
+                                        .size(11.5)
+                                        .color(TEXT_MUTED),
+                                );
+                            }
+                            UpdateState::UpToDate => {
+                                if ui
+                                    .link(egui::RichText::new("Al día · Buscar").size(12.0))
+                                    .clicked()
+                                {
+                                    self.updater.check_now(false);
+                                }
+                            }
+                            UpdateState::Available(info) => {
+                                let label = format!("Actualizar a v{}", info.version);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(label)
+                                                .size(11.5)
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        )
+                                        .fill(ACCENT_TEAL),
+                                    )
+                                    .on_hover_text("Descargar y aplicar actualización desde GitHub")
+                                    .clicked()
+                                {
+                                    self.updater
+                                        .download_and_apply(info, self.host_panel.is_service_installed());
+                                }
+                            }
+                            UpdateState::Downloading { version, percent } => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Descargando v{version}... {percent}%"
+                                    ))
+                                    .size(11.5)
+                                    .color(ACCENT_TEAL),
+                                );
+                            }
+                            UpdateState::Applying { version } => {
+                                ui.label(
+                                    egui::RichText::new(format!("Aplicando v{version}..."))
+                                        .size(11.5)
+                                        .color(ACCENT_TEAL),
+                                );
+                            }
+                            UpdateState::Error(msg) => {
+                                if ui
+                                    .link(
+                                        egui::RichText::new("Error al actualizar (reintentar)")
+                                            .size(11.5)
+                                            .color(STATUS_ORANGE),
+                                    )
+                                    .on_hover_text(msg)
+                                    .clicked()
+                                {
+                                    self.updater.check_now(false);
+                                }
+                            }
+                        }
                     });
                 });
             });
@@ -1197,9 +1285,16 @@ impl RandyDeskApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
         if bar_actions.keyboard_cfg_changed {
+            self.release_remote_modifiers();
+            self.kb_hook.release_modifiers_now();
             self.kb_hook.set_mode(self.keyboard_mode);
-            if !self.keyboard_grab_enabled {
+            if !self.keyboard_grab_enabled || self.view_only {
                 self.kb_hook.set_capture(false, None);
+            } else {
+                if let Some(tray) = self.tray.as_ref() {
+                    tray.ensure_foreground();
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
         if bar_actions.disconnect {

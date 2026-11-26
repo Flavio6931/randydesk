@@ -126,6 +126,11 @@ impl HostPanelState {
         }
     }
 
+    /// Indica si el servicio de Windows `RandyDeskService` está instalado en el equipo local.
+    pub fn is_service_installed(&self) -> bool {
+        self.cached_svc_status != ServiceStatusKind::NotInstalled
+    }
+
     /// Devuelve un resumen vivo del servicio (propio o de `RandyDeskService`) para la barra inferior.
     pub fn runtime_info(&self) -> Option<HostRuntimeInfo> {
         if let Some(ref s) = self.cached_svc_state {

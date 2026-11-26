@@ -1,5 +1,21 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.5.3: Fix definitivo `Modo mapa (Teclado físico)` estilo RustDesk (`REA + Ghidra`) + Auto-Actualizador en 1 clic
+- **Causa raíz confirmada con REA + Ghidra 12.2 (`RustDesk.exe` / `librustdesk.dll`) y fuente de RustDesk (`rdev` Windows + `keyboard.rs` + `input_service.rs`):**
+  1. `Modo mapa` en `v0.5.2` enviaba `vk != 0` en lugar de scan code físico puro (`wVk = 0`, `KEYEVENTF_SCANCODE`), no filtraba el scan code sintético `0x021D` de `AltGr`, ni excluía `0x45` (`NumLock`/`Pause`) de `KEYEVENTF_EXTENDEDKEY`.
+  2. `WH_KEYBOARD_LL` devolvía `LRESULT(1)` también en `WM_KEYUP`/`WM_SYSKEYUP` (a diferencia de RustDesk que bloquea solo `KeyDown` y siempre llama a `CallNextHookEx` en `KeyUp`, además de `CapsLock`/`NumLock`).
+  3. Al perder foco en `Modo mapa` faltaba soltar todas las teclas físicas rastreadas (y hacer el doble pulso de `Alt`/`AltGr`), y `force_foreground` no usaba `AllowSetForegroundWindow(ASFW_ANY)`.
+- **Resumen técnico:**
+  - `Cargo.toml`, `crates/randydesk-client/Cargo.toml` (+ `Cargo.lock`): versión `0.5.3` y dependencia `reqwest 0.12` (`rustls-tls`, `stream`).
+  - [win_hook.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/win_hook.rs): `build_map_key_event` (scan code puro `vk = 0`, filtro `0x021D`, exclusión `0x36`/`0x45`, `VK_PAUSE`/`VK_PACKET`), `should_block_locally` (solo `KeyDown`, deja pasar `KeyUp`, `CapsLock` y `NumLock`), seguimiento y liberación completa de `pressed_keys` (con doble pulso `Alt`/`AltGr`) y tests unitarios.
+  - [input.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/input.rs): exclusión `0x45` junto a `0x36` para `KEYEVENTF_EXTENDEDKEY` y test `physical_scancode_mode_matches_rustdesk_rdev`.
+  - [tray.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydesk-client/src/tray.rs) y [session_bar.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydesk-client/src/session_bar.rs): `AllowSetForegroundWindow(ASFW_ANY)` + `SW_SHOW` en `force_foreground` y etiqueta explícita de `Modo físico` vs `Modo traducción`.
+  - [updater.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/updater.rs), [main.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/main.rs) y [app.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/app.rs): botón de actualización en 1 clic (`Buscar actualización` / `Actualizar a vX.Y.Z`) consultando GitHub Releases, descarga con progreso y validación PE (`MZ`), reemplazo seguro (`--apply-update`, UAC solo si hace falta y actualización de `RandyDeskService`), relanzamiento y limpieza en `%TEMP%` (`--cleanup-file`).
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 48 pruebas aprobadas (22 `randydesk-client`, 16 unit + 1 `quic_loopback` `randydesk-host`, 8 `randydesk-proto`, 1 `relay_e2e` `randydesk-relay`).
+  - `cargo build --workspace --release` + copia a `dist\`.
+
 ## 2026-11-26 — RandyDesk v0.5.2: Captura de teclado por foco estricto de `RandyDesk` y `Modo mapa` por defecto
 - **Causa raíz identificada (video + `input_debug.log`):**
   1. `KeyboardMode::Translate` era el modo por defecto al conectar, dejando pasar teclas fuera del hook y rompiendo `Win+R`/`Win+E` por depender de `GetAsyncKeyState(VK_LWIN)` cuando el hook bloqueaba `Win`.

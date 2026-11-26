@@ -499,13 +499,17 @@ pub fn render_session_overlay(
                                     ("Estado hook: Desactivado".to_string(), TEXT_MUTED)
                                 } else if input.hook_installed {
                                     if KeyboardHookGuard::is_window_foreground() {
-                                        (
-                                            format!(
-                                                "Teclado: PC remota (activo, {} teclas)",
+                                        let label = match state.keyboard_mode {
+                                            KeyboardMode::Map => format!(
+                                                "Teclado: PC remota (Modo físico, {} teclas)",
                                                 input.hook_hits
                                             ),
-                                            ACCENT_TEAL,
-                                        )
+                                            KeyboardMode::Translate => format!(
+                                                "Teclado: PC remota (Modo traducción, {} atajos)",
+                                                input.hook_hits
+                                            ),
+                                        };
+                                        (label, ACCENT_TEAL)
                                     } else {
                                         (
                                             "Teclado: Tu PC (haz clic aquí para controlar)"

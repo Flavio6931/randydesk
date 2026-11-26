@@ -274,7 +274,7 @@ pub(crate) fn build_keybd_input(
     let (raw_scan, is_extended) = if scan != 0 {
         let raw = scan & 0x00FF;
         let prefix = (scan >> 8) & 0x00FF;
-        let ext = if raw == 0x36 {
+        let ext = if matches!(raw, 0x36 | 0x45) {
             false
         } else {
             extended || prefix == 0xE0 || prefix == 0xE1 || is_extended_vk(vk)
@@ -283,7 +283,7 @@ pub(crate) fn build_keybd_input(
     } else {
         let raw = (resolved_scan_ex & 0x00FF) as u16;
         let prefix = (resolved_scan_ex >> 8) & 0x00FF;
-        let ext = if raw == 0x36 {
+        let ext = if matches!(raw, 0x36 | 0x45) {
             false
         } else {
             extended || prefix == 0xE0 || prefix == 0xE1 || is_extended_vk(vk)
@@ -581,6 +581,37 @@ mod tests {
         assert_eq!(scan_only.wVk, VIRTUAL_KEY(0));
         assert_eq!(scan_only.wScan, 0x1E);
         assert_eq!(scan_only.dwFlags, KEYEVENTF_SCANCODE);
+    }
+
+    #[test]
+    fn physical_scancode_mode_matches_rustdesk_rdev() {
+        let a_down = build_keybd_input(0, 0x1E, false, true, 0);
+        assert_eq!(a_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(a_down.wScan, 0x1E);
+        assert_eq!(a_down.dwFlags, KEYEVENTF_SCANCODE);
+
+        let lwin_down = build_keybd_input(0, 0x5B, true, true, 0);
+        assert_eq!(lwin_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(lwin_down.wScan, 0x5B);
+        assert_eq!(lwin_down.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
+
+        let ralt_up = build_keybd_input(0, 0x38, true, false, 0);
+        assert_eq!(ralt_up.wVk, VIRTUAL_KEY(0));
+        assert_eq!(ralt_up.wScan, 0x38);
+        assert_eq!(
+            ralt_up.dwFlags,
+            KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
+        );
+
+        let rshift_down = build_keybd_input(0, 0x36, true, true, 0);
+        assert_eq!(rshift_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(rshift_down.wScan, 0x36);
+        assert_eq!(rshift_down.dwFlags, KEYEVENTF_SCANCODE);
+
+        let numlock_down = build_keybd_input(0, 0x45, true, true, 0);
+        assert_eq!(numlock_down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(numlock_down.wScan, 0x45);
+        assert_eq!(numlock_down.dwFlags, KEYEVENTF_SCANCODE);
     }
 
     #[test]

@@ -21,6 +21,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Códigos Virtual-Key de modificadores que se liberan al perder foco para evitar teclas pegadas.
 const MODIFIER_VKS: &[u16] = &[0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
 const VK_PACKET_U16: u16 = 0x00E7;
+const VK_PAUSE_U16: u16 = 0x0013;
+const VK_CAPITAL_U16: u16 = 0x0014;
+const VK_NUMLOCK_U16: u16 = 0x0090;
 const VK_LWIN_U16: u16 = 0x005B;
 const VK_RWIN_U16: u16 = 0x005C;
 
@@ -42,7 +45,9 @@ struct HookSharedState {
     win_down: AtomicBool,
     own_pid: u32,
     sent_keys: AtomicU64,
+    map_skip_logs: AtomicU64,
     tx: Mutex<Option<mpsc::Sender<NetCommand>>>,
+    pressed_keys: Mutex<Vec<(u16, u16, bool)>>,
 }
 
 static HOOK_STATE: OnceLock<Arc<HookSharedState>> = OnceLock::new();
@@ -57,7 +62,9 @@ fn shared_state() -> &'static Arc<HookSharedState> {
             win_down: AtomicBool::new(false),
             own_pid: unsafe { GetCurrentProcessId() },
             sent_keys: AtomicU64::new(0),
+            map_skip_logs: AtomicU64::new(0),
             tx: Mutex::new(None),
+            pressed_keys: Mutex::new(Vec::new()),
         })
     })
 }
@@ -116,9 +123,14 @@ impl KeyboardHookGuard {
 
     /// Cambia el modo de teclado (`Translate`: solo atajos sistema, `Map`: teclado físico completo).
     pub fn set_mode(&self, mode: KeyboardMode) {
-        shared_state()
-            .map_mode
-            .store(matches!(mode, KeyboardMode::Map), Ordering::Relaxed);
+        let is_map = matches!(mode, KeyboardMode::Map);
+        let prev = shared_state().map_mode.swap(is_map, Ordering::Relaxed);
+        if prev != is_map {
+            append_input_debug_log(&format!(
+                "[CLIENT-HOOK] mode={}",
+                if is_map { "Map" } else { "Translate" }
+            ));
+        }
     }
 
     /// Indica si el hook está capturando todas las teclas físicas (`Modo mapa` con ventana enfocada).
@@ -261,7 +273,57 @@ impl Drop for KeyboardHookGuard {
     }
 }
 
+fn track_pressed_key(state: &HookSharedState, ev: &InputEvent) {
+    if let InputEvent::Key {
+        vk,
+        scan,
+        extended,
+        down,
+    } = *ev
+    {
+        if vk == VK_PACKET_U16 {
+            return;
+        }
+        if let Ok(mut keys) = state.pressed_keys.try_lock() {
+            if down {
+                if !keys.contains(&(vk, scan, extended)) {
+                    keys.push((vk, scan, extended));
+                }
+            } else {
+                keys.retain(|&k| !(k.0 == vk && k.1 == scan && k.2 == extended));
+            }
+        }
+    }
+}
+
 fn release_modifiers(tx: &mpsc::Sender<NetCommand>) {
+    if let Ok(mut keys) = shared_state().pressed_keys.lock() {
+        let drained = std::mem::take(&mut *keys);
+        drop(keys);
+        for (vk, scan, extended) in drained {
+            let _ = tx.try_send(NetCommand::Input(InputEvent::Key {
+                vk,
+                scan,
+                extended,
+                down: false,
+            }));
+            // Evita menús o estado AltGr enganchados en el equipo remoto tras perder foco (estilo RustDesk).
+            if (vk == 0 && scan == 0x38) || matches!(vk, 0xA4 | 0xA5) {
+                let _ = tx.try_send(NetCommand::Input(InputEvent::Key {
+                    vk,
+                    scan,
+                    extended,
+                    down: true,
+                }));
+                let _ = tx.try_send(NetCommand::Input(InputEvent::Key {
+                    vk,
+                    scan,
+                    extended,
+                    down: false,
+                }));
+            }
+        }
+    }
     for &vk in MODIFIER_VKS {
         let extended = matches!(vk, 0x5B | 0x5C | 0xA3 | 0xA5);
         let _ = tx.try_send(NetCommand::Input(InputEvent::Key {
@@ -305,7 +367,7 @@ pub(crate) fn build_hook_key_event(vk_code: u32, scan_code: u32, flags: u32, dow
     }
 
     let raw_scan = (scan_code & 0x00FF) as u16;
-    let extended = if raw_scan == 0x36 {
+    let extended = if matches!(raw_scan, 0x36 | 0x45) {
         false
     } else {
         (flags & LLKHF_EXTENDED.0) != 0
@@ -321,6 +383,65 @@ pub(crate) fn build_hook_key_event(vk_code: u32, scan_code: u32, flags: u32, dow
         extended,
         down,
     }
+}
+
+/// Construye el evento físico puro (`wVk = 0`, `KEYEVENTF_SCANCODE`) para `Modo mapa` siguiendo las reglas exactas de `rdev`/RustDesk.
+pub(crate) fn build_map_key_event(
+    vk_code: u32,
+    scan_code: u32,
+    flags: u32,
+    down: bool,
+) -> Option<InputEvent> {
+    let vk = vk_code as u16;
+    if vk == VK_PACKET_U16 {
+        return Some(InputEvent::Key {
+            vk,
+            scan: scan_code as u16,
+            extended: false,
+            down,
+        });
+    }
+
+    // RustDesk #1371: descarta scan codes sintéticos > 0xFF cuyo byte alto no sea 0xE0 (ej. 0x021D de AltGr).
+    if scan_code > 0x00FF && (scan_code >> 8) != 0xE0 {
+        return None;
+    }
+
+    // `VK_PAUSE` comparte scan code con NumLock; RustDesk lo envía como tecla virtual especial.
+    if vk == VK_PAUSE_U16 {
+        return Some(InputEvent::Key {
+            vk,
+            scan: 0,
+            extended: false,
+            down,
+        });
+    }
+
+    let raw_scan = (scan_code & 0x00FF) as u16;
+    if raw_scan == 0 {
+        return Some(build_hook_key_event(vk_code, scan_code, flags, down));
+    }
+
+    let extended = if matches!(raw_scan, 0x36 | 0x45) {
+        false
+    } else {
+        (flags & LLKHF_EXTENDED.0) != 0 || ((scan_code >> 8) & 0xFF) == 0xE0
+    };
+
+    Some(InputEvent::Key {
+        vk: 0,
+        scan: raw_scan,
+        extended,
+        down,
+    })
+}
+
+/// Bloquea en Windows local únicamente `KeyDown`; siempre deja pasar `KeyUp`, `CapsLock` y `NumLock` (regla RustDesk).
+pub(crate) fn should_block_locally(vk: u16, down: bool) -> bool {
+    if matches!(vk, VK_CAPITAL_U16 | VK_NUMLOCK_U16) {
+        return false;
+    }
+    down
 }
 
 /// Captura teclado hacia la PC remota únicamente cuando la ventana de RandyDesk es la ventana activa.
@@ -370,12 +491,14 @@ unsafe extern "system" fn low_level_kb_proc(
             && !can_capture
             && state.map_mode.load(Ordering::Relaxed)
             && down == Some(true)
-            && matches!(vk, 0x0D | 0x20)
         {
-            append_input_debug_log(&format!(
-                "[CLIENT-HOOK] map_skip vk=0x{vk:04X} fg_pid={fg_pid} focused={win_focused} own_pid={}",
-                state.own_pid
-            ));
+            let count = state.map_skip_logs.fetch_add(1, Ordering::Relaxed);
+            if count < 5 || count.is_multiple_of(10) || matches!(vk, 0x0D | 0x20) {
+                append_input_debug_log(&format!(
+                    "[CLIENT-HOOK] map_skip vk=0x{vk:04X} fg_pid={fg_pid} focused={win_focused} own_pid={}",
+                    state.own_pid
+                ));
+            }
         }
 
         // Limpia win_down SIEMPRE al soltar Win incluso si el foco salió de RandyDesk.
@@ -384,8 +507,15 @@ unsafe extern "system" fn low_level_kb_proc(
             if active && was_win_down {
                 if let Ok(guard) = state.tx.try_lock() {
                     if let Some(tx) = guard.as_ref() {
-                        let ev = build_hook_key_event(kb.vkCode, kb.scanCode, kb.flags.0, false);
-                        let _ = tx.try_send(NetCommand::Input(ev));
+                        let ev = if state.map_mode.load(Ordering::Relaxed) {
+                            build_map_key_event(kb.vkCode, kb.scanCode, kb.flags.0, false)
+                        } else {
+                            Some(build_hook_key_event(kb.vkCode, kb.scanCode, kb.flags.0, false))
+                        };
+                        if let Some(ev) = ev {
+                            track_pressed_key(state, &ev);
+                            let _ = tx.try_send(NetCommand::Input(ev));
+                        }
                     }
                 }
             }
@@ -394,39 +524,79 @@ unsafe extern "system" fn low_level_kb_proc(
         if can_capture {
             if let Some(down) = down {
                 let capture_all = state.map_mode.load(Ordering::Relaxed);
-                let intercept = if capture_all {
-                    if matches!(vk, VK_LWIN_U16 | VK_RWIN_U16) {
-                        state.win_down.store(down, Ordering::Relaxed);
-                    }
-                    true
-                } else {
-                    let win_was_down = state.win_down.load(Ordering::Relaxed);
-                    let alt_down = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0;
-                    let ctrl_down = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0;
-                    let (hit, new_win_down) =
-                        should_intercept_system_key(vk, down, win_was_down, alt_down, ctrl_down);
-                    state.win_down.store(new_win_down, Ordering::Relaxed);
-                    hit
-                };
-
-                if intercept {
-                    if let Ok(guard) = state.tx.try_lock() {
-                        if let Some(tx) = guard.as_ref() {
-                            let ev =
-                                build_hook_key_event(kb.vkCode, kb.scanCode, kb.flags.0, down);
-                            match tx.try_send(NetCommand::Input(ev)) {
-                                Ok(()) => {
-                                    state.sent_keys.fetch_add(1, Ordering::Relaxed);
-                                    append_input_debug_log(&format!(
-                                        "[CLIENT-HOOK] syskey vk=0x{vk:04X} scan=0x{:02X} down={down} capture_all={capture_all} -> sent=ok",
-                                        kb.scanCode & 0xFF
-                                    ));
-                                    return LRESULT(1);
+                if let Ok(guard) = state.tx.try_lock() {
+                    if let Some(tx) = guard.as_ref() {
+                        if capture_all {
+                            if matches!(vk, VK_LWIN_U16 | VK_RWIN_U16) {
+                                state.win_down.store(down, Ordering::Relaxed);
+                            }
+                            match build_map_key_event(kb.vkCode, kb.scanCode, kb.flags.0, down) {
+                                Some(ev) => {
+                                    let (ev_vk, ev_scan, ev_ext) = match ev {
+                                        InputEvent::Key {
+                                            vk,
+                                            scan,
+                                            extended,
+                                            ..
+                                        } => (vk, scan, extended),
+                                        _ => (0, 0, false),
+                                    };
+                                    match tx.try_send(NetCommand::Input(ev.clone())) {
+                                        Ok(()) => {
+                                            track_pressed_key(state, &ev);
+                                            state.sent_keys.fetch_add(1, Ordering::Relaxed);
+                                            append_input_debug_log(&format!(
+                                                "[CLIENT-HOOK] mapkey vk=0x{vk:04X} -> ev_vk=0x{ev_vk:04X} scan=0x{ev_scan:02X} ext={ev_ext} down={down} -> sent=ok"
+                                            ));
+                                            if should_block_locally(vk, down) {
+                                                return LRESULT(1);
+                                            }
+                                        }
+                                        Err(err) => {
+                                            append_input_debug_log(&format!(
+                                                "[CLIENT-HOOK] mapkey vk=0x{vk:04X} down={down} -> send_err={err}"
+                                            ));
+                                        }
+                                    }
                                 }
-                                Err(err) => {
-                                    append_input_debug_log(&format!(
-                                        "[CLIENT-HOOK] syskey vk=0x{vk:04X} down={down} -> send_err={err}"
-                                    ));
+                                None => {
+                                    if should_block_locally(vk, down) {
+                                        return LRESULT(1);
+                                    }
+                                }
+                            }
+                        } else {
+                            let win_was_down = state.win_down.load(Ordering::Relaxed);
+                            let alt_down = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0;
+                            let ctrl_down = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0;
+                            let (hit, new_win_down) = should_intercept_system_key(
+                                vk,
+                                down,
+                                win_was_down,
+                                alt_down,
+                                ctrl_down,
+                            );
+                            state.win_down.store(new_win_down, Ordering::Relaxed);
+                            if hit {
+                                let ev =
+                                    build_hook_key_event(kb.vkCode, kb.scanCode, kb.flags.0, down);
+                                match tx.try_send(NetCommand::Input(ev.clone())) {
+                                    Ok(()) => {
+                                        track_pressed_key(state, &ev);
+                                        state.sent_keys.fetch_add(1, Ordering::Relaxed);
+                                        append_input_debug_log(&format!(
+                                            "[CLIENT-HOOK] syskey vk=0x{vk:04X} scan=0x{:02X} down={down} -> sent=ok",
+                                            kb.scanCode & 0xFF
+                                        ));
+                                        if should_block_locally(vk, down) {
+                                            return LRESULT(1);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        append_input_debug_log(&format!(
+                                            "[CLIENT-HOOK] syskey vk=0x{vk:04X} down={down} -> send_err={err}"
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -620,5 +790,94 @@ mod tests {
         }
         assert_eq!(received, MODIFIER_VKS.len());
         guard.set_capture(false, None);
+    }
+
+    #[test]
+    fn map_mode_builds_pure_scancodes_and_filters_altgr_fake_ctrl() {
+        // Letra normal en Modo mapa -> vk=0, scan físico, sin extended
+        assert_eq!(
+            build_map_key_event(0x41, 0x1E, 0, true),
+            Some(InputEvent::Key {
+                vk: 0,
+                scan: 0x1E,
+                extended: false,
+                down: true,
+            })
+        );
+
+        // Win izquierdo extendido -> vk=0, scan=0x5B, extended=true
+        assert_eq!(
+            build_map_key_event(0x5B, 0x5B, LLKHF_EXTENDED.0, true),
+            Some(InputEvent::Key {
+                vk: 0,
+                scan: 0x5B,
+                extended: true,
+                down: true,
+            })
+        );
+
+        // Scan code sintético de AltGr (0x021D) debe descartarse (#1371) y luego RAlt (0xE038) sí pasa
+        assert_eq!(build_map_key_event(0xA2, 0x021D, 0, true), None);
+        assert_eq!(
+            build_map_key_event(0xA5, 0x38, LLKHF_EXTENDED.0, true),
+            Some(InputEvent::Key {
+                vk: 0,
+                scan: 0x38,
+                extended: true,
+                down: true,
+            })
+        );
+
+        // RShift (0x36) y NumLock (0x45) nunca deben marcarse extendidos
+        assert_eq!(
+            build_map_key_event(0xA1, 0x36, LLKHF_EXTENDED.0, true),
+            Some(InputEvent::Key {
+                vk: 0,
+                scan: 0x36,
+                extended: false,
+                down: true,
+            })
+        );
+        assert_eq!(
+            build_map_key_event(VK_NUMLOCK_U16 as u32, 0x45, LLKHF_EXTENDED.0, true),
+            Some(InputEvent::Key {
+                vk: 0,
+                scan: 0x45,
+                extended: false,
+                down: true,
+            })
+        );
+
+        // VK_PAUSE y VK_PACKET preservan su envío especial
+        assert_eq!(
+            build_map_key_event(VK_PAUSE_U16 as u32, 0x45, 0, true),
+            Some(InputEvent::Key {
+                vk: VK_PAUSE_U16,
+                scan: 0,
+                extended: false,
+                down: true,
+            })
+        );
+        assert_eq!(
+            build_map_key_event(VK_PACKET_U16 as u32, 'á' as u32, 0, true),
+            Some(InputEvent::Key {
+                vk: VK_PACKET_U16,
+                scan: 'á' as u16,
+                extended: false,
+                down: true,
+            })
+        );
+    }
+
+    #[test]
+    fn blocks_locally_only_on_keydown_and_allows_lock_keys() {
+        assert!(should_block_locally(0x41, true));
+        assert!(should_block_locally(VK_LWIN_U16, true));
+        assert!(!should_block_locally(0x41, false));
+        assert!(!should_block_locally(VK_LWIN_U16, false));
+        assert!(!should_block_locally(VK_CAPITAL_U16, true));
+        assert!(!should_block_locally(VK_CAPITAL_U16, false));
+        assert!(!should_block_locally(VK_NUMLOCK_U16, true));
+        assert!(!should_block_locally(VK_NUMLOCK_U16, false));
     }
 }

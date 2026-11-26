@@ -13,6 +13,7 @@ mod relay_client;
 mod session_bar;
 mod theme;
 mod tray;
+mod updater;
 mod win_hook;
 
 use anyhow::Result;
@@ -56,6 +57,22 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--uninstall-service") {
         init_logging();
         return randydesk_host::win_service::uninstall_service_now();
+    }
+
+    if args.iter().any(|a| a == "--apply-update") {
+        init_logging();
+        let target = arg_value(&args, "--target")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("falta --target en --apply-update"))?;
+        let wait_pid = arg_value(&args, "--wait-pid")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let reinstall_service = args.iter().any(|a| a == "--reinstall-service");
+        return updater::run_apply_update(&target, wait_pid, reinstall_service);
+    }
+
+    if let Some(cleanup_path) = arg_value(&args, "--cleanup-file") {
+        updater::run_cleanup_temp_file(PathBuf::from(cleanup_path));
     }
 
     rustls::crypto::ring::default_provider()
