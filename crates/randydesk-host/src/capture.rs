@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use windows::core::Interface;
 use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
@@ -63,6 +64,7 @@ pub trait ScreenCapturer: Send {
 
 /// Crea el mejor capturador disponible para `monitor_index`: intenta DXGI y cae a GDI si falla.
 pub fn create_capturer(monitor_index: usize) -> Result<Box<dyn ScreenCapturer>> {
+    let _ = crate::input::sync_thread_to_input_desktop();
     match DxgiCapturer::new(monitor_index) {
         Ok(dxgi) => {
             let dims = dxgi.dimensions();
@@ -114,6 +116,8 @@ pub struct DxgiCapturer {
     staging: Option<ID3D11Texture2D>,
     bgra: Vec<u8>,
     geometry: MonitorGeometry,
+    gdi_fallback: Option<GdiCapturer>,
+    last_dxgi_retry: Instant,
 }
 
 impl DxgiCapturer {
@@ -172,10 +176,13 @@ impl DxgiCapturer {
             staging: None,
             bgra: Vec::new(),
             geometry,
+            gdi_fallback: None,
+            last_dxgi_retry: Instant::now(),
         })
     }
 
     fn recreate_duplication(&mut self) -> Result<()> {
+        let _ = crate::input::sync_thread_to_input_desktop();
         self.staging = None;
         let dxgi_device: IDXGIDevice = self.device.cast()?;
         let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter()? };
@@ -252,6 +259,20 @@ impl DxgiCapturer {
 
 impl ScreenCapturer for DxgiCapturer {
     fn capture(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
+        if self.gdi_fallback.is_some() {
+            if self.last_dxgi_retry.elapsed() >= Duration::from_secs(1) {
+                self.last_dxgi_retry = Instant::now();
+                if self.recreate_duplication().is_ok() {
+                    info!("DXGI Desktop Duplication recuperado tras escritorio seguro");
+                    self.gdi_fallback = None;
+                } else if let Some(gdi) = self.gdi_fallback.as_mut() {
+                    return gdi.capture(timeout_ms);
+                }
+            } else if let Some(gdi) = self.gdi_fallback.as_mut() {
+                return gdi.capture(timeout_ms);
+            }
+        }
+
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
 
@@ -260,7 +281,13 @@ impl ScreenCapturer for DxgiCapturer {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                 warn!("DXGI_ERROR_ACCESS_LOST detectado; recreando duplicación");
-                self.recreate_duplication()?;
+                if self.recreate_duplication().is_err() {
+                    let mut gdi = GdiCapturer::new(self.monitor_index)?;
+                    let frame = gdi.capture(timeout_ms);
+                    self.gdi_fallback = Some(gdi);
+                    self.last_dxgi_retry = Instant::now();
+                    return frame;
+                }
                 return Ok(None);
             }
             Err(e) => return Err(e).context("error en AcquireNextFrame"),
@@ -370,6 +397,7 @@ impl GdiCapturer {
 
 impl ScreenCapturer for GdiCapturer {
     fn capture(&mut self, _timeout_ms: u32) -> Result<Option<CapturedFrame>> {
+        let _ = crate::input::sync_thread_to_input_desktop();
         let width = self.geometry.width;
         let height = self.geometry.height;
 

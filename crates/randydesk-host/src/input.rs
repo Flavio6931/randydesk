@@ -294,24 +294,30 @@ pub(crate) fn build_keybd_input(
 
 /// Adjunta el hilo dedicado al escritorio de entrada activo de Windows (`Default`, `Winlogon`, etc.) como hace RustDesk.
 fn ensure_input_desktop() {
+    let _ = sync_thread_to_input_desktop();
+}
+
+/// Sincroniza el hilo actual con el escritorio de entrada activo de Windows (`WinSta0\Default` o `Winlogon`).
+pub fn sync_thread_to_input_desktop() -> bool {
     unsafe {
         let Ok(input_desk) = OpenInputDesktop(
             DESKTOP_CONTROL_FLAGS(0),
             false,
             DESKTOP_ACCESS_FLAGS(DESKTOP_SWITCH_ACCESS),
         ) else {
-            return;
+            return false;
         };
         let Ok(current_desk) = GetThreadDesktop(GetCurrentThreadId()) else {
             let _ = CloseDesktop(input_desk);
-            return;
+            return false;
         };
 
         let same = desktop_name(current_desk) == desktop_name(input_desk);
         if !same && SetThreadDesktop(input_desk).is_ok() {
-            return;
+            return true;
         }
         let _ = CloseDesktop(input_desk);
+        same
     }
 }
 

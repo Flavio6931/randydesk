@@ -71,6 +71,7 @@ pub struct SessionBarActions {
     pub stream_scale_changed: bool,
     pub send_win_key: bool,
     pub send_task_manager: bool,
+    pub send_sas: bool,
     pub lock_remote_screen: bool,
     pub send_clipboard: bool,
     pub fetch_clipboard: bool,
@@ -345,11 +346,22 @@ pub fn render_session_overlay(
                                 });
 
                                 ui.menu_button("Códec", |ui| {
-                                    ui.set_min_width(185.0);
+                                    ui.set_min_width(215.0);
+                                    if ui
+                                        .selectable_label(
+                                            state.codec == CodecKind::H264,
+                                            "H.264 (Fluido / Bajo consumo)",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.codec = CodecKind::H264;
+                                        actions.settings_changed = true;
+                                        ui.close_menu();
+                                    }
                                     if ui
                                         .selectable_label(
                                             state.codec == CodecKind::Jpeg,
-                                            "Automático (JPEG)",
+                                            "Automático (JPEG por bloques)",
                                         )
                                         .clicked()
                                     {
@@ -406,13 +418,14 @@ pub fn render_session_overlay(
                                     actions.lock_remote_screen = true;
                                     ui.close_menu();
                                 }
-                                ui.add_enabled(
-                                    false,
-                                    egui::Button::new("Ctrl + Alt + Del (Requiere servicio SYSTEM)"),
-                                )
-                                .on_disabled_hover_text(
-                                    "Disponible en Fase 2 al instalar el servicio Windows SYSTEM.",
-                                );
+                                if ui
+                                    .button("Enviar Ctrl + Alt + Del (SAS)")
+                                    .on_hover_text("Requiere servicio SYSTEM activo en la PC remota")
+                                    .clicked()
+                                {
+                                    actions.send_sas = true;
+                                    ui.close_menu();
+                                }
                                 ui.separator();
                                 if ui.button("Enviar portapapeles").clicked() {
                                     actions.send_clipboard = true;
@@ -579,8 +592,14 @@ pub fn render_session_overlay(
                             .map(|r| format!("{r} ms"))
                             .unwrap_or_else(|| "-- ms".to_string());
                         let codec_str = match state.codec {
+                            CodecKind::H264 => "H.264".to_string(),
                             CodecKind::Jpeg => format!("JPEG {}%", state.quality),
                             CodecKind::Lz4Rgba => "LZ4 Nítido".to_string(),
+                        };
+                        let transport_suffix = if input.stats.transport_label.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" | {}", input.stats.transport_label)
                         };
                         let res_str = if state.stream_scale < 100 {
                             format!("{}x{} ({}%)", input.width, input.height, state.stream_scale)
@@ -598,7 +617,7 @@ pub fn render_session_overlay(
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "{codec_str} | {}",
+                                "{codec_str}{transport_suffix} | {}",
                                 format_duration(input.stats.elapsed_secs)
                             ))
                             .size(11.0)

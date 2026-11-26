@@ -1,6 +1,9 @@
-//! Decodificación incremental de bloques JPEG/LZ4 para actualización parcial de textura GPU.
+//! Decodificación incremental de bloques JPEG/LZ4 y stream H.264 (OpenH264) para textura GPU.
 
 use anyhow::{anyhow, Context, Result};
+use openh264::decoder::Decoder as OpenH264Decoder;
+use openh264::formats::YUVSource;
+use openh264::nal_units;
 use randydesk_proto::{CodecKind, EncodedTile, HostMsg};
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
@@ -25,8 +28,40 @@ pub struct FrameUpdate {
     pub tiles: Vec<DecodedTilePatch>,
 }
 
+/// Decodificador con estado de sesión que soporta JPEG, LZ4 y H.264 inter-frame.
+pub struct FrameDecoder {
+    h264: Option<OpenH264Decoder>,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameDecoder {
+    /// Crea un decodificador nuevo inicializando OpenH264 bajo demanda.
+    pub fn new() -> Self {
+        Self { h264: None }
+    }
+
+    /// Decodifica cualquier `HostMsg::VideoFrame` (JPEG, LZ4 o H.264 Annex-B).
+    pub fn decode(&mut self, msg: &HostMsg) -> Result<FrameUpdate> {
+        decode_frame_with(msg, Some(&mut self.h264))
+    }
+}
+
 /// Decodifica únicamente los tiles incluidos en `HostMsg::VideoFrame` validando sus límites.
+#[allow(dead_code)]
 pub fn decode_frame_update(msg: &HostMsg) -> Result<FrameUpdate> {
+    let mut temp_h264 = None;
+    decode_frame_with(msg, Some(&mut temp_h264))
+}
+
+fn decode_frame_with(
+    msg: &HostMsg,
+    mut h264_state: Option<&mut Option<OpenH264Decoder>>,
+) -> Result<FrameUpdate> {
     let HostMsg::VideoFrame {
         width,
         height,
@@ -44,7 +79,7 @@ pub fn decode_frame_update(msg: &HostMsg) -> Result<FrameUpdate> {
 
     let mut decoded_tiles = Vec::with_capacity(tiles.len());
     for tile in tiles {
-        if let Some(patch) = decode_tile(tile, *width, *height)? {
+        if let Some(patch) = decode_tile(tile, *width, *height, h264_state.as_deref_mut())? {
             decoded_tiles.push(patch);
         }
     }
@@ -61,6 +96,7 @@ fn decode_tile(
     tile: &EncodedTile,
     frame_width: u32,
     frame_height: u32,
+    h264_state: Option<&mut Option<OpenH264Decoder>>,
 ) -> Result<Option<DecodedTilePatch>> {
     if tile.width == 0 || tile.height == 0 {
         return Ok(None);
@@ -75,6 +111,32 @@ fn decode_tile(
         ));
     }
 
+    if tile.codec == CodecKind::H264 {
+        let holder = h264_state.ok_or_else(|| anyhow!("decodificador H.264 no disponible"))?;
+        if holder.is_none() {
+            let dec = OpenH264Decoder::new()
+                .map_err(|e| anyhow!("no se pudo inicializar OpenH264 decoder: {e}"))?;
+            *holder = Some(dec);
+        }
+        let dec = holder.as_mut().expect("decoder H.264 inicializado");
+        let mut last_img: Option<(u32, u32, Vec<u8>)> = None;
+        for nal in nal_units(&tile.data) {
+            if let Ok(Some(yuv)) = dec.decode(nal) {
+                let (w, h) = yuv.dimensions();
+                let mut rgba = vec![255u8; yuv.rgba8_len()];
+                yuv.write_rgba8(&mut rgba);
+                last_img = Some((w as u32, h as u32, rgba));
+            }
+        }
+        return Ok(last_img.map(|(w, h, rgba)| DecodedTilePatch {
+            x: tile.x,
+            y: tile.y,
+            width: w,
+            height: h,
+            rgba,
+        }));
+    }
+
     let mut rgba = match tile.codec {
         CodecKind::Jpeg => {
             let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
@@ -85,6 +147,7 @@ fn decode_tile(
         }
         CodecKind::Lz4Rgba => lz4_flex::decompress_size_prepended(&tile.data)
             .context("falló descompresión LZ4 de tile")?,
+        CodecKind::H264 => unreachable!(),
     };
 
     let expected_tile_bytes = (tile.width as usize) * (tile.height as usize) * 4;
@@ -124,6 +187,8 @@ fn decode_tile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use randydesk_host::h264_codec::H264FrameEncoder;
+    use randydesk_proto::StreamSettings;
 
     #[test]
     fn decodes_lz4_patch_without_full_framebuffer_copy() {
@@ -201,5 +266,27 @@ mod tests {
         assert_eq!(update.tiles.len(), 1);
         assert_eq!(update.tiles[0].rgba.len(), 16 * 16 * 4);
         assert!(update.tiles[0].rgba[0].abs_diff(128) <= 4);
+    }
+
+    #[test]
+    fn roundtrip_h264_encode_and_decode() {
+        let mut enc = H264FrameEncoder::new();
+        let mut dec = FrameDecoder::new();
+        let w = 128u32;
+        let h = 128u32;
+        let bgra = vec![200u8; (w * h * 4) as usize];
+        let settings = StreamSettings {
+            codec: CodecKind::H264,
+            jpeg_quality: 75,
+            target_fps: 30,
+        };
+        let msg = enc
+            .encode(&bgra, w, h, settings, 100, true)
+            .expect("encode")
+            .expect("frame");
+        let update = dec.decode(&msg).expect("decode H264");
+        assert_eq!((update.width, update.height), (128, 128));
+        assert_eq!(update.tiles.len(), 1);
+        assert_eq!(update.tiles[0].rgba.len(), (w * h * 4) as usize);
     }
 }

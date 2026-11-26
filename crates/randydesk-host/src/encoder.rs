@@ -283,7 +283,7 @@ impl TileEncoder {
 }
 
 /// Reduce un cuadro BGRA usando promedio 2x2 al 50% o punto fijo 16.16 para otros porcentajes.
-fn downscale_bgra(
+pub(crate) fn downscale_bgra(
     src: &[u8],
     src_w: u32,
     src_h: u32,
@@ -372,6 +372,9 @@ fn encode_tile_payload(
         CodecKind::Lz4Rgba => {
             Ok(encode_lz4_tile_into(bgra, stride, job.x, job.y, job.tw, job.th, rgba_scratch))
         }
+        CodecKind::H264 => Err(anyhow!(
+            "CodecKind::H264 debe codificarse mediante H264FrameEncoder"
+        )),
     }
 }
 

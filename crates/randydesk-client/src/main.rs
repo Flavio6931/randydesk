@@ -1,4 +1,4 @@
-//! Punto de entrada unificado de RandyDesk (bandeja del sistema + hook Win + Relay E2E).
+//! Punto de entrada unificado de RandyDesk (GUI, servicio Windows SYSTEM, worker e instalador CLI).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -18,22 +18,63 @@ mod win_hook;
 use anyhow::Result;
 use app::RandyDeskApp;
 use eframe::egui;
+use std::path::PathBuf;
 
-fn main() -> Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| anyhow::anyhow!("no se pudo instalar el proveedor criptográfico ring"))?;
-
-    tracing_subscriber::fmt()
+fn init_logging() {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .init();
+        .try_init();
+}
+
+fn arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--service") {
+        init_logging();
+        return randydesk_host::win_service::run_windows_service();
+    }
+
+    if args.iter().any(|a| a == "--install-service") {
+        init_logging();
+        let host_id = arg_value(&args, "--host-id");
+        let source_dir = arg_value(&args, "--source-dir").map(PathBuf::from);
+        return randydesk_host::win_service::install_service_now(
+            host_id.as_deref(),
+            source_dir.as_deref(),
+        );
+    }
+
+    if args.iter().any(|a| a == "--uninstall-service") {
+        init_logging();
+        return randydesk_host::win_service::uninstall_service_now();
+    }
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("no se pudo instalar el proveedor criptográfico ring"))?;
+
+    init_logging();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+
+    if args.iter().any(|a| a == "--host-worker") {
+        return randydesk_host::win_service::run_host_worker(
+            runtime.handle(),
+            env!("CARGO_PKG_VERSION"),
+        );
+    }
+
     let rt_handle = runtime.handle().clone();
 
     let options = eframe::NativeOptions {

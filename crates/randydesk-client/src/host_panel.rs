@@ -5,7 +5,13 @@ use crate::theme::{ACCENT_BLUE, ACCENT_TEAL, STATUS_ORANGE, TEXT_MUTED};
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use randydesk_host::service::{HostRuntimeInfo, HostService};
+use randydesk_host::win_service::{
+    query_service_status, read_service_runtime_state, request_install_service_elevated,
+    request_uninstall_service_elevated, save_service_config, ServiceConfig, ServiceRuntimeState,
+    ServiceStatusKind,
+};
 use randydesk_proto::{format_host_id, StreamSettings, DEFAULT_PORT};
+use std::time::{Duration, Instant};
 
 /// Estado del servidor host embebido dentro de la aplicación gráfica.
 pub struct HostPanelState {
@@ -17,12 +23,21 @@ pub struct HostPanelState {
     editing_password: bool,
     monitor_index: usize,
     status_msg: Option<String>,
+    last_svc_poll: Instant,
+    cached_svc_status: ServiceStatusKind,
+    cached_svc_state: Option<ServiceRuntimeState>,
 }
 
 impl HostPanelState {
-    /// Crea el estado e inicia automáticamente la escucha LAN + registro Relay sin contraseña obligatoria.
+    /// Crea el estado; si el servicio `SYSTEM` ya corre en segundo plano, cede el puerto al servicio.
     pub fn new(rt_handle: &tokio::runtime::Handle, relay_url: Option<String>) -> Self {
         let initial_pwd = std::env::var("RANDYDESK_PASSWORD").unwrap_or_default();
+        let svc_status = query_service_status();
+        let svc_state = if svc_status == ServiceStatusKind::Running {
+            read_service_runtime_state()
+        } else {
+            None
+        };
 
         let mut state = Self {
             service: None,
@@ -33,20 +48,58 @@ impl HostPanelState {
             editing_password: false,
             monitor_index: 0,
             status_msg: None,
+            last_svc_poll: Instant::now(),
+            cached_svc_status: svc_status,
+            cached_svc_state: svc_state,
         };
-        state.start_host(rt_handle);
+        if svc_status != ServiceStatusKind::Running {
+            state.start_host(rt_handle);
+        }
         state
     }
 
-    /// Actualiza la URL del servidor Relay y reinicia el servicio host.
+    fn refresh_service_cache(&mut self, rt_handle: &tokio::runtime::Handle, force: bool) {
+        if !force && self.last_svc_poll.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_svc_poll = Instant::now();
+        let status = query_service_status();
+        self.cached_svc_status = status;
+        self.cached_svc_state = if status == ServiceStatusKind::Running {
+            self.stop_host();
+            read_service_runtime_state()
+        } else {
+            if self.service.is_none() {
+                self.start_host(rt_handle);
+            }
+            None
+        };
+    }
+
+    /// Actualiza la URL del servidor Relay y reinicia el servicio host (o guarda `ServiceConfig`).
     pub fn set_relay_url(&mut self, relay_url: Option<String>, rt_handle: &tokio::runtime::Handle) {
-        self.relay_url = relay_url;
+        self.relay_url = relay_url.clone();
+        if self.cached_svc_status == ServiceStatusKind::Running {
+            let _ = save_service_config(&ServiceConfig {
+                port: self.port,
+                password: self.password.clone(),
+                relay_url,
+                monitor: self.monitor_index,
+            });
+            self.status_msg = Some("Configuración guardada para el servicio SYSTEM.".into());
+            return;
+        }
         self.start_host(rt_handle);
     }
 
     /// Inicia o reinicia el servicio host con el puerto, contraseña (opcional) y Relay actuales.
     pub fn start_host(&mut self, rt_handle: &tokio::runtime::Handle) {
         self.stop_host();
+        if query_service_status() == ServiceStatusKind::Running {
+            self.cached_svc_status = ServiceStatusKind::Running;
+            self.cached_svc_state = read_service_runtime_state();
+            return;
+        }
         match HostService::start(
             rt_handle,
             self.port,
@@ -73,13 +126,31 @@ impl HostPanelState {
         }
     }
 
-    /// Devuelve un resumen vivo del servicio para la barra inferior de estado.
+    /// Devuelve un resumen vivo del servicio (propio o de `RandyDeskService`) para la barra inferior.
     pub fn runtime_info(&self) -> Option<HostRuntimeInfo> {
+        if let Some(ref s) = self.cached_svc_state {
+            return Some(HostRuntimeInfo {
+                running: true,
+                host_id: s.host_id.clone(),
+                port: s.port,
+                lan_ip: s.lan_ip.clone(),
+                tailscale_ip: s.tailscale_ip.clone(),
+                relay_url: s.relay_url.clone(),
+                relay_connected: s.relay_connected,
+                fingerprint_sha256: s.fingerprint_sha256.clone(),
+                active_clients: s.active_clients,
+                is_elevated: true,
+                is_system: s.running_as_system,
+                uipi_warning: false,
+            });
+        }
         self.service.as_ref().map(|s| s.info())
     }
 
     /// Dibuja la barra lateral minimalista "Tu escritorio".
     pub fn ui(&mut self, ui: &mut egui::Ui, rt_handle: &tokio::runtime::Handle) {
+        self.refresh_service_cache(rt_handle, false);
+
         ui.add_space(10.0);
         ui.label(egui::RichText::new("Tu escritorio").size(16.0).strong());
         ui.label(
@@ -89,7 +160,7 @@ impl HostPanelState {
         );
         ui.add_space(16.0);
 
-        let info = self.service.as_ref().map(|s| s.info());
+        let info = self.runtime_info();
         let is_running = info.as_ref().is_some_and(|i| i.running);
 
         // Bloque único principal: Tu ID + menú avanzado "..."
@@ -249,29 +320,106 @@ impl HostPanelState {
                 }
 
                 ui.add_space(6.0);
-                if i.is_elevated {
+                if self.cached_svc_status == ServiceStatusKind::Running {
                     ui.horizontal(|ui| {
                         let (dot_rect, _) =
                             ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                         ui.painter().circle_filled(dot_rect.center(), 3.5, ACCENT_TEAL);
                         ui.label(
-                            egui::RichText::new("Modo Administrador activo")
+                            egui::RichText::new("Servicio SYSTEM activo (Control total)")
                                 .size(11.0)
                                 .color(ACCENT_TEAL),
                         );
                     });
+                    if let Some(ref svc_state) = self.cached_svc_state {
+                        if svc_state.version != env!("CARGO_PKG_VERSION")
+                            && ui
+                                .small_button("Actualizar servicio SYSTEM")
+                                .on_hover_text("Actualiza el servicio instalado a esta versión")
+                                .clicked()
+                        {
+                            match request_install_service_elevated(
+                                &i.host_id,
+                                self.port,
+                                &self.password,
+                                self.relay_url.as_deref(),
+                            ) {
+                                Ok(()) => {
+                                    self.status_msg = Some("Actualizando servicio SYSTEM...".into());
+                                    self.last_svc_poll = Instant::now() - Duration::from_secs(2);
+                                }
+                                Err(err) => self.status_msg = Some(format!("{err}")),
+                            }
+                        }
+                    }
+                    if ui
+                        .small_button("Desinstalar servicio")
+                        .on_hover_text("Detiene y elimina RandyDeskService de Windows")
+                        .clicked()
+                    {
+                        match request_uninstall_service_elevated() {
+                            Ok(()) => {
+                                self.status_msg = Some("Desinstalando servicio SYSTEM...".into());
+                                self.last_svc_poll = Instant::now() - Duration::from_secs(2);
+                            }
+                            Err(err) => self.status_msg = Some(format!("{err}")),
+                        }
+                    }
                 } else {
-                    if i.uipi_warning {
+                    if i.is_elevated {
+                        ui.horizontal(|ui| {
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot_rect.center(), 3.5, ACCENT_TEAL);
+                            ui.label(
+                                egui::RichText::new("Modo Administrador activo")
+                                    .size(11.0)
+                                    .color(ACCENT_TEAL),
+                            );
+                        });
+                    } else if i.uipi_warning {
                         ui.label(
-                            egui::RichText::new("Ventana Admin detectada: eleva permisos para controlarla")
+                            egui::RichText::new("Ventana Admin detectada: instala servicio SYSTEM")
                                 .size(10.5)
                                 .color(STATUS_ORANGE),
                         );
                     }
+
                     if ui
-                        .small_button("Ejecutar como Admin")
-                        .on_hover_text("Necesario si en esta PC controlas ventanas elevadas (SSMS, Terminal Admin, UAC)")
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Instalar servicio (SYSTEM)")
+                                    .size(11.5)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(ACCENT_BLUE),
+                        )
+                        .on_hover_text(
+                            "Instala RandyDeskService como NT AUTHORITY\\SYSTEM: control total sobre UAC, pantalla de bloqueo, Ctrl+Alt+Del y apps Admin",
+                        )
                         .clicked()
+                    {
+                        match request_install_service_elevated(
+                            &i.host_id,
+                            self.port,
+                            &self.password,
+                            self.relay_url.as_deref(),
+                        ) {
+                            Ok(()) => {
+                                self.stop_host();
+                                self.status_msg =
+                                    Some("Instalando e iniciando servicio SYSTEM...".into());
+                                self.last_svc_poll = Instant::now() - Duration::from_secs(2);
+                            }
+                            Err(err) => self.status_msg = Some(format!("{err}")),
+                        }
+                    }
+
+                    if !i.is_elevated
+                        && ui
+                            .small_button("Ejecutar solo esta vez como Admin")
+                            .on_hover_text("Alternativa temporal sin instalar servicio permanente")
+                            .clicked()
                     {
                         match randydesk_host::input::relaunch_as_admin() {
                             Ok(()) => std::process::exit(0),

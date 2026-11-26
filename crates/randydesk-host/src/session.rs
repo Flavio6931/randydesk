@@ -3,12 +3,13 @@
 use crate::capture::{MonitorGeometry, ScreenCapturer};
 use crate::clipboard;
 use crate::encoder::TileEncoder;
+use crate::h264_codec::H264FrameEncoder;
 use crate::input;
 use anyhow::{anyhow, Context, Result};
 use quinn::{Connection, Endpoint};
 use randydesk_proto::{
-    generate_nonce, read_msg, verify_proof, write_msg, ClientMsg, HostMsg, StreamSettings,
-    PROTOCOL_VERSION,
+    generate_nonce, read_msg, verify_proof, write_msg, ClientMsg, CodecKind, HostMsg,
+    StreamSettings, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -83,6 +84,14 @@ impl LatestFrameSlot {
         self.notify.notify_waiters();
     }
 
+    /// Indica si ya hay un cuadro esperando ser enviado por la red.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
     fn take_pending(&self) -> Option<HostMsg> {
         let mut guard = match self.pending.lock() {
             Ok(g) => g,
@@ -120,7 +129,9 @@ fn merge_video_frames(prev: HostMsg, next: &mut HostMsg) {
         *next_full = true;
     }
 
-    if prev_w != *next_w || prev_h != *next_h || next_was_full {
+    let uses_h264 = prev_tiles.iter().any(|t| t.codec == CodecKind::H264)
+        || next_tiles.iter().any(|t| t.codec == CodecKind::H264);
+    if prev_w != *next_w || prev_h != *next_h || next_was_full || uses_h264 {
         return;
     }
 
@@ -147,6 +158,7 @@ pub struct HostServerConfig {
     pub default_settings: StreamSettings,
     pub capturer_factory: CapturerFactory,
     pub active_clients: Arc<AtomicUsize>,
+    pub direct_endpoints: Vec<String>,
 }
 
 /// Guardia RAII para llevar el conteo exacto de sesiones activas en curso.
@@ -198,7 +210,8 @@ pub async fn handle_connection(conn: Connection, cfg: HostServerConfig) -> Resul
 
     // 1. Saludo inicial del cliente
     match read_msg::<_, ClientMsg>(&mut ctrl_recv).await? {
-        ClientMsg::Hello { version } if version == PROTOCOL_VERSION => {}
+        ClientMsg::Hello { version }
+            if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) => {}
         ClientMsg::Hello { version } => {
             let _ = write_msg(
                 &mut ctrl_send,
@@ -345,6 +358,9 @@ async fn run_session_loops(
                     Ok(ClientMsg::LockWorkStation) => {
                         let _ = crate::power::lock_workstation();
                     }
+                    Ok(ClientMsg::SendSas) => {
+                        let _ = crate::power::send_sas();
+                    }
                     Ok(ClientMsg::RequestKeyframe) => {
                         force_keyframe.store(true, Ordering::Relaxed);
                     }
@@ -403,6 +419,8 @@ pub(crate) fn spawn_capture_worker(
     std::thread::spawn(move || {
         let _slot_guard = SlotCloseGuard(Arc::clone(&frame_slot));
         let mut encoder = TileEncoder::new();
+        let mut h264_encoder: Option<H264FrameEncoder> = None;
+        let mut prev_codec = StreamSettings::default().codec;
         let mut last_awake = Instant::now() - Duration::from_secs(60);
         while !stop_flag.load(Ordering::Relaxed) {
             if last_awake.elapsed() >= Duration::from_secs(30) {
@@ -413,16 +431,49 @@ pub(crate) fn spawn_capture_worker(
                 .lock()
                 .map(|s| *s)
                 .unwrap_or_default();
+            if settings.codec != prev_codec {
+                force_keyframe.store(true, Ordering::Relaxed);
+                if settings.codec == CodecKind::H264 {
+                    if let Some(h264) = h264_encoder.as_mut() {
+                        h264.invalidate();
+                    }
+                } else {
+                    encoder.invalidate();
+                }
+                prev_codec = settings.codec;
+            }
+
             let scale = scale_percent.load(Ordering::Relaxed);
             let fps = settings.target_fps.clamp(5, 60) as u64;
             let frame_budget = Duration::from_millis(1000 / fps);
             let started = Instant::now();
 
+            if settings.codec == CodecKind::H264
+                && frame_slot.has_pending()
+                && !force_keyframe.load(Ordering::Relaxed)
+            {
+                std::thread::sleep(frame_budget.min(Duration::from_millis(20)));
+                continue;
+            }
+
             let timeout_ms = frame_budget.as_millis().min(100) as u32;
             match capturer.capture(timeout_ms) {
                 Ok(Some(captured)) => {
                     let keyframe = force_keyframe.swap(false, Ordering::Relaxed);
-                    match encoder.encode_scaled(&captured, settings, scale, keyframe) {
+                    let encode_res = if settings.codec == CodecKind::H264 {
+                        let h264 = h264_encoder.get_or_insert_with(H264FrameEncoder::new);
+                        h264.encode(
+                            &captured.bgra,
+                            captured.width,
+                            captured.height,
+                            settings,
+                            scale,
+                            keyframe,
+                        )
+                    } else {
+                        encoder.encode_scaled(&captured, settings, scale, keyframe)
+                    };
+                    match encode_res {
                         Ok(Some(msg)) => {
                             if !frame_slot.push(msg) {
                                 break;
@@ -434,9 +485,15 @@ pub(crate) fn spawn_capture_worker(
                     capturer.recycle_buffer(captured.bgra);
                 }
                 Ok(None) => {
-                    // Si el cliente pidió keyframe con pantalla estática, forzamos esperar o invalidar.
+                    // Si el cliente pidió keyframe con pantalla estática, forzamos invalidación.
                     if force_keyframe.load(Ordering::Relaxed) {
-                        encoder.invalidate();
+                        if settings.codec == CodecKind::H264 {
+                            if let Some(h264) = h264_encoder.as_mut() {
+                                h264.invalidate();
+                            }
+                        } else {
+                            encoder.invalidate();
+                        }
                     }
                 }
                 Err(err) => {

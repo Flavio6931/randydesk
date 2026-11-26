@@ -10,6 +10,8 @@ pub enum CodecKind {
     Jpeg,
     /// Compresión LZ4 sobre RGBA sin pérdida (ideal para texto y código nítido).
     Lz4Rgba,
+    /// Compresión de video H.264 inter-frame (OpenH264 Annex-B, ideal para alta fluidez y bajo bitrate).
+    H264,
 }
 
 /// Preferencias dinámicas de transmisión de video solicitadas por el cliente.
@@ -106,6 +108,8 @@ pub enum ClientMsg {
     SetStreamScale(u8),
     /// Bloquea la sesión de Windows en el equipo remoto (`LockWorkStation`).
     LockWorkStation,
+    /// Envía la secuencia de atención segura (`Ctrl+Alt+Del`) mediante `SendSAS` del servicio `SYSTEM`.
+    SendSas,
 }
 
 /// Mensajes enviados por el host remoto hacia el cliente visor.
@@ -136,6 +140,8 @@ pub enum HostMsg {
     ClipboardData(String),
     /// Respuesta al latido `Ping` para calcular RTT.
     Pong(u64),
+    /// Lista de endpoints directos LAN/Tailscale (`ip:puerto`) del host para promover sesión Relay a QUIC directo.
+    DirectEndpoints(Vec<String>),
 }
 
 #[cfg(test)]
@@ -170,10 +176,37 @@ mod tests {
         let decoded_h: HostMsg = bincode::deserialize(&encoded_h).expect("deserialización host");
         assert_eq!(host_msg, decoded_h);
 
-        for extra in [ClientMsg::SetStreamScale(75), ClientMsg::LockWorkStation] {
+        for extra in [
+            ClientMsg::SetStreamScale(75),
+            ClientMsg::LockWorkStation,
+            ClientMsg::SendSas,
+        ] {
             let bytes = bincode::serialize(&extra).expect("serialización comando");
             let back: ClientMsg = bincode::deserialize(&bytes).expect("deserialización comando");
             assert_eq!(extra, back);
         }
+
+        let h264_msg = HostMsg::VideoFrame {
+            frame_id: 100,
+            width: 1280,
+            height: 720,
+            full_refresh: true,
+            tiles: vec![EncodedTile {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720,
+                codec: CodecKind::H264,
+                data: vec![0, 0, 0, 1, 0x67],
+            }],
+        };
+        let encoded_h264 = bincode::serialize(&h264_msg).expect("serialización h264");
+        let decoded_h264: HostMsg = bincode::deserialize(&encoded_h264).expect("deserialización h264");
+        assert_eq!(h264_msg, decoded_h264);
+
+        let endpoints = HostMsg::DirectEndpoints(vec!["192.168.1.50:21118".to_string()]);
+        let enc_ep = bincode::serialize(&endpoints).expect("serialización endpoints");
+        let dec_ep: HostMsg = bincode::deserialize(&enc_ep).expect("deserialización endpoints");
+        assert_eq!(endpoints, dec_ep);
     }
 }

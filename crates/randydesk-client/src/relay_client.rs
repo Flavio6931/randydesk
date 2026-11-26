@@ -1,14 +1,16 @@
 //! Sesión remota de cliente a través del servidor Relay E2E con `TCP_NODELAY` y `ws.split()`.
 
-use crate::decoder::decode_frame_update;
+use crate::decoder::FrameDecoder;
 use crate::net::{
-    push_frame_update, ConnectRequest, ConnectionState, NetCommand, SessionExit, SharedSessionState,
+    probe_direct_quic, push_frame_update, ConnectRequest, ConnectionState, NetCommand, SessionExit,
+    SharedSessionState,
 };
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
 use randydesk_proto::{
-    compute_proof, ClientMsg, E2eCipher, E2eKeypair, HostMsg, PROTOCOL_VERSION,
+    compute_proof, ClientMsg, E2eCipher, E2eKeypair, HostMsg, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -85,7 +87,7 @@ pub async fn run_relay_session(
             width,
             height,
         } => {
-            if version != PROTOCOL_VERSION {
+            if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
                 return Ok(SessionExit::AuthFailed(format!(
                     "Versión incompatible del equipo remoto: {version}"
                 )));
@@ -122,9 +124,14 @@ pub async fn run_relay_session(
             width,
             height,
         };
+        guard.stats.transport_label = "Relay E2E".to_string();
     }
     ctx.request_repaint();
     info!("Sesión Relay E2E autenticada con ID {target_id}");
+
+    let mut frame_decoder = FrameDecoder::new();
+    let (direct_tx, mut direct_rx) = mpsc::channel::<String>(1);
+    let mut direct_probe_started = false;
 
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (mut enc, mut dec) = cipher.split();
@@ -185,6 +192,9 @@ pub async fn run_relay_session(
                     Some(NetCommand::LockWorkStation) => {
                         let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::LockWorkStation)).await;
                     }
+                    Some(NetCommand::SendSas) => {
+                        let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::SendSas)).await;
+                    }
                     Some(NetCommand::RequestKeyframe) => {
                         let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::RequestKeyframe)).await;
                     }
@@ -221,11 +231,23 @@ pub async fn run_relay_session(
                                 }
                                 ctx.request_repaint();
                             }
+                            HostMsg::DirectEndpoints(candidates)
+                                if !direct_probe_started && !candidates.is_empty() =>
+                            {
+                                direct_probe_started = true;
+                                let tx_probe = direct_tx.clone();
+                                let expected_fp = req.expected_fingerprint.clone();
+                                tokio::spawn(async move {
+                                    if let Some(addr) = probe_direct_quic(&candidates, expected_fp).await {
+                                        let _ = tx_probe.send(addr).await;
+                                    }
+                                });
+                            }
                             video @ HostMsg::VideoFrame { .. } => {
                                 if let HostMsg::VideoFrame { tiles, .. } = &video {
                                     bytes_in_window += tiles.iter().map(|t| t.data.len()).sum::<usize>();
                                 }
-                                let update = decode_frame_update(&video)?;
+                                let update = frame_decoder.decode(&video)?;
                                 frames_in_window += 1;
 
                                 let elapsed_win = stat_window_start.elapsed().as_secs_f32();
@@ -254,6 +276,11 @@ pub async fn run_relay_session(
                     Some(Err(err)) => break Err(anyhow!("error WS Relay cliente: {err}")),
                     _ => {}
                 }
+            }
+            Some(direct_addr) = direct_rx.recv() => {
+                let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::Disconnect)).await;
+                let _ = out_tx.send(OutboundClientItem::Close).await;
+                break Ok(SessionExit::SwitchToDirect(direct_addr));
             }
             _ = ping_ticker.tick() => {
                 let now_ms = session_start.elapsed().as_millis() as u64;

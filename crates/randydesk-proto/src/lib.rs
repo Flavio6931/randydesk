@@ -25,7 +25,10 @@ pub const DEFAULT_RELAY_PORT: u16 = 21119;
 pub const DEFAULT_RELAY_URL: &str = "wss://randydesk-relay.onrender.com";
 
 /// Versión actual del protocolo de comunicación.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// Versión mínima compatible del protocolo para interoperar con versiones `v0.4.x`.
+pub const MIN_PROTOCOL_VERSION: u16 = 1;
 
 /// Límite máximo permitido por mensaje serializado (32 MiB) para evitar ataques OOM.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;

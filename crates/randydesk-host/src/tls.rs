@@ -1,7 +1,6 @@
 //! Gestión de identidad TLS 1.3 del host y configuración QUIC optimizada para sesiones largas.
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -96,7 +95,5 @@ pub fn format_sha256_fingerprint(cert_der: &[u8]) -> String {
 }
 
 fn identity_dir() -> Result<PathBuf> {
-    let proj = ProjectDirs::from("com", "RandyDesk", "RandyDesk")
-        .context("no se pudo resolver el directorio de datos de usuario")?;
-    Ok(proj.config_dir().to_path_buf())
+    Ok(crate::win_service::shared_host_data_dir())
 }

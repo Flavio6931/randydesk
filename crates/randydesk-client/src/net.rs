@@ -1,12 +1,12 @@
 //! Cliente QUIC con verificación TLS TOFU, keep-alive para sesiones largas y reconexión automática.
 
-use crate::decoder::{decode_frame_update, FrameUpdate};
+use crate::decoder::{FrameDecoder, FrameUpdate};
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use quinn::{ClientConfig, Endpoint, TransportConfig, VarInt};
 use randydesk_proto::{
     compute_proof, parse_numeric_id, read_msg, write_msg, ClientMsg, HostMsg, InputEvent,
-    StreamSettings, PROTOCOL_VERSION,
+    StreamSettings, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -39,6 +39,7 @@ pub enum NetCommand {
     UpdateSettings(StreamSettings),
     SetStreamScale(u8),
     LockWorkStation,
+    SendSas,
     RequestKeyframe,
     ClipboardSet(String),
     ClipboardGet,
@@ -63,6 +64,7 @@ pub struct SessionStats {
     pub rtt_ms: Option<u64>,
     pub elapsed_secs: u64,
     pub fingerprint_sha256: Option<String>,
+    pub transport_label: String,
 }
 
 /// Estado compartido entre el runtime Tokio y el hilo de renderizado `eframe`.
@@ -198,7 +200,7 @@ impl NetworkHandle {
 
         let handle = self
             .rt_handle
-            .spawn(session_supervisor(req, cmd_rx, shared, ctx));
+            .spawn(async move { session_supervisor(req, cmd_rx, &shared, &ctx).await });
         self.active_task = Some(handle);
     }
 
@@ -244,18 +246,26 @@ impl NetworkHandle {
 async fn session_supervisor(
     mut req: ConnectRequest,
     mut cmd_rx: mpsc::Receiver<NetCommand>,
-    shared: Arc<Mutex<SharedSessionState>>,
-    ctx: egui::Context,
+    shared: &Arc<Mutex<SharedSessionState>>,
+    ctx: &egui::Context,
 ) {
     let mut attempt: u32 = 0;
     let session_start = Instant::now();
+    let original_address = req.address.clone();
+    let mut direct_override: Option<String> = None;
 
     loop {
+        if let Some(ref direct) = direct_override {
+            req.address = direct.clone();
+        } else {
+            req.address = original_address.clone();
+        }
+
         let res = run_single_session(
             &mut req,
             &mut cmd_rx,
-            &shared,
-            &ctx,
+            shared,
+            ctx,
             session_start,
         )
         .await;
@@ -268,6 +278,12 @@ async fn session_supervisor(
                 ctx.request_repaint();
                 break;
             }
+            Ok(SessionExit::SwitchToDirect(direct_addr)) => {
+                info!("Promoviendo sesión Relay a QUIC directo en {direct_addr}");
+                direct_override = Some(direct_addr);
+                attempt = 0;
+                continue;
+            }
             Ok(SessionExit::AuthFailed(reason)) => {
                 if let Ok(mut guard) = shared.lock() {
                     guard.status = ConnectionState::Error(reason);
@@ -276,6 +292,11 @@ async fn session_supervisor(
                 break;
             }
             Err(err) => {
+                if direct_override.take().is_some() {
+                    warn!("Ruta directa QUIC caída ({err:#}); regresando a Relay automático");
+                    attempt = 0;
+                    continue;
+                }
                 attempt += 1;
                 let backoff_secs = match attempt {
                     1 => 1,
@@ -317,6 +338,68 @@ async fn session_supervisor(
 pub(crate) enum SessionExit {
     UserRequested,
     AuthFailed(String),
+    SwitchToDirect(String),
+}
+
+fn build_quic_client_config(
+    expected_fingerprint: Option<String>,
+    observed_fp: Arc<Mutex<Option<String>>>,
+) -> Result<ClientConfig> {
+    let verifier = Arc::new(TofuCertVerifier {
+        expected_fingerprint,
+        observed_fingerprint: observed_fp,
+    });
+
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
+    let mut client_cfg = ClientConfig::new(Arc::new(quic_crypto));
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
+    transport.receive_window(VarInt::from_u32(8 * 1024 * 1024));
+    transport.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
+    client_cfg.transport_config(Arc::new(transport));
+    Ok(client_cfg)
+}
+
+/// Prueba en paralelo rutas directas LAN/Tailscale anunciadas por el host y devuelve la primera alcanzable.
+pub(crate) async fn probe_direct_quic(
+    candidates: &[String],
+    expected_fingerprint: Option<String>,
+) -> Option<String> {
+    for raw in candidates {
+        let Ok(addr) = raw.parse::<SocketAddr>() else {
+            continue;
+        };
+        if addr.ip().is_loopback() {
+            continue;
+        }
+        let observed = Arc::new(Mutex::new(None));
+        let Ok(client_cfg) = build_quic_client_config(expected_fingerprint.clone(), observed) else {
+            continue;
+        };
+        let bind_addr = match addr {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
+        };
+        let Ok(mut ep) = Endpoint::client(bind_addr) else {
+            continue;
+        };
+        ep.set_default_client_config(client_cfg);
+        let Ok(connecting) = ep.connect(addr, "randydesk.local") else {
+            continue;
+        };
+        if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_millis(1400), connecting).await {
+            conn.close(0u32.into(), b"probe");
+            return Some(raw.clone());
+        }
+    }
+    None
 }
 
 async fn run_single_session(
@@ -351,25 +434,10 @@ async fn run_single_session(
         .ok_or_else(|| anyhow!("dirección sin resultados DNS: {}", req.address))?;
 
     let observed_fp = Arc::new(Mutex::new(None));
-    let verifier = Arc::new(TofuCertVerifier {
-        expected_fingerprint: req.expected_fingerprint.clone(),
-        observed_fingerprint: Arc::clone(&observed_fp),
-    });
-
-    let mut tls = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
-
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
-    let mut client_cfg = ClientConfig::new(Arc::new(quic_crypto));
-    let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(5)));
-    transport.max_idle_timeout(Some(VarInt::from_u32(60_000).into()));
-    transport.receive_window(VarInt::from_u32(8 * 1024 * 1024));
-    transport.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
-    client_cfg.transport_config(Arc::new(transport));
+    let client_cfg = build_quic_client_config(
+        req.expected_fingerprint.clone(),
+        Arc::clone(&observed_fp),
+    )?;
 
     let bind_addr = match addr {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -412,7 +480,7 @@ async fn run_single_session(
             width,
             height,
         } => {
-            if version != PROTOCOL_VERSION {
+            if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
                 return Ok(SessionExit::AuthFailed(format!(
                     "Versión incompatible del host: {version}"
                 )));
@@ -456,10 +524,12 @@ async fn run_single_session(
             height,
         };
         guard.stats.fingerprint_sha256 = fingerprint;
+        guard.stats.transport_label = "QUIC directo".to_string();
     }
     ctx.request_repaint();
     info!("Sesión QUIC autenticada con {}", req.address);
 
+    let mut frame_decoder = FrameDecoder::new();
     let mut ping_ticker = tokio::time::interval(Duration::from_secs(2));
     let mut stat_window_start = Instant::now();
     let mut frames_in_window: u32 = 0;
@@ -484,6 +554,9 @@ async fn run_single_session(
                     }
                     Some(NetCommand::LockWorkStation) => {
                         write_msg(&mut ctrl_send, &ClientMsg::LockWorkStation).await?;
+                    }
+                    Some(NetCommand::SendSas) => {
+                        write_msg(&mut ctrl_send, &ClientMsg::SendSas).await?;
                     }
                     Some(NetCommand::RequestKeyframe) => {
                         write_msg(&mut ctrl_send, &ClientMsg::RequestKeyframe).await?;
@@ -526,7 +599,7 @@ async fn run_single_session(
                 if let HostMsg::VideoFrame { tiles, .. } = &msg {
                     bytes_in_window += tiles.iter().map(|t| t.data.len()).sum::<usize>();
                 }
-                let update = decode_frame_update(&msg)?;
+                let update = frame_decoder.decode(&msg)?;
                 frames_in_window += 1;
 
                 let elapsed_win = stat_window_start.elapsed().as_secs_f32();

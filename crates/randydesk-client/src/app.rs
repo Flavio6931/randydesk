@@ -492,7 +492,9 @@ impl RandyDeskApp {
                     let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
 
-                    let state_txt = if relay_ok {
+                    let state_txt = if relay_ok && info.as_ref().is_some_and(|i| i.is_system) {
+                        "Listo (Internet y red local · SYSTEM)."
+                    } else if relay_ok {
                         "Listo (Internet y red local)."
                     } else if has_relay {
                         "Conectando al servidor Relay..."
@@ -564,6 +566,11 @@ impl RandyDeskApp {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.menu_button("Opciones", |ui| {
                                     ui.label("Modo de video:");
+                                    ui.radio_value(
+                                        &mut self.codec_input,
+                                        CodecKind::H264,
+                                        "H.264 (Ultra fluido)",
+                                    );
                                     ui.radio_value(
                                         &mut self.codec_input,
                                         CodecKind::Jpeg,
@@ -1083,6 +1090,9 @@ impl RandyDeskApp {
         }
         if bar_actions.lock_remote_screen {
             self.net.send_cmd(NetCommand::LockWorkStation);
+        }
+        if bar_actions.send_sas {
+            self.net.send_cmd(NetCommand::SendSas);
         }
         if bar_actions.send_win_key {
             if let Some(tx) = self.net.cmd_sender() {

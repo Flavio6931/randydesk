@@ -80,6 +80,7 @@ async fn relay_healthcheck_and_e2e_session_work_end_to_end() -> Result<()> {
         },
         capturer_factory: Arc::new(|| Ok(Box::new(MockCapturer { emitted: false }))),
         active_clients: Arc::new(AtomicUsize::new(0)),
+        direct_endpoints: Vec::new(),
     };
 
     let host_task = tokio::spawn(run_relay_loop(
@@ -228,6 +229,7 @@ async fn relay_healthcheck_and_e2e_session_work_end_to_end() -> Result<()> {
         default_settings: StreamSettings::default(),
         capturer_factory: Arc::new(|| Ok(Box::new(MockCapturer { emitted: false }))),
         active_clients: Arc::new(AtomicUsize::new(0)),
+        direct_endpoints: Vec::new(),
     };
     let open_task = tokio::spawn(run_relay_loop(
         relay_ws.clone(),

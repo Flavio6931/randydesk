@@ -1,5 +1,18 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.5.0 (Fase 2): Servicio `SYSTEM` (`SendSAS` / UAC), códec H.264 y promoción directa LAN/Tailscale
+- **Resumen técnico:**
+  - Versión subida a `0.5.0` en `Cargo.toml` (y `Cargo.lock`), agregando `openh264 = "0.9"` (`openh264 v0.9.10` compilado sin NASM externo vía MSVC) y features Win32 `Win32_Security_Authorization`, `Win32_System_Registry`, `Win32_System_RemoteDesktop`, `Win32_System_Services`.
+  - Protocolo `v2` compatible hacia atrás (`MIN_PROTOCOL_VERSION = 1..=2`): agregados `CodecKind::H264`, `ClientMsg::SendSas` y `HostMsg::DirectEndpoints(Vec<String>)`.
+  - Servicio Windows `NT AUTHORITY\SYSTEM` ([win_service.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/win_service.rs)): instala/desinstala `RandyDeskService` (`C:\Program Files\RandyDesk\RandyDesk.exe`), migra ID/certificados TLS a `C:\ProgramData\RandyDesk\`, configura `SoftwareSASGeneration = 3`, ejecuta supervisor Session 0 → sesión consola activa (`CreateProcessAsUserW`) y permite `Ctrl+Alt+Del` (`sas.dll!SendSAS`), captura de UAC/pantalla de bloqueo (`capture.rs` cambia de escritorio con `sync_thread_to_input_desktop` y fallback GDI) y gestión con 1 clic en `host_panel.rs`.
+  - Códec H.264 ([h264_codec.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-host/src/h264_codec.rs) + [decoder.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/decoder.rs)): streaming inter-frame OpenH264 (`ScreenContentRealTime`) con prevención de descarte de P-frames en `LatestFrameSlot`, más promoción automática de sesión Relay a QUIC directo en LAN/Tailscale (`probe_direct_quic` + `SwitchToDirect`).
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 41 pruebas aprobadas (18 en `randydesk-client`, 13 unit + 1 `quic_loopback` en `randydesk-host`, 8 en `randydesk-proto`, 1 `relay_e2e` en `randydesk-relay`).
+  - `cargo build --workspace --release` + copia a `dist\`: `RandyDesk.exe` (`12,302,848` bytes) y `randydesk-relay.exe` (`2,768,384` bytes).
+- **Pendiente de verificación en vivo:**
+  - Probar instalación del servicio `SYSTEM`, `Ctrl+Alt+Del (SAS)`, UAC/LockScreen, códec `H.264` y promoción automática LAN/Tailscale en ambas PCs.
+
 ## 2026-11-26 — RandyDesk v0.4.6 (Fase 1): Fix escritura/`win_down`/AltGr, barra colapsable y downscale fluido
 - **Resumen técnico:**
   - Versión subida a `0.4.6` en `Cargo.toml` (y `Cargo.lock`), activando `Win32_System_Shutdown` para `LockWorkStation`.

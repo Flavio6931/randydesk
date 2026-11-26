@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
         },
         capturer_factory: Arc::new(move || capture::create_capturer(monitor_idx)),
         active_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        direct_endpoints: vec![format!("{local_ip}:{}", cli.port)],
     };
 
     let relay_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));

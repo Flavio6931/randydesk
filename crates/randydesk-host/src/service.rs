@@ -26,6 +26,7 @@ pub struct HostRuntimeInfo {
     pub fingerprint_sha256: String,
     pub active_clients: usize,
     pub is_elevated: bool,
+    pub is_system: bool,
     pub uipi_warning: bool,
 }
 
@@ -67,12 +68,23 @@ impl HostService {
         let active_clients = Arc::new(AtomicUsize::new(0));
         let host_name =
             std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-Host".to_string());
+        let lan_ip = detect_lan_ip();
+        let tailscale_ip = detect_tailscale_ip();
+        let mut direct_endpoints = Vec::new();
+        if let Some(ref ts) = tailscale_ip {
+            direct_endpoints.push(format!("{ts}:{actual_port}"));
+        }
+        if let Some(ref lan) = lan_ip {
+            direct_endpoints.push(format!("{lan}:{actual_port}"));
+        }
+
         let cfg = HostServerConfig {
             password,
             host_name,
             default_settings: settings,
             capturer_factory: Arc::new(move || capture::create_capturer(monitor)),
             active_clients: Arc::clone(&active_clients),
+            direct_endpoints,
         };
 
         let host_id = relay_agent::load_or_create_host_id();
@@ -100,8 +112,8 @@ impl HostService {
             active_clients,
             host_id,
             port: actual_port,
-            lan_ip: detect_lan_ip(),
-            tailscale_ip: detect_tailscale_ip(),
+            lan_ip,
+            tailscale_ip,
             relay_url: normalized_relay,
             fingerprint_sha256: identity.fingerprint_sha256,
             stopped: false,
@@ -121,6 +133,7 @@ impl HostService {
             fingerprint_sha256: self.fingerprint_sha256.clone(),
             active_clients: self.active_clients.load(Ordering::Relaxed),
             is_elevated: crate::input::is_process_elevated(),
+            is_system: crate::win_service::is_running_as_system(),
             uipi_warning: crate::input::uipi_block_detected(),
         }
     }

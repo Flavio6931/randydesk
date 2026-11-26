@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.6"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 
@@ -23,6 +23,7 @@ eframe = "0.29"
 futures-util = "0.3"
 jpeg-encoder = "0.6"
 lz4_flex = "0.11"
+openh264 = "0.9"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.8"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
@@ -48,8 +49,12 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_LibraryLoader",
     "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
     "Win32_System_Shutdown",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",

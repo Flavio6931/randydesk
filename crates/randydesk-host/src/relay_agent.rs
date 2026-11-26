@@ -4,11 +4,10 @@ use crate::clipboard;
 use crate::input;
 use crate::session::{spawn_capture_worker, HostServerConfig, LatestFrameSlot};
 use anyhow::{anyhow, Context, Result};
-use directories::ProjectDirs;
 use futures_util::{SinkExt, StreamExt};
 use randydesk_proto::{
     generate_host_id, generate_nonce, parse_numeric_id, verify_proof, ClientMsg, E2eCipher,
-    E2eKeypair, HostMsg, PROTOCOL_VERSION,
+    E2eKeypair, HostMsg, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -19,23 +18,20 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 use url::Url;
 
-/// Carga o genera un ID numérico persistente de 9 dígitos para este equipo en `%APPDATA%\RandyDesk\host_id.txt`.
+/// Carga o genera un ID numérico persistente de 9 dígitos para este equipo (`ProgramData` si hay servicio, o `%APPDATA%`).
 pub fn load_or_create_host_id() -> String {
-    if let Some(proj) = ProjectDirs::from("com", "RandyDesk", "RandyDesk") {
-        let dir = proj.config_dir();
-        let path = dir.join("host_id.txt");
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Some(id) = parse_numeric_id(&raw) {
-                return id;
-            }
+    let dir = crate::win_service::shared_host_data_dir();
+    let path = dir.join("host_id.txt");
+    if let Ok(raw) = fs::read_to_string(&path) {
+        if let Some(id) = parse_numeric_id(&raw) {
+            return id;
         }
-        let id = generate_host_id();
-        if fs::create_dir_all(dir).is_ok() {
-            let _ = fs::write(&path, &id);
-        }
-        return id;
     }
-    generate_host_id()
+    let id = generate_host_id();
+    if fs::create_dir_all(&dir).is_ok() {
+        let _ = fs::write(&path, &id);
+    }
+    id
 }
 
 /// Mantiene registrado el host en el servidor Relay y atiende solicitudes `PAIR:<session_id>`.
@@ -153,8 +149,12 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
     let mut cipher = E2eCipher::from_handshake(secret, peer_pub, false);
 
     // 2. Hello cifrado
-    match recv_e2e(&mut ws, &mut cipher).await? {
-        ClientMsg::Hello { version } if version == PROTOCOL_VERSION => {}
+    let client_version = match recv_e2e(&mut ws, &mut cipher).await? {
+        ClientMsg::Hello { version }
+            if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) =>
+        {
+            version
+        }
         ClientMsg::Hello { version } => {
             let _ = send_e2e(
                 &mut ws,
@@ -169,7 +169,7 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
             return Err(anyhow!("versión incompatible: {version}"));
         }
         other => return Err(anyhow!("se esperaba Hello, llegó {other:?}")),
-    }
+    };
 
     // 3. Capturador y autenticación (acceso directo si password está vacío)
     let capturer = (cfg.capturer_factory)()?;
@@ -217,6 +217,15 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
         },
     )
     .await?;
+
+    if client_version >= 2 && !cfg.direct_endpoints.is_empty() {
+        let _ = send_e2e(
+            &mut ws,
+            &mut cipher,
+            &HostMsg::DirectEndpoints(cfg.direct_endpoints.clone()),
+        )
+        .await;
+    }
 
     let shared_settings = Arc::new(Mutex::new(cfg.default_settings));
     let scale_percent = Arc::new(AtomicU8::new(100));
@@ -300,6 +309,9 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
                 }
                 Ok(ClientMsg::LockWorkStation) => {
                     let _ = crate::power::lock_workstation();
+                }
+                Ok(ClientMsg::SendSas) => {
+                    let _ = crate::power::send_sas();
                 }
                 Ok(ClientMsg::RequestKeyframe) => {
                     force_keyframe.store(true, Ordering::Relaxed);
