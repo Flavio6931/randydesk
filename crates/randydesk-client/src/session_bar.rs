@@ -1,9 +1,9 @@
-//! Barra flotante superior Obsidian Craft colapsable y tarjeta de telemetría en sesión remota.
+//! Barra flotante superior Obsidian Craft colapsable en sesión remota.
 
 use crate::net::SessionStats;
 use crate::theme::{
     ACCENT_BLUE, ACCENT_DANGER_TEXT, ACCENT_TEAL, BG_SURFACE_ELEVATED, BORDER_HOVER,
-    BORDER_SUBTLE, PILL_AMBER_BG, PILL_AMBER_TEXT, PILL_GREEN_BG, PILL_GREEN_BORDER,
+    PILL_AMBER_BG, PILL_AMBER_TEXT, PILL_GREEN_BG, PILL_GREEN_BORDER,
     PILL_GREEN_TEXT, PILL_RED_BG, PILL_RED_BORDER, STATUS_ORANGE, TEXT_MUTED, TEXT_PRIMARY,
     TEXT_SECONDARY,
 };
@@ -37,11 +37,9 @@ pub enum QualityPreset {
     Custom,
 }
 
-/// Datos de solo lectura mostrados en la barra flotante y el monitor de calidad.
+/// Datos de solo lectura mostrados en la barra flotante de sesión.
 pub struct SessionBarInput<'a> {
     pub host_name: &'a str,
-    pub width: u32,
-    pub height: u32,
     pub stats: &'a SessionStats,
     pub reconnecting: Option<(u32, &'a str)>,
     pub hook_installed: bool,
@@ -59,7 +57,6 @@ pub struct SessionBarState {
     pub custom_scale_pct: f32,
     pub stream_scale: u8,
     pub quality_preset: QualityPreset,
-    pub show_monitor_stats: bool,
     pub show_remote_cursor: bool,
     pub fullscreen: bool,
     pub keyboard_grab_enabled: bool,
@@ -459,10 +456,6 @@ pub fn render_session_overlay(
                                     &mut state.show_remote_cursor,
                                     "Mostrar cursor remoto",
                                 );
-                                ui.checkbox(
-                                    &mut state.show_monitor_stats,
-                                    "Mostrar calidad del monitor",
-                                );
                                 if ui
                                     .checkbox(&mut state.fullscreen, "Pantalla completa")
                                     .changed()
@@ -755,69 +748,11 @@ pub fn render_session_overlay(
         }
     }
 
-    if state.show_monitor_stats {
-        let card_y = if state.bar_collapsed { 14.0 } else { 58.0 };
-        egui::Area::new(egui::Id::new("session_monitor_card"))
-            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-14.0, card_y))
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(16, 19, 25, 224))
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
-                    .show(ui, |ui| {
-                        let bw = if input.stats.kbps >= 1024.0 {
-                            format!("{:.2} MB/s", input.stats.kbps / 8192.0)
-                        } else {
-                            format!("{:.0} kbps", input.stats.kbps)
-                        };
-                        let rtt = input
-                            .stats
-                            .rtt_ms
-                            .map(|r| format!("{r} ms"))
-                            .unwrap_or_else(|| "-- ms".to_string());
-                        let codec_str = match state.codec {
-                            CodecKind::H264 => "H.264".to_string(),
-                            CodecKind::Jpeg => format!("JPEG {}%", state.quality),
-                            CodecKind::Lz4Rgba => "LZ4 Nítido".to_string(),
-                        };
-                        let transport_suffix = if input.stats.transport_label.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" | {}", input.stats.transport_label)
-                        };
-                        let res_str = if state.stream_scale < 100 {
-                            format!("{}x{} ({}%)", input.width, input.height, state.stream_scale)
-                        } else {
-                            format!("{}x{}", input.width, input.height)
-                        };
-
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{res_str} · {:.1} fps · {bw} · {rtt}",
-                                input.stats.fps
-                            ))
-                            .size(11.0)
-                            .color(Color32::from_rgb(0x60, 0xA5, 0xFA)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{codec_str}{transport_suffix} · {}",
-                                format_duration(input.stats.elapsed_secs)
-                            ))
-                            .size(10.5)
-                            .color(TEXT_SECONDARY),
-                        );
-                    });
-            });
-    }
-
     actions
 }
 
 /// Formatea una duración en segundos como `HH:MM:SS`.
+#[allow(dead_code)]
 pub fn format_duration(total_secs: u64) -> String {
     let h = total_secs / 3600;
     let m = (total_secs % 3600) / 60;

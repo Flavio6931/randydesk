@@ -1,5 +1,16 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.9.1: Identidad Portal R (.ico + bandeja + Figma Obsidian Craft 2.0) y limpieza de HUD
+- **Resumen técnico:**
+  - `Cargo.toml` (+ `Cargo.lock`): versión `0.9.1`.
+  - [build.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/build.rs) y [tray.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/tray.rs): renderizador supersampled 4×4 del logotipo **Portal R** (`render_portal_r_rgba`), generación de `.ico` multi-resolución (`16/32/48/256 px`) compilado con `rc.exe` e incrustado en `RandyDesk.exe`, más icono `64×64` HiDPI de ventana y `32×32` en bandeja.
+  - [session_bar.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/session_bar.rs) y [session_tab.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/session_tab.rs): eliminada la tarjeta flotante superior derecha de telemetría (`session_monitor_card`) y la opción `"Mostrar calidad del monitor"` del menú `Pantalla`.
+  - **Figma (`8cPEueVwbe7tsD2wJ5Gq6G`):** rediseño completo **Obsidian Craft 2.0** con página nueva `00 · Brand & Logo` (3 propuestas vectoriales + componentes exportables `512×512`), `01 · Design System` (`Geist` + `JetBrains Mono`), `02 · Lobby`, `03 · Sesión Remota & HUD` sin telemetría, y `04 · Gestor de Archivos`, con el icono **Portal R** unificado en todas las vistas.
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 61 pruebas aprobadas.
+  - `cargo build --workspace --release` + verificación del recurso `.ico` embebido + Release `v0.9.1` en GitHub.
+
 ## 2026-11-26 — RandyDesk v0.9.0 (Fase 3): P2P STUN/UDP Hole Punching, H.264 GPU Media Foundation, Multi-sesión por pestañas, Presencia y Miniaturas
 - **Resumen técnico:**
   - `Cargo.toml`, `crates/randydesk-client/Cargo.toml` (+ `Cargo.lock`): versión `0.9.0`, feature `Win32_Media_MediaFoundation` y `jpeg-encoder` en `[dependencies]` del cliente.

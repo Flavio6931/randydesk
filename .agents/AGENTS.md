@@ -1,7 +1,7 @@
 # RandyDesk — Contexto del Proyecto
 
 - **Tipo:** Aplicación de escritorio remoto para Windows en Rust puro (estilo RustDesk, sin límites de tiempo).
-- **Versión actual:** `0.9.0` (regla del repo: cada mejora sube `[workspace.package].version` en `Cargo.toml` y publica Release `vX.Y.Z` en `Flavio6931/randydesk` con `RandyDesk.exe`).
+- **Versión actual:** `0.9.1` (regla del repo: cada mejora sube `[workspace.package].version` en `Cargo.toml` y publica Release `vX.Y.Z` en `Flavio6931/randydesk` con `RandyDesk.exe`).
 - **Stack principal:** Rust 2021, `eframe`/`egui 0.29`, `quinn` (QUIC + TLS 1.3 TOFU + STUN/UDP hole punching), `tokio-tungstenite` + X25519/ChaCha20-Poly1305 (Relay E2E), `openh264` + Windows Media Foundation MFT (`h264_hw.rs`), IMA-ADPCM 4:1 WASAPI (`audio_codec.rs`), `jpeg-encoder`/`zune-jpeg`, `lz4_flex`, `windows 0.58` (DXGI/GDI, `SendInput`, `WH_KEYBOARD_LL`, SCM `LocalSystem`, `SendSAS`).
 
 ## Arquitectura por Crates

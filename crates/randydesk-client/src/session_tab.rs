@@ -104,7 +104,6 @@ pub struct RemoteSessionTab {
     pub custom_scale_pct: f32,
     pub stream_scale: u8,
     pub quality_preset: QualityPreset,
-    pub show_monitor_stats: bool,
     pub show_remote_cursor: bool,
     pub keyboard_grab_enabled: bool,
     pub keyboard_mode: KeyboardMode,
@@ -177,7 +176,6 @@ impl RemoteSessionTab {
             custom_scale_pct: 100.0,
             stream_scale: params.stream_scale,
             quality_preset: params.quality_preset,
-            show_monitor_stats: true,
             show_remote_cursor: params.show_remote_cursor,
             keyboard_grab_enabled: params.keyboard_grab_enabled,
             keyboard_mode: params.keyboard_mode,
@@ -587,19 +585,13 @@ impl RemoteSessionTab {
                 kb_hook.set_capture(false, None);
                 SessionTabOutcome::CloseTab
             }
-            ConnectionState::Connected {
-                host_name,
-                width,
-                height,
-            } => self.render_remote_canvas(
+            ConnectionState::Connected { host_name, .. } => self.render_remote_canvas(
                 ctx,
                 rt_handle,
                 kb_hook,
                 tray,
                 hidden_to_tray,
                 host_name,
-                *width,
-                *height,
                 &snap.stats,
                 None,
                 &snap.monitors,
@@ -618,8 +610,6 @@ impl RemoteSessionTab {
                     tray,
                     hidden_to_tray,
                     &self.title.clone(),
-                    0,
-                    0,
                     &snap.stats,
                     Some((*attempt, reason.as_str())),
                     &snap.monitors,
@@ -641,8 +631,6 @@ impl RemoteSessionTab {
         tray: Option<&TrayController>,
         hidden_to_tray: bool,
         host_name: &str,
-        width: u32,
-        height: u32,
         stats: &SessionStats,
         reconnecting: Option<(u32, &str)>,
         monitors: &[MonitorInfo],
@@ -748,7 +736,6 @@ impl RemoteSessionTab {
             custom_scale_pct: self.custom_scale_pct,
             stream_scale: self.stream_scale,
             quality_preset: self.quality_preset,
-            show_monitor_stats: self.show_monitor_stats,
             show_remote_cursor: self.show_remote_cursor,
             fullscreen: self.fullscreen,
             keyboard_grab_enabled: self.keyboard_grab_enabled,
@@ -768,8 +755,6 @@ impl RemoteSessionTab {
             ctx,
             SessionBarInput {
                 host_name,
-                width,
-                height,
                 stats,
                 reconnecting,
                 hook_installed: kb_hook.is_installed(),
@@ -787,7 +772,6 @@ impl RemoteSessionTab {
         self.custom_scale_pct = bar_state.custom_scale_pct;
         self.stream_scale = bar_state.stream_scale;
         self.quality_preset = bar_state.quality_preset;
-        self.show_monitor_stats = bar_state.show_monitor_stats;
         self.show_remote_cursor = bar_state.show_remote_cursor;
         self.fullscreen = bar_state.fullscreen;
         self.keyboard_grab_enabled = bar_state.keyboard_grab_enabled;

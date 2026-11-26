@@ -18,53 +18,117 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE, WS_EX_TOOLWINDOW,
 };
 
-/// Genera el icono RGBA8 32x32 de RandyDesk (fondo azul `#0078FF` con pantalla blanca).
-pub fn build_app_icon_rgba() -> (Vec<u8>, u32, u32) {
-    let w = 32u32;
-    let h = 32u32;
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
+/// Renderiza el logotipo vectorial `Portal R` a cualquier tamaño con supersampling 4x4.
+pub fn render_portal_r_rgba(size: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (size * size * 4) as usize];
+    for py in 0..size {
+        for px in 0..size {
+            let mut acc_r = 0.0f32;
+            let mut acc_g = 0.0f32;
+            let mut acc_b = 0.0f32;
+            let mut acc_a = 0.0f32;
 
-    for y in 0..h {
-        for x in 0..w {
-            let idx = ((y * w + x) * 4) as usize;
-            // Esquinas suavemente redondeadas
-            let corner = (x < 3 && y < 3)
-                || (x >= w - 3 && y < 3)
-                || (x < 3 && y >= h - 3)
-                || (x >= w - 3 && y >= h - 3);
-            if corner {
-                continue;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let x = ((px as f32) + (sx as f32 + 0.5) * 0.25) * 100.0 / (size as f32);
+                    let y = ((py as f32) + (sy as f32 + 0.5) * 0.25) * 100.0 / (size as f32);
+                    let (r, g, b, a) = sample_portal_r(x, y);
+                    acc_r += r * a;
+                    acc_g += g * a;
+                    acc_b += b * a;
+                    acc_a += a;
+                }
             }
 
-            let is_screen_border = (6..=25).contains(&x)
-                && (7..=20).contains(&y)
-                && (x == 6 || x == 25 || y == 7 || y == 20);
-            let is_stand = (14..=17).contains(&x) && (21..=23).contains(&y)
-                || (10..=21).contains(&x) && y == 24;
-
-            if is_screen_border || is_stand {
-                rgba[idx] = 245;
-                rgba[idx + 1] = 248;
-                rgba[idx + 2] = 255;
-                rgba[idx + 3] = 255;
-            } else {
-                rgba[idx] = 0x00;
-                rgba[idx + 1] = 0x78;
-                rgba[idx + 2] = 0xFF;
-                rgba[idx + 3] = 255;
+            let idx = ((py * size + px) * 4) as usize;
+            if acc_a > 0.0 {
+                out[idx] = (acc_r / acc_a).round().clamp(0.0, 255.0) as u8;
+                out[idx + 1] = (acc_g / acc_a).round().clamp(0.0, 255.0) as u8;
+                out[idx + 2] = (acc_b / acc_a).round().clamp(0.0, 255.0) as u8;
+                out[idx + 3] = ((acc_a / 16.0) * 255.0).round().clamp(0.0, 255.0) as u8;
             }
         }
     }
-    (rgba, w, h)
+    out
 }
 
-/// Construye `egui::IconData` usando el mismo icono vectorial de la bandeja.
+fn lerp_chan(a: u8, b: u8, t: f32) -> f32 {
+    let tc = t.clamp(0.0, 1.0);
+    (a as f32) + ((b as f32) - (a as f32)) * tc
+}
+
+fn sample_portal_r(x: f32, y: f32) -> (f32, f32, f32, f32) {
+    let rad = 24.0f32;
+    let b = 50.0 - rad;
+    let qx = (x - 50.0).abs() - b;
+    let qy = (y - 50.0).abs() - b;
+    let sd = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - rad;
+    if sd > 0.0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    if (x - 78.5).hypot(y - 22.5) <= 5.5 {
+        return (0x10 as f32, 0xB9 as f32, 0x81 as f32, 1.0);
+    }
+
+    let in_spine = (26.0..=39.0).contains(&x) && (22.0..=78.0).contains(&y);
+    let in_bowl_outer = ((26.0..=56.0).contains(&x) && (22.0..=60.0).contains(&y))
+        || ((x - 56.0).hypot(y - 41.0) <= 19.0);
+    let in_bowl_inner = ((39.0..=55.0).contains(&x) && (33.0..=49.0).contains(&y))
+        || ((x - 55.0).hypot(y - 41.0) <= 8.0);
+    if (in_spine || in_bowl_outer) && !in_bowl_inner {
+        let t = (y - 22.0) / 56.0;
+        return (
+            lerp_chan(255, 0xD8, t),
+            lerp_chan(255, 0xE8, t),
+            255.0,
+            1.0,
+        );
+    }
+
+    if (55.0..=78.0).contains(&y) {
+        let u = (y - 55.0) / 23.0;
+        let xl = 47.0 + 16.0 * u;
+        let xr = 61.0 + 17.0 * u;
+        if x >= xl && x <= xr {
+            return (
+                lerp_chan(0x3B, 0x06, u),
+                lerp_chan(0x82, 0xB6, u),
+                lerp_chan(0xF6, 0xD4, u),
+                1.0,
+            );
+        }
+    }
+
+    if sd > -2.0 {
+        return (0x2D as f32, 0x46 as f32, 0x78 as f32, 1.0);
+    }
+
+    let bg_t = (x + y) / 200.0;
+    let mut r = lerp_chan(0x10, 0x07, bg_t);
+    let mut g = lerp_chan(0x1A, 0x0B, bg_t);
+    let mut b_col = lerp_chan(0x33, 0x14, bg_t);
+    let glow_d = (x - 50.0).hypot(y - 48.0);
+    if glow_d < 44.0 {
+        let k = (1.0 - glow_d / 44.0).powi(2) * 0.24;
+        r = r * (1.0 - k) + (0x2F as f32) * k;
+        g = g * (1.0 - k) + (0x81 as f32) * k;
+        b_col = b_col * (1.0 - k) + (0xF7 as f32) * k;
+    }
+    (r, g, b_col, 1.0)
+}
+
+/// Genera el icono RGBA8 32x32 (`Portal R`) para la bandeja del sistema.
+pub fn build_app_icon_rgba() -> (Vec<u8>, u32, u32) {
+    (render_portal_r_rgba(32), 32, 32)
+}
+
+/// Construye `egui::IconData` 64x64 nítido para ventana y barra de tareas.
 pub fn build_egui_icon() -> egui::IconData {
-    let (rgba, width, height) = build_app_icon_rgba();
     egui::IconData {
-        rgba,
-        width,
-        height,
+        rgba: render_portal_r_rgba(64),
+        width: 64,
+        height: 64,
     }
 }
 
@@ -413,9 +477,18 @@ mod tests {
         assert_eq!(rgba.len(), 32 * 32 * 4);
         // Esquina transparente
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
-        // Centro de fondo azul #0078FF
-        let center_idx = ((12 * 32 + 12) * 4) as usize;
-        assert_eq!(&rgba[center_idx..center_idx + 4], &[0x00, 0x78, 0xFF, 0xFF]);
+        // Trazo vertical blanco de la 'R' en (10, 14)
+        let r_idx = ((14 * 32 + 10) * 4) as usize;
+        assert!(rgba[r_idx] > 200 && rgba[r_idx + 1] > 200 && rgba[r_idx + 3] == 255);
+        // Haz diagonal cobalto-cyan en (20, 22)
+        let beam_idx = ((22 * 32 + 20) * 4) as usize;
+        assert!(rgba[beam_idx + 2] > 180 && rgba[beam_idx + 3] == 255);
+        // Nodo vivo esmeralda en (25, 7)
+        let dot_idx = ((7 * 32 + 25) * 4) as usize;
+        assert!(rgba[dot_idx + 1] > 150 && rgba[dot_idx + 3] == 255);
+        // Fondo obsidiana en (5, 24)
+        let bg_idx = ((24 * 32 + 5) * 4) as usize;
+        assert!(rgba[bg_idx] < 40 && rgba[bg_idx + 3] == 255);
     }
 
     #[test]
