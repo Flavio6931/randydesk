@@ -44,15 +44,54 @@ pub async fn run_relay_listener(listener: TcpListener) -> Result<()> {
 }
 
 async fn handle_tcp_connection(mut stream: TcpStream, state: Arc<RelayState>) -> Result<()> {
-    let mut peek_buf = [0u8; 1024];
+    let mut peek_buf = [0u8; 2048];
     let n = stream.peek(&mut peek_buf).await?;
-    let head = String::from_utf8_lossy(&peek_buf[..n]).to_ascii_lowercase();
+    let head_raw = String::from_utf8_lossy(&peek_buf[..n]);
+    let head = head_raw.to_ascii_lowercase();
 
-    // Responde healthchecks HTTP planos (Render / Cloudflare) sin romper handshakes WebSocket.
+    // Responde healthchecks HTTP planos y consultas /api/status sin romper handshakes WebSocket.
     if (head.starts_with("get ") || head.starts_with("head "))
         && head.contains("\r\n\r\n")
         && !head.contains("upgrade: websocket")
     {
+        let path_with_query = head_raw
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/");
+        if let Some(rest) = path_with_query.strip_prefix("/api/status") {
+            let query = rest.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let ids_param = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("ids="))
+                .unwrap_or("");
+            let hosts = state.hosts.read().await;
+            let mut online_json = Vec::new();
+            for raw_id in ids_param
+                .split([',', ';'])
+                .map(|s| s.trim().replace("%2C", "").replace("%2c", ""))
+                .filter(|s| !s.is_empty() && s.len() <= 32)
+                .take(64)
+            {
+                let safe_id: String = raw_id
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                if !safe_id.is_empty() && hosts.contains_key(&safe_id) {
+                    online_json.push(format!("\"{safe_id}\""));
+                }
+            }
+            drop(hosts);
+            let body = format!("{{\"online\":[{}]}}", online_json.join(","));
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+
         let body = "RandyDesk Relay OK\n";
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

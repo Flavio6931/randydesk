@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod encoder;
 pub mod files;
 pub mod h264_codec;
+pub mod h264_hw;
 pub mod input;
 pub mod power;
 pub mod relay_agent;

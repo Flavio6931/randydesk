@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use randydesk_proto::{
     generate_host_id, generate_nonce, parse_numeric_id, verify_proof, ClientMsg, E2eCipher,
-    E2eKeypair, HostMsg, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    E2eKeypair, HostMsg, MIN_PROTOCOL_VERSION, P2P_PUNCH_MAGIC, PROTOCOL_VERSION,
 };
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -383,6 +383,19 @@ async fn handle_relay_bridge_session(bridge_url: String, cfg: HostServerConfig) 
                         Ok(ClientMsg::Disconnect) => {
                             let _ = ctrl_tx.send(OutboundItem::Close).await;
                             break Ok(());
+                        }
+                        Ok(ClientMsg::P2pPunch { client_public_addr }) => {
+                            if let (Some(sock), Ok(target)) = (
+                                cfg.punch_socket.as_ref().map(Arc::clone),
+                                client_public_addr.parse::<std::net::SocketAddr>(),
+                            ) {
+                                tokio::spawn(async move {
+                                    for _ in 0..6 {
+                                        let _ = sock.send_to(P2P_PUNCH_MAGIC, target);
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                    }
+                                });
+                            }
                         }
                         Ok(other) => {
                             if let Some(unhandled) = file_mgr.handle_client_msg(other, &file_tx) {

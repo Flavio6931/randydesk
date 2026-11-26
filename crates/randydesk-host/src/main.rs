@@ -6,9 +6,12 @@ use quinn::Endpoint;
 use randydesk_host::capture;
 use randydesk_host::session::{accept_loop, HostServerConfig};
 use randydesk_host::tls;
-use randydesk_proto::{generate_session_pin, CodecKind, StreamSettings, DEFAULT_PORT};
+use randydesk_proto::{
+    discover_public_addr_sync, generate_session_pin, CodecKind, StreamSettings, DEFAULT_PORT,
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -70,17 +73,32 @@ async fn main() -> Result<()> {
 
     let identity = tls::load_or_create_server_identity()?;
     let addr = SocketAddr::new(cli.bind, cli.port);
-    let endpoint = Endpoint::server(identity.server_config, addr)
-        .with_context(|| format!("no se pudo abrir socket QUIC en {addr}"))?;
+    let relay_url = cli
+        .relay
+        .or_else(|| std::env::var("RANDYDESK_RELAY_URL").ok())
+        .and_then(|u| randydesk_proto::normalize_relay_ws_url(&u));
+
+    let std_udp =
+        UdpSocket::bind(addr).with_context(|| format!("no se pudo abrir socket UDP en {addr}"))?;
+    let actual_port = std_udp.local_addr()?.port();
+    let punch_socket = std_udp.try_clone().ok().map(Arc::new);
+    let public_endpoint = if relay_url.is_some() && !cli.bind.is_loopback() {
+        discover_public_addr_sync(&std_udp, Duration::from_millis(350))
+    } else {
+        None
+    };
+    let endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(identity.server_config),
+        std_udp,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .with_context(|| format!("no se pudo abrir socket QUIC en {addr}"))?;
 
     let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-Host".to_string());
     let local_ip = detect_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
 
     let host_id = randydesk_host::relay_agent::load_or_create_host_id();
-    let relay_url = cli
-        .relay
-        .or_else(|| std::env::var("RANDYDESK_RELAY_URL").ok())
-        .and_then(|u| randydesk_proto::normalize_relay_ws_url(&u));
 
     println!("============================================================");
     println!("  RandyDesk Host v{} - Listo para sesiones ilimitadas", env!("CARGO_PKG_VERSION"));
@@ -88,7 +106,10 @@ async fn main() -> Result<()> {
     println!("  Equipo      : {host_name}");
     println!("  ID numérico : {}", randydesk_proto::format_host_id(&host_id));
     println!("  Escucha     : {addr}");
-    println!("  IP LAN      : {local_ip}:{}", cli.port);
+    println!("  IP LAN      : {local_ip}:{actual_port}");
+    if let Some(pub_addr) = public_endpoint {
+        println!("  P2P STUN    : {pub_addr}");
+    }
     if let Some(ref r) = relay_url {
         println!("  Relay       : {r}");
     }
@@ -102,6 +123,14 @@ async fn main() -> Result<()> {
     println!("============================================================");
     println!("  Consejo: con Relay configurado conecta solo con el ID numérico\n");
 
+    let mut direct_endpoints = vec![format!("{local_ip}:{actual_port}")];
+    if let Some(pub_addr) = public_endpoint {
+        let pub_str = pub_addr.to_string();
+        if !direct_endpoints.contains(&pub_str) {
+            direct_endpoints.push(pub_str);
+        }
+    }
+
     let cfg = HostServerConfig {
         password,
         host_name,
@@ -113,7 +142,8 @@ async fn main() -> Result<()> {
         default_monitor: cli.monitor,
         capturer_factory: Arc::new(capture::create_capturer),
         active_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        direct_endpoints: vec![format!("{local_ip}:{}", cli.port)],
+        direct_endpoints,
+        punch_socket,
     };
 
     let relay_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));

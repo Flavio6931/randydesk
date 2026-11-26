@@ -4,15 +4,15 @@ use crate::audio::AudioPlayer;
 use crate::decoder::FrameDecoder;
 use crate::file_manager::{ClientFileTransfers, HandledFileCommand};
 use crate::net::{
-    probe_direct_quic, push_frame_update, ConnectRequest, ConnectionState, NetCommand, SessionExit,
-    SharedSessionState,
+    discover_client_stun, probe_direct_quic, punch_and_connect_quic, push_frame_update,
+    ConnectRequest, ConnectionState, NetCommand, SessionExit, SharedSessionState,
 };
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
 use randydesk_proto::{
-    compute_proof, ClientMsg, E2eCipher, E2eKeypair, HostMsg, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION,
+    compute_proof, is_private_or_cgnat, ClientMsg, E2eCipher, E2eKeypair, HostMsg,
+    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -147,7 +147,7 @@ pub async fn run_relay_session(
     let mut frame_decoder = FrameDecoder::new();
     let mut xfers = ClientFileTransfers::new();
     let (xfer_tx, mut xfer_rx) = mpsc::channel::<ClientMsg>(32);
-    let (direct_tx, mut direct_rx) = mpsc::channel::<String>(1);
+    let (direct_tx, mut direct_rx) = mpsc::channel::<(String, Option<quinn::Endpoint>)>(1);
     let mut direct_probe_started = false;
 
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -289,9 +289,56 @@ pub async fn run_relay_session(
                                 direct_probe_started = true;
                                 let tx_probe = direct_tx.clone();
                                 let expected_fp = req.expected_fingerprint.clone();
+                                let out_for_punch = out_tx.clone();
                                 tokio::spawn(async move {
-                                    if let Some(addr) = probe_direct_quic(&candidates, expected_fp).await {
-                                        let _ = tx_probe.send(addr).await;
+                                    let mut local_candidates = Vec::new();
+                                    let mut wan_candidates = Vec::new();
+                                    for c in candidates {
+                                        if let Ok(sa) = c.parse::<std::net::SocketAddr>() {
+                                            if sa.ip().is_loopback() {
+                                                continue;
+                                            }
+                                            if is_private_or_cgnat(sa.ip()) {
+                                                local_candidates.push(c);
+                                            } else {
+                                                wan_candidates.push(c);
+                                            }
+                                        }
+                                    }
+
+                                    if !local_candidates.is_empty() {
+                                        if let Some(addr) = probe_direct_quic(
+                                            &local_candidates,
+                                            expected_fp.clone(),
+                                        )
+                                        .await
+                                        {
+                                            let _ = tx_probe.send((addr, None)).await;
+                                            return;
+                                        }
+                                    }
+
+                                    if !wan_candidates.is_empty() {
+                                        if let Some((sock, client_pub)) = discover_client_stun().await
+                                        {
+                                            let _ = out_for_punch
+                                                .send(OutboundClientItem::Client(
+                                                    ClientMsg::P2pPunch {
+                                                        client_public_addr: client_pub.to_string(),
+                                                    },
+                                                ))
+                                                .await;
+                                            tokio::time::sleep(Duration::from_millis(60)).await;
+                                            if let Some((addr, ep)) = punch_and_connect_quic(
+                                                sock,
+                                                &wan_candidates,
+                                                expected_fp,
+                                            )
+                                            .await
+                                            {
+                                                let _ = tx_probe.send((addr, Some(ep))).await;
+                                            }
+                                        }
                                     }
                                 });
                             }
@@ -351,10 +398,13 @@ pub async fn run_relay_session(
                     _ => {}
                 }
             }
-            Some(direct_addr) = direct_rx.recv() => {
+            Some((direct_addr, prebound_ep)) = direct_rx.recv() => {
                 let _ = out_tx.send(OutboundClientItem::Client(ClientMsg::Disconnect)).await;
                 let _ = out_tx.send(OutboundClientItem::Close).await;
-                break Ok(SessionExit::SwitchToDirect(direct_addr));
+                break Ok(SessionExit::SwitchToDirect {
+                    addr: direct_addr,
+                    prebound_endpoint: prebound_ep,
+                });
             }
             _ = ping_ticker.tick() => {
                 let now_ms = session_start.elapsed().as_millis() as u64;

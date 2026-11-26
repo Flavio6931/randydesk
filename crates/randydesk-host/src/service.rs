@@ -6,10 +6,11 @@ use crate::session::{accept_loop, HostServerConfig};
 use crate::tls;
 use anyhow::{Context, Result};
 use quinn::Endpoint;
-use randydesk_proto::{normalize_relay_ws_url, StreamSettings};
+use randydesk_proto::{discover_public_addr_sync, normalize_relay_ws_url, StreamSettings};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
@@ -59,11 +60,25 @@ impl HostService {
     ) -> Result<Self> {
         let identity = tls::load_or_create_server_identity()?;
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let normalized_relay = relay_url.and_then(|u| normalize_relay_ws_url(&u));
         // Entrar al reactor Tokio es obligatorio si se invoca desde el hilo de UI.
         let _guard = rt.enter();
-        let endpoint = Endpoint::server(identity.server_config, bind_addr)
+        let std_udp = UdpSocket::bind(bind_addr)
             .with_context(|| format!("no se pudo abrir puerto UDP {port}"))?;
-        let actual_port = endpoint.local_addr()?.port();
+        let actual_port = std_udp.local_addr()?.port();
+        let punch_socket = std_udp.try_clone().ok().map(Arc::new);
+        let public_endpoint = if normalized_relay.is_some() {
+            discover_public_addr_sync(&std_udp, Duration::from_millis(350))
+        } else {
+            None
+        };
+        let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(identity.server_config),
+            std_udp,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .with_context(|| format!("no se pudo iniciar endpoint QUIC en puerto {port}"))?;
 
         let active_clients = Arc::new(AtomicUsize::new(0));
         let host_name =
@@ -77,6 +92,12 @@ impl HostService {
         if let Some(ref lan) = lan_ip {
             direct_endpoints.push(format!("{lan}:{actual_port}"));
         }
+        if let Some(pub_addr) = public_endpoint {
+            let pub_str = pub_addr.to_string();
+            if !direct_endpoints.contains(&pub_str) {
+                direct_endpoints.push(pub_str);
+            }
+        }
 
         let cfg = HostServerConfig {
             password,
@@ -86,10 +107,10 @@ impl HostService {
             capturer_factory: Arc::new(capture::create_capturer),
             active_clients: Arc::clone(&active_clients),
             direct_endpoints,
+            punch_socket,
         };
 
         let host_id = relay_agent::load_or_create_host_id();
-        let normalized_relay = relay_url.and_then(|u| normalize_relay_ws_url(&u));
         let relay_stop = Arc::new(AtomicBool::new(false));
         let relay_connected = Arc::new(AtomicBool::new(false));
 

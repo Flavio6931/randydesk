@@ -9,8 +9,9 @@ use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use quinn::{ClientConfig, Endpoint, TransportConfig, VarInt};
 use randydesk_proto::{
-    compute_proof, parse_numeric_id, read_msg, write_msg, ClientMsg, CursorKind, HostMsg,
-    InputEvent, MonitorInfo, StreamSettings, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    compute_proof, discover_public_addr_sync, is_private_or_cgnat, parse_numeric_id, read_msg,
+    write_msg, ClientMsg, CursorKind, HostMsg, InputEvent, MonitorInfo, StreamSettings,
+    MIN_PROTOCOL_VERSION, P2P_PUNCH_MAGIC, PROTOCOL_VERSION,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -302,14 +303,16 @@ async fn session_supervisor(
     let mut attempt: u32 = 0;
     let session_start = Instant::now();
     let original_address = req.address.clone();
-    let mut direct_override: Option<String> = None;
+    let mut direct_override: Option<(String, Option<Endpoint>)> = None;
 
     loop {
-        if let Some(ref direct) = direct_override {
+        let prebound_ep = if let Some((ref direct, ref mut ep_opt)) = direct_override {
             req.address = direct.clone();
+            ep_opt.take()
         } else {
             req.address = original_address.clone();
-        }
+            None
+        };
 
         let res = run_single_session(
             &mut req,
@@ -318,6 +321,7 @@ async fn session_supervisor(
             ctx,
             session_start,
             Arc::clone(&audio_player),
+            prebound_ep,
         )
         .await;
 
@@ -329,9 +333,12 @@ async fn session_supervisor(
                 ctx.request_repaint();
                 break;
             }
-            Ok(SessionExit::SwitchToDirect(direct_addr)) => {
-                info!("Promoviendo sesión Relay a QUIC directo en {direct_addr}");
-                direct_override = Some(direct_addr);
+            Ok(SessionExit::SwitchToDirect {
+                addr: direct_addr,
+                prebound_endpoint,
+            }) => {
+                info!("Promoviendo sesión Relay a ruta directa en {direct_addr}");
+                direct_override = Some((direct_addr, prebound_endpoint));
                 attempt = 0;
                 continue;
             }
@@ -394,7 +401,10 @@ async fn session_supervisor(
 pub(crate) enum SessionExit {
     UserRequested,
     AuthFailed(String),
-    SwitchToDirect(String),
+    SwitchToDirect {
+        addr: String,
+        prebound_endpoint: Option<Endpoint>,
+    },
 }
 
 fn build_quic_client_config(
@@ -428,6 +438,7 @@ pub(crate) async fn probe_direct_quic(
     candidates: &[String],
     expected_fingerprint: Option<String>,
 ) -> Option<String> {
+    let mut set = tokio::task::JoinSet::new();
     for raw in candidates {
         let Ok(addr) = raw.parse::<SocketAddr>() else {
             continue;
@@ -435,24 +446,89 @@ pub(crate) async fn probe_direct_quic(
         if addr.ip().is_loopback() {
             continue;
         }
-        let observed = Arc::new(Mutex::new(None));
-        let Ok(client_cfg) = build_quic_client_config(expected_fingerprint.clone(), observed) else {
-            continue;
-        };
-        let bind_addr = match addr {
-            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
-        };
-        let Ok(mut ep) = Endpoint::client(bind_addr) else {
-            continue;
-        };
-        ep.set_default_client_config(client_cfg);
+        let raw_owned = raw.clone();
+        let fp = expected_fingerprint.clone();
+        set.spawn(async move {
+            let observed = Arc::new(Mutex::new(None));
+            let client_cfg = build_quic_client_config(fp, observed).ok()?;
+            let bind_addr = match addr {
+                SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                SocketAddr::V6(_) => {
+                    SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+                }
+            };
+            let mut ep = Endpoint::client(bind_addr).ok()?;
+            ep.set_default_client_config(client_cfg);
+            let connecting = ep.connect(addr, "randydesk.local").ok()?;
+            if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_millis(1400), connecting).await
+            {
+                conn.close(0u32.into(), b"probe");
+                return Some(raw_owned);
+            }
+            None
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(winner)) = res {
+            set.abort_all();
+            return Some(winner);
+        }
+    }
+    None
+}
+
+/// Abre un socket UDP efimero y descubre su direccion publica STUN para hole punching P2P.
+pub(crate) async fn discover_client_stun() -> Option<(std::net::UdpSocket, SocketAddr)> {
+    tokio::task::spawn_blocking(|| {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        let pub_addr = discover_public_addr_sync(&sock, Duration::from_millis(350))?;
+        Some((sock, pub_addr))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Envia paquetes de hole punch desde `sock` hacia candidatos publicos y reutiliza el mismo socket en Quinn.
+pub(crate) async fn punch_and_connect_quic(
+    sock: std::net::UdpSocket,
+    candidates: &[String],
+    expected_fingerprint: Option<String>,
+) -> Option<(String, Endpoint)> {
+    let addrs: Vec<(String, SocketAddr)> = candidates
+        .iter()
+        .filter_map(|raw| raw.parse::<SocketAddr>().ok().map(|sa| (raw.clone(), sa)))
+        .filter(|(_, sa)| !sa.ip().is_loopback() && !is_private_or_cgnat(sa.ip()))
+        .collect();
+    if addrs.is_empty() {
+        return None;
+    }
+
+    for _ in 0..6 {
+        for (_, target) in &addrs {
+            let _ = sock.send_to(P2P_PUNCH_MAGIC, *target);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let observed = Arc::new(Mutex::new(None));
+    let client_cfg = build_quic_client_config(expected_fingerprint, observed).ok()?;
+    let mut ep = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        sock,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .ok()?;
+    ep.set_default_client_config(client_cfg);
+
+    for (raw, addr) in addrs {
         let Ok(connecting) = ep.connect(addr, "randydesk.local") else {
             continue;
         };
-        if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_millis(1400), connecting).await {
-            conn.close(0u32.into(), b"probe");
-            return Some(raw.clone());
+        if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_millis(2200), connecting).await {
+            conn.close(0u32.into(), b"p2p-probe");
+            return Some((raw, ep));
         }
     }
     None
@@ -465,6 +541,7 @@ async fn run_single_session(
     ctx: &egui::Context,
     session_start: Instant,
     audio_player: Arc<AudioPlayer>,
+    prebound_endpoint: Option<Endpoint>,
 ) -> Result<SessionExit> {
     if let Some(target_id) = parse_numeric_id(&req.address) {
         let Some(relay_url) = req.relay_url.clone() else {
@@ -497,11 +574,15 @@ async fn run_single_session(
         Arc::clone(&observed_fp),
     )?;
 
-    let bind_addr = match addr {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
+    let mut endpoint = if let Some(ep) = prebound_endpoint {
+        ep
+    } else {
+        let bind_addr = match addr {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
+        };
+        Endpoint::client(bind_addr)?
     };
-    let mut endpoint = Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_cfg);
 
     let conn = endpoint
@@ -581,6 +662,7 @@ async fn run_single_session(
         .await
         .context("el host no abrió stream de video")?;
 
+    let is_wan_p2p = !is_private_or_cgnat(addr.ip()) && !addr.ip().is_loopback();
     if let Ok(mut guard) = shared.lock() {
         guard.status = ConnectionState::Connected {
             host_name,
@@ -588,7 +670,11 @@ async fn run_single_session(
             height,
         };
         guard.stats.fingerprint_sha256 = fingerprint;
-        guard.stats.transport_label = "QUIC directo".to_string();
+        guard.stats.transport_label = if is_wan_p2p {
+            "P2P directo".to_string()
+        } else {
+            "QUIC directo".to_string()
+        };
     }
     ctx.request_repaint();
     info!("Sesión QUIC autenticada con {}", req.address);

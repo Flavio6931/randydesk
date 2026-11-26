@@ -160,6 +160,8 @@ pub struct HostServerConfig {
     pub capturer_factory: CapturerFactory,
     pub active_clients: Arc<AtomicUsize>,
     pub direct_endpoints: Vec<String>,
+    /// Socket UDP compartido con `quinn::Endpoint` para emitir paquetes `P2P_PUNCH_MAGIC`.
+    pub punch_socket: Option<Arc<std::net::UdpSocket>>,
 }
 
 /// Guardia RAII para llevar el conteo exacto de sesiones activas en curso.
@@ -449,6 +451,9 @@ async fn run_session_loops(
                     Ok(ClientMsg::Disconnect) => {
                         conn.close(0u32.into(), b"cliente desconectado");
                         return Ok(());
+                    }
+                    Ok(ClientMsg::P2pPunch { .. }) => {
+                        // Sesion ya establecida directamente por QUIC; no requiere punch.
                     }
                     Ok(other) => {
                         if let Some(unhandled) = file_mgr.handle_client_msg(other, file_tx) {

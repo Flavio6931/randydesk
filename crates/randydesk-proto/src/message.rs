@@ -208,6 +208,8 @@ pub enum ClientMsg {
     FileTransferCancel { transfer_id: u64 },
     /// Crea una nueva carpeta dentro de `parent_dir`.
     FileMkdir { parent_dir: String, name: String },
+    /// Coordina UDP hole punching P2P enviando al host la IP:puerto STUN del cliente.
+    P2pPunch { client_public_addr: String },
 }
 
 /// Mensajes enviados por el host remoto hacia el cliente visor.
@@ -402,6 +404,9 @@ mod tests {
             ClientMsg::FileMkdir {
                 parent_dir: "C:\\".to_string(),
                 name: "Nueva".to_string(),
+            },
+            ClientMsg::P2pPunch {
+                client_public_addr: "203.0.113.42:54321".to_string(),
             },
         ] {
             let enc = bincode::serialize(&fmsg).expect("serialización archivo cliente");

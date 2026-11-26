@@ -1,12 +1,14 @@
 //! Cuadrícula visual Obsidian Craft de tarjetas de equipos guardados y recientes.
 
-use crate::config::{display_address, SavedHost};
+use crate::config::{display_address, normalize_address, SavedHost};
 use crate::theme::{
     draw_star, draw_windows_logo, paint_vertical_gradient_banner, ACCENT_BLUE, ACCENT_TEAL,
     BANNER_GRADIENTS, BG_CARD, BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED, TEXT_PRIMARY,
     TEXT_SECONDARY,
 };
 use eframe::egui::{self, Align, Color32, Layout, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
+use randydesk_proto::parse_numeric_id;
+use std::collections::HashMap;
 
 /// Pestaña activa para filtrar la lista de tarjetas de equipos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,8 @@ pub fn render_host_cards(
     hosts: &[SavedHost],
     tab: HostTab,
     search: &str,
+    online_map: &HashMap<String, bool>,
+    thumbnails: &HashMap<String, egui::TextureHandle>,
 ) -> Option<CardAction> {
     let query = search.trim().to_lowercase();
     let mut indices: Vec<usize> = hosts
@@ -82,7 +86,9 @@ pub fn render_host_cards(
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 for &idx in row {
-                    if let Some(act) = render_single_card(ui, idx, &hosts[idx]) {
+                    if let Some(act) =
+                        render_single_card(ui, idx, &hosts[idx], online_map, thumbnails)
+                    {
                         action = Some(act);
                     }
                 }
@@ -93,7 +99,13 @@ pub fn render_host_cards(
     action
 }
 
-fn render_single_card(ui: &mut egui::Ui, idx: usize, host: &SavedHost) -> Option<CardAction> {
+fn render_single_card(
+    ui: &mut egui::Ui,
+    idx: usize,
+    host: &SavedHost,
+    online_map: &HashMap<String, bool>,
+    thumbnails: &HashMap<String, egui::TextureHandle>,
+) -> Option<CardAction> {
     let card_size = Vec2::new(272.0, 152.0);
     let banner_h = 90.0;
     let footer_h = card_size.y - banner_h;
@@ -121,8 +133,34 @@ fn render_single_card(ui: &mut egui::Ui, idx: usize, host: &SavedHost) -> Option
     let hovered = click_resp.hovered() || banner_only_resp.hovered();
 
     let painter = ui.painter();
-    let (top_col, bot_col) = BANNER_GRADIENTS[(host.color_idx as usize) % BANNER_GRADIENTS.len()];
-    paint_vertical_gradient_banner(painter, banner_rect, 12.0, top_col, bot_col);
+    let norm_addr = normalize_address(&host.address);
+    if let Some(tex) = thumbnails.get(&norm_addr) {
+        let inset_rect = banner_rect.shrink2(Vec2::new(1.0, 1.0));
+        painter.rect_filled(
+            banner_rect,
+            Rounding {
+                nw: 12.0,
+                ne: 12.0,
+                sw: 0.0,
+                se: 0.0,
+            },
+            BG_CARD,
+        );
+        painter.image(
+            tex.id(),
+            inset_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        painter.rect_filled(
+            inset_rect,
+            Rounding::ZERO,
+            Color32::from_rgba_unmultiplied(8, 12, 20, 56),
+        );
+    } else {
+        let (top_col, bot_col) = BANNER_GRADIENTS[(host.color_idx as usize) % BANNER_GRADIENTS.len()];
+        paint_vertical_gradient_banner(painter, banner_rect, 12.0, top_col, bot_col);
+    }
 
     painter.rect_filled(
         footer_rect,
@@ -170,19 +208,28 @@ fn render_single_card(ui: &mut egui::Ui, idx: usize, host: &SavedHost) -> Option
         );
     }
 
-    // Logotipo Windows centrado en el banner
-    draw_windows_logo(
-        painter,
-        Pos2::new(banner_rect.center().x, banner_rect.min.y + 53.0),
-        30.0,
-    );
+    // Logotipo Windows centrado en el banner solo si no hay miniatura real
+    if !thumbnails.contains_key(&norm_addr) {
+        draw_windows_logo(
+            painter,
+            Pos2::new(banner_rect.center().x, banner_rect.min.y + 53.0),
+            30.0,
+        );
+    }
 
     // Pie de tarjeta: nombre arriba con punto de estado + ID/IP abajo
     let name_y = footer_rect.min.y + 21.0;
-    let dot_color = if host.fingerprint_sha256.is_some() {
-        ACCENT_TEAL
-    } else {
-        STATUS_ORANGE
+    let online_state = parse_numeric_id(&host.address).and_then(|id| online_map.get(&id).copied());
+    let dot_color = match online_state {
+        Some(true) => Color32::from_rgb(0x22, 0xC5, 0x5E),
+        Some(false) => Color32::from_rgb(0x64, 0x74, 0x8B),
+        None => {
+            if host.fingerprint_sha256.is_some() {
+                ACCENT_TEAL
+            } else {
+                STATUS_ORANGE
+            }
+        }
     };
     painter.circle_filled(
         Pos2::new(footer_rect.min.x + 16.0, name_y),

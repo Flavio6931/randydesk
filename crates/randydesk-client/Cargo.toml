@@ -14,6 +14,7 @@ arboard.workspace = true
 directories.workspace = true
 eframe.workspace = true
 futures-util.workspace = true
+jpeg-encoder.workspace = true
 lz4_flex.workspace = true
 openh264.workspace = true
 quinn.workspace = true
@@ -32,6 +33,3 @@ tray-icon.workspace = true
 url.workspace = true
 windows.workspace = true
 zune-jpeg.workspace = true
-
-[dev-dependencies]
-jpeg-encoder.workspace = true

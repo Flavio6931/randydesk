@@ -82,6 +82,7 @@ async fn relay_healthcheck_and_e2e_session_work_end_to_end() -> Result<()> {
         capturer_factory: Arc::new(|_| Ok(Box::new(MockCapturer { emitted: false }))),
         active_clients: Arc::new(AtomicUsize::new(0)),
         direct_endpoints: Vec::new(),
+        punch_socket: None,
     };
 
     let host_task = tokio::spawn(run_relay_loop(
@@ -232,6 +233,7 @@ async fn relay_healthcheck_and_e2e_session_work_end_to_end() -> Result<()> {
         capturer_factory: Arc::new(|_| Ok(Box::new(MockCapturer { emitted: false }))),
         active_clients: Arc::new(AtomicUsize::new(0)),
         direct_endpoints: Vec::new(),
+        punch_socket: None,
     };
     let open_task = tokio::spawn(run_relay_loop(
         relay_ws.clone(),
@@ -247,6 +249,26 @@ async fn relay_healthcheck_and_e2e_session_work_end_to_end() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(open_connected.load(Ordering::Relaxed));
+
+    // Verifica endpoint HTTP de presencia online (/api/status?ids=...)
+    let status_resp = tokio::net::TcpStream::connect(addr).await?;
+    let mut status_sock = status_resp;
+    status_sock
+        .write_all(
+            format!(
+                "GET /api/status?ids={open_id},999999999 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut status_buf = Vec::new();
+    status_sock.read_to_end(&mut status_buf).await?;
+    let status_text = String::from_utf8_lossy(&status_buf);
+    assert!(status_text.contains("200 OK"), "status inesperado: {status_text}");
+    assert!(
+        status_text.contains(&format!("{{\"online\":[\"{open_id}\"]}}")),
+        "JSON presencia inesperado: {status_text}"
+    );
 
     {
         let (mut ws, _) =

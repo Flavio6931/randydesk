@@ -1,6 +1,7 @@
 //! Codificador de video H.264 (OpenH264 Annex-B) optimizado para escritorio en tiempo real.
 
 use crate::encoder::downscale_bgra;
+use crate::h264_hw::MfH264Encoder;
 use anyhow::{anyhow, ensure, Result};
 use openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, RateControlMode,
@@ -11,7 +12,11 @@ use openh264::OpenH264API;
 use randydesk_proto::{CodecKind, EncodedTile, HostMsg, StreamSettings};
 
 /// Codificador H.264 persistente por sesión con detección rápida de cuadros estáticos y ajuste de bitrate.
+/// Prioriza codificacion hardware via Windows Media Foundation (NVENC/QuickSync/AMF) y cae a OpenH264 CPU.
 pub struct H264FrameEncoder {
+    hw_encoder: Option<MfH264Encoder>,
+    hw_disabled: bool,
+    hw_empty_streak: u8,
     encoder: Option<Encoder>,
     width: u32,
     height: u32,
@@ -34,6 +39,9 @@ impl H264FrameEncoder {
     /// Crea un nuevo codificador H.264 sin estado previo.
     pub fn new() -> Self {
         Self {
+            hw_encoder: None,
+            hw_disabled: false,
+            hw_empty_streak: 0,
             encoder: None,
             width: 0,
             height: 0,
@@ -115,12 +123,67 @@ impl H264FrameEncoder {
         };
 
         let hash = fast_sample_hash(tight_bgra);
-        if !force_keyframe && self.last_hash == Some(hash) && self.encoder.is_some() {
+        let has_active_encoder = self.hw_encoder.is_some() || self.encoder.is_some();
+        if !force_keyframe && self.last_hash == Some(hash) && has_active_encoder {
             return Ok(None);
         }
 
         let target_bps = bitrate_for_quality(settings.jpeg_quality);
         let target_fps = settings.target_fps.clamp(5, 60);
+
+        if !self.hw_disabled && even_w >= 128 && even_h >= 128 {
+            let need_hw_recreate = self.hw_encoder.as_ref().is_none_or(|hw| {
+                force_keyframe || !hw.matches_params(even_w, even_h, target_fps, target_bps)
+            });
+            if need_hw_recreate {
+                self.hw_encoder = MfH264Encoder::try_new(even_w, even_h, target_fps, target_bps);
+                self.hw_empty_streak = 0;
+                if self.hw_encoder.is_none() {
+                    self.hw_disabled = true;
+                }
+            }
+            if let Some(hw) = self.hw_encoder.as_mut() {
+                match hw.encode_bgra(tight_bgra) {
+                    Ok(Some((data, is_idr))) => {
+                        self.hw_empty_streak = 0;
+                        self.last_hash = Some(hash);
+                        self.frame_id += 1;
+                        return Ok(Some(HostMsg::VideoFrame {
+                            frame_id: self.frame_id,
+                            width: even_w,
+                            height: even_h,
+                            full_refresh: is_idr || need_hw_recreate,
+                            tiles: vec![EncodedTile {
+                                x: 0,
+                                y: 0,
+                                width: even_w,
+                                height: even_h,
+                                codec: CodecKind::H264,
+                                data,
+                            }],
+                        }));
+                    }
+                    Ok(None) => {
+                        self.hw_empty_streak = self.hw_empty_streak.saturating_add(1);
+                        if self.hw_empty_streak >= 8 || (force_keyframe && self.last_hash.is_none()) {
+                            tracing::warn!(
+                                "H.264 GPU MFT no emitio cuadro inmediato, cambiando a OpenH264 CPU"
+                            );
+                            self.hw_encoder = None;
+                            self.hw_disabled = true;
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("H.264 GPU MFT fallo en ejecucion, cambiando a OpenH264 CPU: {err:#}");
+                        self.hw_encoder = None;
+                        self.hw_disabled = true;
+                    }
+                }
+            }
+        }
+
         let bitrate_diff = target_bps.abs_diff(self.bitrate_bps);
         let needs_recreate = self.encoder.is_none()
             || self.width != even_w

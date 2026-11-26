@@ -120,6 +120,7 @@ async fn quic_loopback_rejects_bad_password_and_streams_frame_on_valid_auth() ->
         capturer_factory: Arc::new(|_| Ok(Box::new(MockCapturer { emitted: false }))),
         active_clients: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         direct_endpoints: Vec::new(),
+        punch_socket: None,
     };
 
     let server_task = tokio::spawn(accept_loop(server_ep.clone(), cfg));

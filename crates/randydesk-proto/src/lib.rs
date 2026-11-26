@@ -5,8 +5,10 @@ pub mod auth;
 pub mod e2e;
 pub mod framing;
 pub mod message;
+pub mod stun;
 
 pub use audio_codec::{decode_stereo_ima_adpcm, encode_stereo_ima_adpcm};
+pub use stun::{discover_public_addr_sync, is_private_or_cgnat, P2P_PUNCH_MAGIC};
 pub use auth::{
     compute_proof, format_host_id, generate_host_id, generate_nonce, generate_session_pin,
     parse_numeric_id, verify_proof,
@@ -28,7 +30,7 @@ pub const DEFAULT_RELAY_PORT: u16 = 21119;
 pub const DEFAULT_RELAY_URL: &str = "wss://randydesk-relay.onrender.com";
 
 /// Versión actual del protocolo de comunicación.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Tamaño de bloque usado en transferencias de archivos cifradas (128 KiB).
 pub const FILE_CHUNK_SIZE: usize = 128 * 1024;

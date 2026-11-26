@@ -227,6 +227,67 @@ fn settings_file_path() -> Result<PathBuf> {
     Ok(proj.config_dir().join("settings.json"))
 }
 
+/// Ruta al archivo JPEG de miniatura guardada para un equipo (`%APPDATA%/RandyDesk/thumbs/<id>.jpg`).
+pub fn thumbnail_path(address: &str) -> Result<PathBuf> {
+    let proj = ProjectDirs::from("com", "RandyDesk", "RandyDesk")
+        .context("no se pudo resolver directorio de configuración")?;
+    let safe: String = normalize_address(address)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    Ok(proj.config_dir().join("thumbs").join(format!("{safe}.jpg")))
+}
+
+/// Redimensiona un framebuffer RGBA y lo guarda como miniatura JPEG `272x152` para la tarjeta del equipo.
+pub fn save_host_thumbnail(address: &str, rgba: &[u8], src_w: usize, src_h: usize) -> Result<PathBuf> {
+    let dst_w = 272usize;
+    let dst_h = 152usize;
+    if src_w == 0 || src_h == 0 || rgba.len() < src_w * src_h * 4 {
+        anyhow::bail!("framebuffer invalido para miniatura");
+    }
+    let mut rgb = Vec::with_capacity(dst_w * dst_h * 3);
+    for dy in 0..dst_h {
+        let sy = (dy * src_h) / dst_h;
+        for dx in 0..dst_w {
+            let sx = (dx * src_w) / dst_w;
+            let idx = (sy * src_w + sx) * 4;
+            rgb.push(rgba[idx]);
+            rgb.push(rgba[idx + 1]);
+            rgb.push(rgba[idx + 2]);
+        }
+    }
+    let path = thumbnail_path(address)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut jpeg_bytes = Vec::new();
+    let enc = jpeg_encoder::Encoder::new(&mut jpeg_bytes, 76);
+    enc.encode(&rgb, dst_w as u16, dst_h as u16, jpeg_encoder::ColorType::Rgb)?;
+    let tmp = path.with_extension("jpg.tmp");
+    fs::write(&tmp, &jpeg_bytes)?;
+    let _ = fs::rename(&tmp, &path);
+    Ok(path)
+}
+
+/// Carga y decodifica la miniatura JPEG de un equipo como `(ColorImage)` lista para textura `egui`.
+pub fn load_host_thumbnail(address: &str) -> Option<eframe::egui::ColorImage> {
+    let path = thumbnail_path(address).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let mut dec = zune_jpeg::JpegDecoder::new(&bytes);
+    let pixels = dec.decode().ok()?;
+    let info = dec.info()?;
+    let w = info.width as usize;
+    let h = info.height as usize;
+    if pixels.len() < w * h * 3 {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for rgb in pixels.as_chunks::<3>().0 {
+        rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+    }
+    Some(eframe::egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -303,5 +364,19 @@ mod tests {
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].address, "192.168.1.50:21118");
         assert!(hosts[0].last_connected > 0);
+    }
+
+    #[test]
+    fn thumbnail_save_and_load_roundtrip() {
+        let mut rgba = Vec::with_capacity(16 * 16 * 4);
+        for _ in 0..(16 * 16) {
+            rgba.extend_from_slice(&[20, 120, 220, 255]);
+        }
+        let addr = "999888777";
+        let path = save_host_thumbnail(addr, &rgba, 16, 16).expect("guardar miniatura");
+        assert!(path.exists());
+        let img = load_host_thumbnail(addr).expect("cargar miniatura");
+        assert_eq!(img.size, [272, 152]);
+        let _ = fs::remove_file(path);
     }
 }

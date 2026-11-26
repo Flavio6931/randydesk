@@ -1,20 +1,15 @@
-//! Interfaz gráfica unificada de RandyDesk (bandeja, hook tecla Win, acceso directo y GPU parcial).
+//! Interfaz gráfica unificada de RandyDesk (bandeja, hook tecla Win, multi-sesión por pestañas y GPU parcial).
 
 use crate::cards::{render_host_cards, CardAction, HostTab};
 use crate::config::{
-    display_address, load_hosts, load_settings, normalize_address, save_hosts, save_settings,
-    upsert_recent, AppSettings, SavedHost,
-};
-use crate::decoder::FrameUpdate;
-use crate::file_manager::{
-    FileManagerAction, FileManagerWindowState, RemoteDirListing, TransferItem, TransferStatus,
+    display_address, load_host_thumbnail, load_hosts, load_settings, normalize_address, save_hosts,
+    save_settings, upsert_recent, AppSettings, SavedHost,
 };
 use crate::host_panel::HostPanelState;
-use crate::keymap::{is_control_or_nav_key, map_egui_key_to_vk, map_mouse_button, normalize_pos};
-use crate::net::{ConnectRequest, ConnectionState, NetCommand, NetworkHandle};
-use crate::session_bar::{
-    render_session_overlay, QualityPreset, ScaleMode, SessionBarInput, SessionBarState,
-};
+use crate::net::NetCommand;
+use crate::presence::PresenceTracker;
+use crate::session_bar::QualityPreset;
+use crate::session_tab::{RemoteSessionTab, SessionTabOutcome, TabLaunchParams, TabPollSnapshot};
 use crate::theme::{
     apply_rustdesk_theme, styled_text_input, ACCENT_BLUE, ACCENT_TEAL, ACCENT_TEAL_SOLID,
     BANNER_COLORS, BG_CARD, BG_INPUT, BG_MAIN, BG_SIDEBAR, BG_SURFACE_ELEVATED, BORDER_HOVER,
@@ -23,33 +18,10 @@ use crate::theme::{
 use crate::tray::TrayController;
 use crate::updater::{UpdateState, UpdaterHandle};
 use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
-use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
-use randydesk_host::clipboard::ClipboardWatcher;
-use randydesk_host::input::{append_input_debug_log, set_input_debug_logging};
-use randydesk_proto::{
-    normalize_relay_ws_url, CodecKind, CursorKind, InputEvent, MonitorInfo, StreamSettings,
-    DEFAULT_RELAY_URL,
-};
+use randydesk_proto::{normalize_relay_ws_url, CodecKind, DEFAULT_RELAY_URL};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
-
-fn map_remote_cursor(kind: CursorKind) -> egui::CursorIcon {
-    match kind {
-        CursorKind::Default => egui::CursorIcon::Default,
-        CursorKind::Text => egui::CursorIcon::Text,
-        CursorKind::PointingHand => egui::CursorIcon::PointingHand,
-        CursorKind::Crosshair => egui::CursorIcon::Crosshair,
-        CursorKind::Move => egui::CursorIcon::Move,
-        CursorKind::ResizeHorizontal => egui::CursorIcon::ResizeHorizontal,
-        CursorKind::ResizeVertical => egui::CursorIcon::ResizeVertical,
-        CursorKind::ResizeNeSw => egui::CursorIcon::ResizeNeSw,
-        CursorKind::ResizeNwSe => egui::CursorIcon::ResizeNwSe,
-        CursorKind::NotAllowed => egui::CursorIcon::NotAllowed,
-        CursorKind::Wait => egui::CursorIcon::Wait,
-        CursorKind::Progress => egui::CursorIcon::Progress,
-        CursorKind::Hidden => egui::CursorIcon::None,
-    }
-}
 
 /// Datos para pedir contraseña solo si el host remoto tiene contraseña opcional activada.
 #[derive(Clone)]
@@ -62,6 +34,7 @@ struct PasswordPrompt {
     quality: u8,
     fps: u8,
     just_opened: bool,
+    retry_tab_id: Option<u64>,
 }
 
 /// Datos temporales del modal para agregar o editar un equipo guardado.
@@ -72,16 +45,22 @@ struct HostEditor {
     color_idx: u8,
 }
 
-/// Aplicación principal de RandyDesk (anfitrión + visor remoto con bandeja del sistema).
+/// Aplicación principal de RandyDesk (anfitrión + visor multi-sesión por pestañas con bandeja).
 pub struct RandyDeskApp {
     rt_handle: tokio::runtime::Handle,
     host_panel: HostPanelState,
-    net: NetworkHandle,
     hosts: Vec<SavedHost>,
     settings: AppSettings,
     tray: Option<TrayController>,
     updater: UpdaterHandle,
     kb_hook: KeyboardHookGuard,
+    presence: PresenceTracker,
+    thumbnails: HashMap<String, egui::TextureHandle>,
+
+    // Multi-sesión por pestañas (`None` = vista Lobby / Inicio)
+    tabs: Vec<RemoteSessionTab>,
+    active_session_tab: Option<usize>,
+    next_tab_id: u64,
 
     // Estado de bandeja
     hidden_to_tray: bool,
@@ -105,39 +84,17 @@ pub struct RandyDeskApp {
     relay_modal_msg: Option<String>,
     show_guide: bool,
 
-    // Renderizado incremental del escritorio remoto
-    screen_texture: Option<egui::TextureHandle>,
-    fullscreen: bool,
-    scale_mode: ScaleMode,
-    custom_scale_pct: f32,
+    // Preferencias por defecto aplicadas a cada nueva pestaña
     stream_scale: u8,
     quality_preset: QualityPreset,
-    show_monitor_stats: bool,
     show_remote_cursor: bool,
     keyboard_grab_enabled: bool,
     keyboard_mode: KeyboardMode,
     invert_wheel: bool,
     swap_mouse_buttons: bool,
-    view_only: bool,
-    bar_collapsed: bool,
-    bar_pinned: bool,
     auto_clipboard: bool,
-    input_debug_log: bool,
-    clip_watcher: ClipboardWatcher,
-    last_clip_poll: Instant,
     audio_enabled: bool,
     audio_volume: u8,
-    show_file_manager: bool,
-    file_mgr_ui: FileManagerWindowState,
-    next_transfer_id: u64,
-    was_foreground: bool,
-    focused_on_connect: bool,
-    remote_ctrl_down: bool,
-    remote_alt_down: bool,
-    remote_shift_down: bool,
-    active_target_address: Option<String>,
-    recorded_recent_for_session: bool,
-    last_error_handled: Option<String>,
 }
 
 impl RandyDeskApp {
@@ -151,9 +108,9 @@ impl RandyDeskApp {
         let tray = TrayController::new(cc.egui_ctx.clone());
         let updater = UpdaterHandle::new(rt_handle.clone(), cc.egui_ctx.clone());
         let kb_hook = KeyboardHookGuard::new();
+        let presence = PresenceTracker::new(rt_handle.clone());
 
         Self {
-            net: NetworkHandle::new(rt_handle.clone()),
             rt_handle,
             host_panel,
             hosts,
@@ -161,6 +118,11 @@ impl RandyDeskApp {
             tray,
             updater,
             kb_hook,
+            presence,
+            thumbnails: HashMap::new(),
+            tabs: Vec::new(),
+            active_session_tab: None,
+            next_tab_id: 1,
             hidden_to_tray: false,
             restored_at: Instant::now() - Duration::from_secs(5),
             quick_address: String::new(),
@@ -177,100 +139,50 @@ impl RandyDeskApp {
             relay_url_input,
             relay_modal_msg: None,
             show_guide: false,
-            screen_texture: None,
-            fullscreen: false,
-            scale_mode: ScaleMode::Adaptive,
-            custom_scale_pct: 100.0,
             stream_scale: 100,
             quality_preset: QualityPreset::Balanced,
-            show_monitor_stats: true,
             show_remote_cursor: true,
             keyboard_grab_enabled: true,
             keyboard_mode: KeyboardMode::default(),
             invert_wheel: false,
             swap_mouse_buttons: false,
-            view_only: false,
-            bar_collapsed: false,
-            bar_pinned: true,
             auto_clipboard: true,
-            input_debug_log: false,
-            clip_watcher: ClipboardWatcher::new(),
-            last_clip_poll: Instant::now(),
             audio_enabled: true,
             audio_volume: 100,
-            show_file_manager: false,
-            file_mgr_ui: FileManagerWindowState::new(),
-            next_transfer_id: 1,
-            was_foreground: false,
-            focused_on_connect: false,
-            remote_ctrl_down: false,
-            remote_alt_down: false,
-            remote_shift_down: false,
-            active_target_address: None,
-            recorded_recent_for_session: false,
-            last_error_handled: None,
         }
     }
 
-    fn release_remote_modifiers(&mut self) {
-        if self.remote_ctrl_down {
-            self.net.send_input(InputEvent::Key {
-                vk: 0xA2,
-                scan: 0x1D,
-                extended: false,
-                down: false,
-            });
-            self.remote_ctrl_down = false;
-        }
-        if self.remote_alt_down {
-            self.net.send_input(InputEvent::Key {
-                vk: 0xA4,
-                scan: 0x38,
-                extended: false,
-                down: false,
-            });
-            self.remote_alt_down = false;
-        }
-        if self.remote_shift_down {
-            self.net.send_input(InputEvent::Key {
-                vk: 0xA0,
-                scan: 0x2A,
-                extended: false,
-                down: false,
-            });
-            self.remote_shift_down = false;
+    fn sync_thumbnails(&mut self, ctx: &egui::Context) {
+        for host in &self.hosts {
+            let norm = normalize_address(&host.address);
+            if self.thumbnails.contains_key(&norm) {
+                continue;
+            }
+            if let Some(img) = load_host_thumbnail(&norm) {
+                let tex = ctx.load_texture(
+                    format!("thumb-{norm}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.thumbnails.insert(norm, tex);
+            }
         }
     }
 
-    fn send_remote_ctrl_shortcut(&mut self, vk: u16, scan: u16) {
-        let need_temp_ctrl = !self.remote_ctrl_down;
-        if need_temp_ctrl {
-            self.net.send_input(InputEvent::Key {
-                vk: 0xA2,
-                scan: 0x1D,
-                extended: false,
-                down: true,
-            });
+    fn refresh_thumbnail(&mut self, norm_addr: &str, ctx: &egui::Context) {
+        if let Some(img) = load_host_thumbnail(norm_addr) {
+            let tex = ctx.load_texture(
+                format!("thumb-{norm_addr}"),
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            self.thumbnails.insert(norm_addr.to_string(), tex);
         }
-        self.net.send_input(InputEvent::Key {
-            vk,
-            scan,
-            extended: false,
-            down: true,
-        });
-        self.net.send_input(InputEvent::Key {
-            vk,
-            scan,
-            extended: false,
-            down: false,
-        });
-        if need_temp_ctrl {
-            self.net.send_input(InputEvent::Key {
-                vk: 0xA2,
-                scan: 0x1D,
-                extended: false,
-                down: false,
-            });
+    }
+
+    fn release_all_tabs_modifiers(&mut self) {
+        for tab in &mut self.tabs {
+            tab.release_remote_modifiers();
         }
     }
 
@@ -294,6 +206,7 @@ impl RandyDeskApp {
             quality: self.quality_input,
             fps: self.fps_input,
             just_opened: true,
+            retry_tab_id: None,
         };
         self.launch_connection(attempt, ctx);
     }
@@ -314,38 +227,88 @@ impl RandyDeskApp {
             quality: host.quality,
             fps: host.fps,
             just_opened: true,
+            retry_tab_id: None,
         };
         self.launch_connection(attempt, ctx);
     }
 
     fn launch_connection(&mut self, prompt: PasswordPrompt, ctx: &egui::Context) {
-        self.active_target_address = Some(prompt.address.clone());
-        self.recorded_recent_for_session = false;
-        self.focused_on_connect = false;
-        self.last_error_handled = None;
         self.ui_notice = None;
-        self.show_file_manager = false;
-        self.clip_watcher.reset();
-        self.last_clip_poll = Instant::now();
         self.last_attempt = Some(prompt.clone());
-        self.net.set_audio_volume(self.audio_volume);
-        self.net.connect(
-            ConnectRequest {
+        self.release_all_tabs_modifiers();
+        self.kb_hook.set_capture(false, None);
+
+        if let Some(tab_id) = prompt.retry_tab_id {
+            if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                self.tabs[pos].reconnect_with_password(
+                    prompt.password,
+                    self.settings.normalized_relay_url(),
+                    ctx,
+                );
+                self.active_session_tab = Some(pos);
+                return;
+            }
+        }
+
+        let norm = normalize_address(&prompt.address);
+        if let Some(existing_idx) = self
+            .tabs
+            .iter()
+            .position(|t| normalize_address(&t.target_address) == norm)
+        {
+            self.active_session_tab = Some(existing_idx);
+            return;
+        }
+
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let tab = RemoteSessionTab::launch(
+            TabLaunchParams {
+                id: tab_id,
+                title: prompt.title,
                 address: prompt.address,
                 password: prompt.password,
-                expected_fingerprint: prompt.expected_fp,
+                expected_fp: prompt.expected_fp,
                 relay_url: self.settings.normalized_relay_url(),
-                settings: StreamSettings {
-                    codec: prompt.codec,
-                    jpeg_quality: prompt.quality,
-                    target_fps: prompt.fps,
-                },
+                codec: prompt.codec,
+                quality: prompt.quality,
+                fps: prompt.fps,
                 stream_scale: self.stream_scale,
-                monitor_index: 0,
+                quality_preset: self.quality_preset,
+                show_remote_cursor: self.show_remote_cursor,
+                keyboard_grab_enabled: self.keyboard_grab_enabled,
+                keyboard_mode: self.keyboard_mode,
+                invert_wheel: self.invert_wheel,
+                swap_mouse_buttons: self.swap_mouse_buttons,
+                auto_clipboard: self.auto_clipboard,
                 audio_enabled: self.audio_enabled,
+                audio_volume: self.audio_volume,
             },
-            ctx.clone(),
+            &self.rt_handle,
+            ctx,
         );
+        self.tabs.push(tab);
+        self.active_session_tab = Some(self.tabs.len() - 1);
+    }
+
+    fn close_tab(&mut self, idx: usize, ctx: &egui::Context) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.kb_hook.set_capture(false, None);
+        let mut removed = self.tabs.remove(idx);
+        if let Some(addr) = removed.close_and_save(ctx) {
+            self.refresh_thumbnail(&addr, ctx);
+        }
+        if self.tabs.is_empty() {
+            self.active_session_tab = None;
+        } else if let Some(active) = self.active_session_tab {
+            if active == idx {
+                self.active_session_tab = if idx > 0 { Some(idx - 1) } else { Some(0) };
+            } else if active > idx {
+                self.active_session_tab = Some(active - 1);
+            }
+        }
     }
 
     fn handle_card_action(&mut self, act: CardAction, ctx: &egui::Context) {
@@ -376,36 +339,137 @@ impl RandyDeskApp {
         }
     }
 
-    fn apply_frame_updates_to_gpu(&mut self, ctx: &egui::Context, updates: Vec<FrameUpdate>) {
-        for update in updates {
-            let target_size = [update.width as usize, update.height as usize];
-            let needs_alloc = match &self.screen_texture {
-                Some(tex) => tex.size() != target_size,
-                None => true,
-            };
-
-            if needs_alloc {
-                let blank = egui::ColorImage::new(target_size, Color32::BLACK);
-                self.screen_texture = Some(ctx.load_texture(
-                    "remote-screen",
-                    blank,
-                    egui::TextureOptions::LINEAR,
-                ));
+    fn render_tab_strip(&mut self, ctx: &egui::Context) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        if let Some(active) = self.active_session_tab {
+            if self.tabs.get(active).is_some_and(|t| t.fullscreen) {
+                return;
             }
+        }
 
-            if let Some(tex) = &mut self.screen_texture {
-                for tile in update.tiles {
-                    let tile_img = egui::ColorImage::from_rgba_unmultiplied(
-                        [tile.width as usize, tile.height as usize],
-                        &tile.rgba,
-                    );
-                    tex.set_partial(
-                        [tile.x as usize, tile.y as usize],
-                        tile_img,
-                        egui::TextureOptions::LINEAR,
-                    );
-                }
-            }
+        let mut next_active = self.active_session_tab;
+        let mut close_idx: Option<usize> = None;
+
+        egui::TopBottomPanel::top("session_tabs_bar")
+            .exact_height(34.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(BG_SIDEBAR)
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .inner_margin(egui::Margin::symmetric(10.0, 4.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let lobby_active = self.active_session_tab.is_none();
+                    let lobby_btn = egui::Button::new(
+                        egui::RichText::new("Inicio").size(12.0).color(if lobby_active {
+                            Color32::WHITE
+                        } else {
+                            TEXT_SECONDARY
+                        }),
+                    )
+                    .fill(if lobby_active { ACCENT_BLUE } else { BG_CARD })
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if lobby_active { ACCENT_BLUE } else { BORDER_SUBTLE },
+                    ))
+                    .rounding(Rounding::same(6.0))
+                    .min_size(Vec2::new(58.0, 24.0));
+                    if ui.add(lobby_btn).clicked() {
+                        next_active = None;
+                    }
+
+                    egui::ScrollArea::horizontal()
+                        .id_salt("tabs_scroll")
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for (idx, tab) in self.tabs.iter().enumerate() {
+                                    let selected = self.active_session_tab == Some(idx);
+                                    let bg = if selected {
+                                        BG_SURFACE_ELEVATED
+                                    } else {
+                                        BG_CARD
+                                    };
+                                    let border = if selected {
+                                        ACCENT_BLUE
+                                    } else {
+                                        BORDER_SUBTLE
+                                    };
+                                    egui::Frame::none()
+                                        .fill(bg)
+                                        .stroke(Stroke::new(1.0_f32, border))
+                                        .rounding(Rounding::same(6.0))
+                                        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                let (dot_r, _) = ui.allocate_exact_size(
+                                                    Vec2::splat(8.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().circle_filled(
+                                                    dot_r.center(),
+                                                    3.5,
+                                                    tab.tab_dot_color(),
+                                                );
+                                                let short_title = if tab.title.chars().count() > 18
+                                                {
+                                                    let head: String =
+                                                        tab.title.chars().take(17).collect();
+                                                    format!("{head}...")
+                                                } else {
+                                                    tab.title.clone()
+                                                };
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new(short_title)
+                                                                .size(12.0)
+                                                                .color(if selected {
+                                                                    TEXT_PRIMARY
+                                                                } else {
+                                                                    TEXT_SECONDARY
+                                                                }),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    next_active = Some(idx);
+                                                }
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new("x")
+                                                                .size(11.5)
+                                                                .color(TEXT_MUTED),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .on_hover_text("Cerrar sesion")
+                                                    .clicked()
+                                                {
+                                                    close_idx = Some(idx);
+                                                }
+                                            });
+                                        });
+                                }
+                            });
+                        });
+                });
+            });
+
+        if next_active != self.active_session_tab {
+            self.release_all_tabs_modifiers();
+            self.kb_hook.set_capture(false, None);
+            self.active_session_tab = next_active;
+        }
+        if let Some(idx) = close_idx {
+            self.close_tab(idx, ctx);
         }
     }
 }
@@ -414,7 +478,9 @@ impl eframe::App for RandyDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.updater.take_exit_requested() {
             self.kb_hook.set_capture(false, None);
-            self.net.disconnect();
+            for mut tab in self.tabs.drain(..) {
+                let _ = tab.close_and_save(ctx);
+            }
             self.host_panel.stop_host();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -425,7 +491,11 @@ impl eframe::App for RandyDeskApp {
             if tray.take_restore_requested() {
                 self.hidden_to_tray = false;
                 self.restored_at = Instant::now();
-                self.net.send_cmd(NetCommand::RequestKeyframe);
+                if let Some(active) = self.active_session_tab {
+                    if let Some(tab) = self.tabs.get(active) {
+                        tab.net.send_cmd(NetCommand::RequestKeyframe);
+                    }
+                }
             } else if !self.hidden_to_tray {
                 tray.cache_main_hwnd();
                 if self.restored_at.elapsed() >= Duration::from_millis(450)
@@ -433,165 +503,140 @@ impl eframe::App for RandyDeskApp {
                     && tray.hide_to_tray()
                 {
                     self.hidden_to_tray = true;
-                    self.release_remote_modifiers();
+                    self.release_all_tabs_modifiers();
                     self.kb_hook.set_capture(false, None);
                 }
             }
         }
 
-        // 2. Lectura del estado compartido de red
-        let (
-            status,
-            stats,
-            updates,
-            incoming_clip,
-            monitors,
-            active_monitor,
-            remote_cursor,
-            remote_dir,
-            transfers,
-        ) = {
-            let mut guard = self.net.shared.lock().expect("lock estado red");
-            let clip = guard.incoming_clipboard.take();
-            let updates: Vec<FrameUpdate> = guard.pending_updates.drain(..).collect();
-            (
-                guard.status.clone(),
-                guard.stats.clone(),
-                updates,
-                clip,
-                guard.monitors.clone(),
-                guard.active_monitor,
-                guard.remote_cursor,
-                guard.remote_dir.clone(),
-                guard.transfers.clone(),
-            )
-        };
+        // 2. Presencia online y miniaturas cuando estamos en Lobby (o periodicamente)
+        let addresses: Vec<String> = self.hosts.iter().map(|h| h.address.clone()).collect();
+        self.presence.maybe_refresh(
+            self.settings.normalized_relay_url().as_deref(),
+            &addresses,
+            ctx,
+        );
+        self.sync_thumbnails(ctx);
 
-        if let Some(clip_text) = incoming_clip {
-            if let Ok(mut cb) = Clipboard::new() {
-                let _ = cb.set_text(clip_text.clone());
+        // 3. Sondeo de todas las pestañas abiertas
+        let active_idx = self.active_session_tab;
+        let mut snapshots: Vec<TabPollSnapshot> = Vec::with_capacity(self.tabs.len());
+        let mut refreshed_thumbs: Vec<String> = Vec::new();
+        let mut recent_updates: Vec<(usize, String, Option<String>)> = Vec::new();
+        let mut auth_tab: Option<usize> = None;
+
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
+            let is_active = active_idx == Some(idx);
+            let snap = tab.poll(ctx, is_active, self.hidden_to_tray);
+            if let Some(addr) = &snap.thumb_updated_addr {
+                refreshed_thumbs.push(addr.clone());
             }
-            self.clip_watcher.mark_applied(&clip_text);
+            if let Some((host_name, fp)) = &snap.need_recent_upsert {
+                recent_updates.push((idx, host_name.clone(), fp.clone()));
+            }
+            if snap.auth_prompt_needed && auth_tab.is_none() {
+                auth_tab = Some(idx);
+            }
+            snapshots.push(snap);
         }
 
-        if matches!(status, ConnectionState::Connected { .. })
-            && self.auto_clipboard
-            && !self.view_only
-            && !self.hidden_to_tray
-            && self.last_clip_poll.elapsed() >= Duration::from_millis(350)
-        {
-            self.last_clip_poll = Instant::now();
-            if let Some(text) = self.clip_watcher.poll_changed() {
-                self.net.send_cmd(NetCommand::ClipboardSet(text));
-            }
+        for addr in refreshed_thumbs {
+            self.refresh_thumbnail(&addr, ctx);
         }
-
-        if let ConnectionState::Connected { ref host_name, .. } = status {
-            if !self.recorded_recent_for_session {
-                if let Some(addr) = &self.active_target_address {
-                    upsert_recent(
-                        &mut self.hosts,
-                        addr,
-                        host_name,
-                        stats.fingerprint_sha256.as_deref(),
-                        self.codec_input,
-                        self.quality_input,
-                        self.fps_input,
-                    );
-                    let _ = save_hosts(&self.hosts);
-                }
-                self.recorded_recent_for_session = true;
+        if !recent_updates.is_empty() {
+            for (idx, host_name, fp) in recent_updates {
+                let tab = &self.tabs[idx];
+                upsert_recent(
+                    &mut self.hosts,
+                    &tab.target_address,
+                    &host_name,
+                    fp.as_deref(),
+                    tab.codec_input,
+                    tab.quality_input,
+                    tab.fps_input,
+                );
             }
-            if !self.hidden_to_tray {
-                ctx.request_repaint_after(Duration::from_millis(500));
-            }
+            let _ = save_hosts(&self.hosts);
         }
-
-        if !updates.is_empty() {
-            self.apply_frame_updates_to_gpu(ctx, updates);
+        if let Some(idx) = auth_tab {
+            let tab = &self.tabs[idx];
+            self.password_prompt = Some(PasswordPrompt {
+                title: tab.title.clone(),
+                address: tab.target_address.clone(),
+                password: String::new(),
+                expected_fp: tab.expected_fp.clone(),
+                codec: tab.codec_input,
+                quality: tab.quality_input,
+                fps: tab.fps_input,
+                just_opened: true,
+                retry_tab_id: Some(tab.id),
+            });
+            self.active_session_tab = Some(idx);
         }
 
         if self.hidden_to_tray {
-            self.release_remote_modifiers();
+            self.release_all_tabs_modifiers();
             self.kb_hook.set_capture(false, None);
             return;
         }
 
-        match status {
-            ConnectionState::Disconnected | ConnectionState::Error(_) => {
-                self.focused_on_connect = false;
-                self.release_remote_modifiers();
-                self.kb_hook.set_capture(false, None);
-                if let ConnectionState::Error(msg) = &status {
-                    if self.last_error_handled.as_deref() != Some(msg.as_str()) {
-                        self.last_error_handled = Some(msg.clone());
-                        if msg.contains("Contraseña") || msg.contains("PIN") {
-                            if let Some(mut attempt) = self.last_attempt.clone() {
-                                attempt.password.clear();
-                                attempt.just_opened = true;
-                                self.password_prompt = Some(attempt);
-                            }
-                        } else {
-                            self.ui_notice = Some(format!("No se pudo conectar: {msg}"));
-                        }
+        // 4. Barra superior de pestañas (visible en cuanto haya >= 1 sesión)
+        self.render_tab_strip(ctx);
+
+        // 5. Renderizado de vista activa (Lobby o Pestaña remota)
+        if let Some(active) = self.active_session_tab {
+            if active < self.tabs.len() {
+                let snap = &snapshots[active];
+                let outcome = self.tabs[active].render_active(
+                    ctx,
+                    &self.rt_handle,
+                    &mut self.kb_hook,
+                    self.tray.as_ref(),
+                    self.hidden_to_tray,
+                    snap,
+                );
+                match outcome {
+                    SessionTabOutcome::None => {}
+                    SessionTabOutcome::CloseTab => self.close_tab(active, ctx),
+                    SessionTabOutcome::Reconnect => {
+                        let relay_url = self.settings.normalized_relay_url();
+                        self.tabs[active].reconnect_with_password(String::new(), relay_url, ctx);
+                    }
+                    SessionTabOutcome::ReconnectWithPrompt => {
+                        let tab = &self.tabs[active];
+                        self.password_prompt = Some(PasswordPrompt {
+                            title: tab.title.clone(),
+                            address: tab.target_address.clone(),
+                            password: String::new(),
+                            expected_fp: tab.expected_fp.clone(),
+                            codec: tab.codec_input,
+                            quality: tab.quality_input,
+                            fps: tab.fps_input,
+                            just_opened: true,
+                            retry_tab_id: Some(tab.id),
+                        });
                     }
                 }
-                self.render_lobby(ctx);
                 self.render_modals(ctx);
-            }
-            ConnectionState::Connecting { ref address } => {
-                self.focused_on_connect = false;
-                self.release_remote_modifiers();
-                self.kb_hook.set_capture(false, None);
-                self.render_connecting(ctx, address);
-            }
-            ConnectionState::Connected {
-                ref host_name,
-                width,
-                height,
-            } => {
-                self.render_remote_session(
-                    ctx,
-                    host_name,
-                    width,
-                    height,
-                    &stats,
-                    None,
-                    &monitors,
-                    active_monitor,
-                    remote_cursor,
-                    remote_dir.as_ref(),
-                    &transfers,
-                );
-            }
-            ConnectionState::Reconnecting {
-                attempt,
-                ref reason,
-            } => {
-                self.release_remote_modifiers();
-                self.kb_hook.set_capture(false, None);
-                self.render_remote_session(
-                    ctx,
-                    &self.quick_address.clone(),
-                    0,
-                    0,
-                    &stats,
-                    Some((attempt, reason.as_str())),
-                    &monitors,
-                    active_monitor,
-                    remote_cursor,
-                    remote_dir.as_ref(),
-                    &transfers,
-                );
+                return;
+            } else {
+                self.active_session_tab = None;
             }
         }
+
+        self.kb_hook.set_capture(false, None);
+        self.render_lobby(ctx);
+        self.render_modals(ctx);
     }
 }
 
 impl Drop for RandyDeskApp {
     fn drop(&mut self) {
         self.kb_hook.set_capture(false, None);
-        self.net.disconnect();
+        for mut tab in self.tabs.drain(..) {
+            let _ = tab.save_thumbnail_now();
+            tab.net.disconnect();
+        }
         self.host_panel.stop_host();
     }
 }
@@ -983,9 +1028,16 @@ impl RandyDeskApp {
                 });
 
                 ui.add_space(14.0);
-                if let Some(act) =
-                    render_host_cards(ui, &self.hosts, self.active_tab, &self.search_query)
-                {
+                let addresses: Vec<String> = self.hosts.iter().map(|h| h.address.clone()).collect();
+                let online_map = self.presence.snapshot(&addresses);
+                if let Some(act) = render_host_cards(
+                    ui,
+                    &self.hosts,
+                    self.active_tab,
+                    &self.search_query,
+                    &online_map,
+                    &self.thumbnails,
+                ) {
                     self.handle_card_action(act, ctx);
                 }
             });
@@ -1252,591 +1304,6 @@ impl RandyDeskApp {
                 });
             if !open {
                 self.show_guide = false;
-            }
-        }
-    }
-
-    fn render_connecting(&mut self, ctx: &egui::Context, address: &str) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.add_space(10.0);
-                    ui.heading(format!("Conectando a {}...", display_address(address)));
-                    ui.add_space(10.0);
-                    if ui.button("Cancelar").clicked() {
-                        self.net.disconnect();
-                    }
-                });
-            });
-        });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_remote_session(
-        &mut self,
-        ctx: &egui::Context,
-        host_name: &str,
-        width: u32,
-        height: u32,
-        stats: &crate::net::SessionStats,
-        reconnecting: Option<(u32, &str)>,
-        monitors: &[MonitorInfo],
-        active_monitor: u8,
-        remote_cursor: CursorKind,
-        remote_dir: Option<&RemoteDirListing>,
-        transfers: &[TransferItem],
-    ) {
-        let mut img_rect = egui::Rect::NOTHING;
-        let mut pointer_in_canvas = false;
-        let mut has_texture = false;
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::BLACK))
-            .show(ctx, |ui| {
-                let Some(tex) = &self.screen_texture else {
-                    self.kb_hook.set_capture(false, None);
-                    ui.centered_and_justified(|ui| {
-                        ui.label("Esperando primer cuadro del equipo remoto...");
-                    });
-                    return;
-                };
-                has_texture = true;
-
-                let tex_size = tex.size_vec2();
-                match self.scale_mode {
-                    ScaleMode::Adaptive => {
-                        let avail = ui.available_size();
-                        let scale =
-                            (avail.x / tex_size.x.max(1.0)).min(avail.y / tex_size.y.max(1.0));
-                        let draw_size = tex_size * scale;
-                        let (rect, response) =
-                            ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-                        img_rect = egui::Rect::from_center_size(rect.center(), draw_size);
-                        pointer_in_canvas = response.hovered() || response.dragged();
-                        ui.painter().image(
-                            tex.id(),
-                            img_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-                    }
-                    ScaleMode::Original => {
-                        egui::ScrollArea::both()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let size = tex_size.max(ui.available_size());
-                                let (rect, response) =
-                                    ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                                img_rect = egui::Rect::from_center_size(rect.center(), tex_size);
-                                pointer_in_canvas = response.hovered() || response.dragged();
-                                ui.painter().image(
-                                    tex.id(),
-                                    img_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    Color32::WHITE,
-                                );
-                            });
-                    }
-                    ScaleMode::Custom(pct) => {
-                        let factor = (pct / 100.0).clamp(0.5, 2.0);
-                        let draw_size = tex_size * factor;
-                        egui::ScrollArea::both()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let size = draw_size.max(ui.available_size());
-                                let (rect, response) =
-                                    ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                                img_rect = egui::Rect::from_center_size(rect.center(), draw_size);
-                                pointer_in_canvas = response.hovered() || response.dragged();
-                                ui.painter().image(
-                                    tex.id(),
-                                    img_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    Color32::WHITE,
-                                );
-                            });
-                    }
-                }
-            });
-
-        if has_texture && pointer_in_canvas {
-            if self.view_only {
-                ctx.set_cursor_icon(egui::CursorIcon::NotAllowed);
-            } else if !self.show_remote_cursor {
-                ctx.set_cursor_icon(egui::CursorIcon::None);
-            } else {
-                ctx.set_cursor_icon(map_remote_cursor(remote_cursor));
-            }
-        }
-
-        let mut bar_state = SessionBarState {
-            codec: self.codec_input,
-            quality: self.quality_input,
-            fps: self.fps_input,
-            scale_mode: self.scale_mode,
-            custom_scale_pct: self.custom_scale_pct,
-            stream_scale: self.stream_scale,
-            quality_preset: self.quality_preset,
-            show_monitor_stats: self.show_monitor_stats,
-            show_remote_cursor: self.show_remote_cursor,
-            fullscreen: self.fullscreen,
-            keyboard_grab_enabled: self.keyboard_grab_enabled,
-            keyboard_mode: self.keyboard_mode,
-            invert_wheel: self.invert_wheel,
-            swap_mouse_buttons: self.swap_mouse_buttons,
-            view_only: self.view_only,
-            bar_collapsed: self.bar_collapsed,
-            bar_pinned: self.bar_pinned,
-            auto_clipboard: self.auto_clipboard,
-            input_debug_log: self.input_debug_log,
-            audio_enabled: self.audio_enabled,
-            audio_volume: self.audio_volume,
-            show_file_manager: self.show_file_manager,
-        };
-        let bar_actions = render_session_overlay(
-            ctx,
-            SessionBarInput {
-                host_name,
-                width,
-                height,
-                stats,
-                reconnecting,
-                hook_installed: self.kb_hook.is_installed(),
-                hook_hits: self.kb_hook.sent_key_count(),
-                monitors,
-                active_monitor,
-            },
-            &mut bar_state,
-        );
-
-        self.codec_input = bar_state.codec;
-        self.quality_input = bar_state.quality;
-        self.fps_input = bar_state.fps;
-        self.scale_mode = bar_state.scale_mode;
-        self.custom_scale_pct = bar_state.custom_scale_pct;
-        self.stream_scale = bar_state.stream_scale;
-        self.quality_preset = bar_state.quality_preset;
-        self.show_monitor_stats = bar_state.show_monitor_stats;
-        self.show_remote_cursor = bar_state.show_remote_cursor;
-        self.fullscreen = bar_state.fullscreen;
-        self.keyboard_grab_enabled = bar_state.keyboard_grab_enabled;
-        self.keyboard_mode = bar_state.keyboard_mode;
-        self.invert_wheel = bar_state.invert_wheel;
-        self.swap_mouse_buttons = bar_state.swap_mouse_buttons;
-        self.view_only = bar_state.view_only;
-        self.bar_collapsed = bar_state.bar_collapsed;
-        self.bar_pinned = bar_state.bar_pinned;
-        self.auto_clipboard = bar_state.auto_clipboard;
-        self.input_debug_log = bar_state.input_debug_log;
-        self.audio_enabled = bar_state.audio_enabled;
-        self.audio_volume = bar_state.audio_volume;
-
-        if bar_actions.settings_changed {
-            self.net.send_cmd(NetCommand::UpdateSettings(StreamSettings {
-                codec: self.codec_input,
-                jpeg_quality: self.quality_input,
-                target_fps: self.fps_input,
-            }));
-        }
-        if bar_actions.stream_scale_changed {
-            self.net
-                .send_cmd(NetCommand::SetStreamScale(self.stream_scale));
-        }
-        if let Some(mon_idx) = bar_actions.select_monitor {
-            self.net.send_cmd(NetCommand::SelectMonitor(mon_idx));
-        }
-        if bar_actions.debug_log_changed {
-            set_input_debug_logging(self.input_debug_log);
-        }
-        if bar_actions.audio_changed {
-            self.net.set_audio_muted(!self.audio_enabled);
-            self.net.set_audio_volume(self.audio_volume);
-            self.net
-                .send_cmd(NetCommand::SetAudioEnabled(self.audio_enabled));
-        }
-        if bar_actions.toggle_file_manager {
-            self.show_file_manager = !self.show_file_manager;
-            if self.show_file_manager && remote_dir.is_none() {
-                self.net.send_cmd(NetCommand::FileListReq(String::new()));
-            }
-        }
-        if bar_actions.lock_remote_screen {
-            self.net.send_cmd(NetCommand::LockWorkStation);
-        }
-        if bar_actions.send_sas {
-            self.net.send_cmd(NetCommand::SendSas);
-        }
-        if bar_actions.send_win_key {
-            if let Some(tx) = self.net.cmd_sender() {
-                self.rt_handle.spawn(async move {
-                    let _ = tx
-                        .send(NetCommand::Input(InputEvent::Key {
-                            vk: 0x5B,
-                            scan: 0x5B,
-                            extended: true,
-                            down: true,
-                        }))
-                        .await;
-                    tokio::time::sleep(Duration::from_millis(35)).await;
-                    let _ = tx
-                        .send(NetCommand::Input(InputEvent::Key {
-                            vk: 0x5B,
-                            scan: 0x5B,
-                            extended: true,
-                            down: false,
-                        }))
-                        .await;
-                });
-            }
-        }
-        if bar_actions.send_task_manager {
-            if let Some(tx) = self.net.cmd_sender() {
-                self.rt_handle.spawn(async move {
-                    for (vk, scan) in [(0xA2u16, 0x1Du16), (0xA0, 0x2A), (0x1B, 0x01)] {
-                        let _ = tx
-                            .send(NetCommand::Input(InputEvent::Key {
-                                vk,
-                                scan,
-                                extended: false,
-                                down: true,
-                            }))
-                            .await;
-                    }
-                    tokio::time::sleep(Duration::from_millis(35)).await;
-                    for (vk, scan) in [(0x1Bu16, 0x01u16), (0xA0, 0x2A), (0xA2, 0x1D)] {
-                        let _ = tx
-                            .send(NetCommand::Input(InputEvent::Key {
-                                vk,
-                                scan,
-                                extended: false,
-                                down: false,
-                            }))
-                            .await;
-                    }
-                });
-            }
-        }
-        if bar_actions.send_clipboard {
-            if let Ok(text) = Clipboard::new().and_then(|mut c| c.get_text()) {
-                self.clip_watcher.mark_applied(&text);
-                self.net.send_cmd(NetCommand::ClipboardSet(text));
-            }
-        }
-        if bar_actions.fetch_clipboard {
-            self.net.send_cmd(NetCommand::ClipboardGet);
-        }
-        if bar_actions.request_keyframe {
-            self.net.send_cmd(NetCommand::RequestKeyframe);
-        }
-        if bar_actions.toggle_fullscreen {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-        }
-        if bar_actions.keyboard_cfg_changed {
-            self.release_remote_modifiers();
-            self.kb_hook.release_modifiers_now();
-            self.kb_hook.set_mode(self.keyboard_mode);
-            if !self.keyboard_grab_enabled || self.view_only {
-                self.kb_hook.set_capture(false, None);
-            } else {
-                if let Some(tray) = self.tray.as_ref() {
-                    tray.ensure_foreground();
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-        }
-        if bar_actions.disconnect {
-            if self.fullscreen {
-                self.fullscreen = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            }
-            self.show_file_manager = false;
-            self.focused_on_connect = false;
-            self.release_remote_modifiers();
-            self.kb_hook.set_capture(false, None);
-            self.net.disconnect();
-            return;
-        }
-
-        // Arrastrar y soltar archivos locales sobre la ventana para subirlos al equipo remoto
-        if !self.view_only {
-            let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-            if !dropped.is_empty() {
-                let target_remote = self.file_mgr_ui.current_remote_dir(remote_dir);
-                let mut uploaded_any = false;
-                for file in dropped {
-                    if let Some(path) = file.path {
-                        if path.is_file() {
-                            let id = self.next_transfer_id;
-                            self.next_transfer_id += 1;
-                            self.net.send_cmd(NetCommand::UploadLocalFile {
-                                transfer_id: id,
-                                local_path: path,
-                                remote_dir: target_remote.clone(),
-                            });
-                            uploaded_any = true;
-                        }
-                    }
-                }
-                if uploaded_any {
-                    self.show_file_manager = true;
-                    if remote_dir.is_none() {
-                        self.net.send_cmd(NetCommand::FileListReq(String::new()));
-                    }
-                }
-            }
-        }
-
-        let fm_actions = self.file_mgr_ui.show(
-            ctx,
-            &mut self.show_file_manager,
-            remote_dir,
-            transfers,
-        );
-        for act in fm_actions {
-            match act {
-                FileManagerAction::ListRemote(path) => {
-                    self.net.send_cmd(NetCommand::FileListReq(path));
-                }
-                FileManagerAction::MkdirRemote { parent, name } => {
-                    self.net
-                        .send_cmd(NetCommand::FileMkdir { parent_dir: parent, name });
-                }
-                FileManagerAction::UploadFile {
-                    local_path,
-                    remote_dir,
-                } => {
-                    let id = self.next_transfer_id;
-                    self.next_transfer_id += 1;
-                    self.net.send_cmd(NetCommand::UploadLocalFile {
-                        transfer_id: id,
-                        local_path,
-                        remote_dir,
-                    });
-                }
-                FileManagerAction::DownloadFile {
-                    remote_path,
-                    local_dir,
-                } => {
-                    let id = self.next_transfer_id;
-                    self.next_transfer_id += 1;
-                    self.net.send_cmd(NetCommand::DownloadRemoteFile {
-                        transfer_id: id,
-                        remote_path,
-                        local_dir,
-                    });
-                }
-                FileManagerAction::CancelTransfer(id) => {
-                    self.net.send_cmd(NetCommand::CancelTransfer(id));
-                }
-                FileManagerAction::ClearCompleted => {
-                    if let Ok(mut g) = self.net.shared.lock() {
-                        g.transfers
-                            .retain(|t| matches!(t.status, TransferStatus::InProgress));
-                    }
-                }
-            }
-        }
-
-        if !has_texture {
-            return;
-        }
-
-        if !self.focused_on_connect && reconnecting.is_none() && !self.hidden_to_tray {
-            self.focused_on_connect = true;
-            if let Some(tray) = self.tray.as_ref() {
-                tray.ensure_foreground();
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-
-        let egui_focused = ctx.input(|i| i.focused);
-        self.kb_hook.set_window_focused(egui_focused);
-        let is_fg = KeyboardHookGuard::is_window_foreground();
-        let typing_in_local_ui = ctx.wants_keyboard_input();
-        let should_capture_kb = reconnecting.is_none()
-            && self.keyboard_grab_enabled
-            && !self.hidden_to_tray
-            && !self.view_only
-            && !typing_in_local_ui;
-        if self.was_foreground && !is_fg {
-            self.release_remote_modifiers();
-            if should_capture_kb {
-                self.kb_hook.release_modifiers_now();
-            }
-        }
-        self.was_foreground = is_fg;
-
-        self.kb_hook.set_mode(self.keyboard_mode);
-        self.kb_hook.set_capture(
-            should_capture_kb,
-            if should_capture_kb {
-                self.net.cmd_sender()
-            } else {
-                None
-            },
-        );
-
-        if self.view_only || typing_in_local_ui {
-            self.release_remote_modifiers();
-            return;
-        }
-
-        let hook_blocking_egui = self.kb_hook.is_capturing_all_keys();
-
-        // Sincroniza Ctrl/Alt/Shift con la ventana remota para atajos en Modo traducción (sin AltGr)
-        if !hook_blocking_egui && is_fg && reconnecting.is_none() {
-            let mods = ctx.input(|i| i.modifiers);
-            let altgr = mods.ctrl && mods.alt && KeyboardHookGuard::is_altgr_down();
-            let eff_ctrl = mods.ctrl && !altgr;
-            let eff_alt = mods.alt && !altgr;
-            if eff_ctrl != self.remote_ctrl_down {
-                self.net.send_input(InputEvent::Key {
-                    vk: 0xA2,
-                    scan: 0x1D,
-                    extended: false,
-                    down: eff_ctrl,
-                });
-                self.remote_ctrl_down = eff_ctrl;
-            }
-            if eff_alt != self.remote_alt_down {
-                self.net.send_input(InputEvent::Key {
-                    vk: 0xA4,
-                    scan: 0x38,
-                    extended: false,
-                    down: eff_alt,
-                });
-                self.remote_alt_down = eff_alt;
-            }
-            if mods.shift != self.remote_shift_down {
-                self.net.send_input(InputEvent::Key {
-                    vk: 0xA0,
-                    scan: 0x2A,
-                    extended: false,
-                    down: mods.shift,
-                });
-                self.remote_shift_down = mods.shift;
-            }
-        } else {
-            self.release_remote_modifiers();
-        }
-
-        let events = ctx.input(|i| i.events.clone());
-
-        for ev in events {
-            match ev {
-                egui::Event::PointerMoved(pos) if pointer_in_canvas => {
-                    if let Some((x_norm, y_norm)) = normalize_pos(pos, img_rect) {
-                        self.net
-                            .send_input(InputEvent::MouseMove { x_norm, y_norm });
-                    }
-                }
-                egui::Event::PointerButton {
-                    pos,
-                    button,
-                    pressed,
-                    ..
-                } if (pointer_in_canvas && img_rect.contains(pos)) || !pressed => {
-                    if pressed && pointer_in_canvas && img_rect.contains(pos) {
-                        if let Some(tray) = self.tray.as_ref() {
-                            tray.ensure_foreground();
-                        }
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                    if let Some((x_norm, y_norm)) = normalize_pos(pos, img_rect) {
-                        self.net
-                            .send_input(InputEvent::MouseMove { x_norm, y_norm });
-                    }
-                    let mapped_btn = if self.swap_mouse_buttons {
-                        match button {
-                            egui::PointerButton::Primary => egui::PointerButton::Secondary,
-                            egui::PointerButton::Secondary => egui::PointerButton::Primary,
-                            other => other,
-                        }
-                    } else {
-                        button
-                    };
-                    if let Some(mb) = map_mouse_button(mapped_btn) {
-                        self.net.send_input(InputEvent::MouseButton {
-                            button: mb,
-                            down: pressed,
-                        });
-                    }
-                }
-                egui::Event::MouseWheel { delta, .. } if pointer_in_canvas => {
-                    let sign = if self.invert_wheel { -1 } else { 1 };
-                    let dx = (delta.x * 3.0).round() as i16 * 40 * sign;
-                    let dy = (delta.y * 3.0).round() as i16 * 40 * sign;
-                    if dx != 0 || dy != 0 {
-                        self.net.send_input(InputEvent::MouseWheel {
-                            delta_x: dx,
-                            delta_y: dy,
-                        });
-                    }
-                }
-                egui::Event::Copy if !hook_blocking_egui => {
-                    append_input_debug_log("[CLIENT-EGUI] shortcut Copy (Ctrl+C)");
-                    self.send_remote_ctrl_shortcut(0x43, 0x2E);
-                }
-                egui::Event::Cut if !hook_blocking_egui => {
-                    append_input_debug_log("[CLIENT-EGUI] shortcut Cut (Ctrl+X)");
-                    self.send_remote_ctrl_shortcut(0x58, 0x2D);
-                }
-                egui::Event::Paste(_) if !hook_blocking_egui => {
-                    append_input_debug_log("[CLIENT-EGUI] shortcut Paste (Ctrl+V)");
-                    self.send_remote_ctrl_shortcut(0x56, 0x2F);
-                }
-                egui::Event::Key {
-                    key,
-                    pressed,
-                    modifiers,
-                    ..
-                } if !hook_blocking_egui => {
-                    let altgr = modifiers.ctrl && modifiers.alt && KeyboardHookGuard::is_altgr_down();
-                    let is_combo = (modifiers.ctrl || modifiers.alt || modifiers.command) && !altgr;
-                    if is_combo || is_control_or_nav_key(key) {
-                        if let Some((vk, extended)) = map_egui_key_to_vk(key) {
-                            append_input_debug_log(&format!(
-                                "[CLIENT-EGUI] key vk=0x{vk:04X} ext={extended} down={pressed} combo={is_combo}"
-                            ));
-                            self.net.send_input(InputEvent::Key {
-                                vk,
-                                scan: 0,
-                                extended,
-                                down: pressed,
-                            });
-                        }
-                    }
-                }
-                egui::Event::Text(text) if !hook_blocking_egui => {
-                    let mods = ctx.input(|i| i.modifiers);
-                    let altgr = mods.ctrl && mods.alt && KeyboardHookGuard::is_altgr_down();
-                    if (!mods.ctrl && !mods.alt && !mods.command) || altgr {
-                        if altgr {
-                            self.release_remote_modifiers();
-                        }
-                        let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
-                        if !chars.is_empty() {
-                            append_input_debug_log(&format!(
-                                "[CLIENT-EGUI] text count={} altgr={altgr}",
-                                chars.len()
-                            ));
-                        }
-                        for ch in chars {
-                            self.net
-                                .send_input(InputEvent::UnicodeChar { ch, down: true });
-                            self.net
-                                .send_input(InputEvent::UnicodeChar { ch, down: false });
-                        }
-                    }
-                }
-                _ => {}
             }
         }
     }
