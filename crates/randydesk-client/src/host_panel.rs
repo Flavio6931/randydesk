@@ -2,8 +2,10 @@
 
 use crate::config::display_address;
 use crate::theme::{
-    draw_lock_icon, draw_status_pill, ACCENT_BLUE, ACCENT_TEAL, BG_CARD, BG_SURFACE_ELEVATED,
-    BORDER_HOVER, BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    draw_lock_icon, draw_status_pill, styled_text_input, ACCENT_BLUE, ACCENT_TEAL, BG_CARD,
+    BG_SURFACE_ELEVATED, BORDER_HOVER, BORDER_SUBTLE, PILL_AMBER_BG, PILL_AMBER_BORDER,
+    PILL_AMBER_TEXT, PILL_BLUE_BG, PILL_BLUE_BORDER, PILL_BLUE_TEXT, PILL_GREEN_BG,
+    PILL_GREEN_BORDER, PILL_GREEN_TEXT, STATUS_ORANGE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
@@ -292,13 +294,10 @@ impl HostPanelState {
                                         egui::RichText::new("Copiar")
                                             .size(10.5)
                                             .strong()
-                                            .color(ACCENT_BLUE),
+                                            .color(PILL_BLUE_TEXT),
                                     )
-                                    .fill(Color32::from_rgba_unmultiplied(0x2F, 0x81, 0xF7, 36))
-                                    .stroke(Stroke::new(
-                                        1.0_f32,
-                                        Color32::from_rgba_unmultiplied(0x2F, 0x81, 0xF7, 88),
-                                    ))
+                                    .fill(PILL_BLUE_BG)
+                                    .stroke(Stroke::new(1.0_f32, PILL_BLUE_BORDER))
                                     .rounding(Rounding::same(5.0))
                                     .min_size(Vec2::new(50.0, 20.0)),
                                 )
@@ -334,18 +333,18 @@ impl HostPanelState {
                                 ui,
                                 "Relay E2E",
                                 ACCENT_TEAL,
-                                ACCENT_TEAL,
-                                Color32::from_rgba_unmultiplied(0x10, 0xB9, 0x81, 32),
-                                Color32::from_rgba_unmultiplied(0x10, 0xB9, 0x81, 90),
+                                PILL_GREEN_TEXT,
+                                PILL_GREEN_BG,
+                                PILL_GREEN_BORDER,
                             );
                         } else if i.relay_url.is_some() {
                             draw_status_pill(
                                 ui,
                                 "Conectando...",
                                 STATUS_ORANGE,
-                                STATUS_ORANGE,
-                                Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, 30),
-                                Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, 85),
+                                PILL_AMBER_TEXT,
+                                PILL_AMBER_BG,
+                                PILL_AMBER_BORDER,
                             );
                         } else {
                             draw_status_pill(
@@ -425,10 +424,7 @@ impl HostPanelState {
             ui.add_space(10.0);
             egui::Frame::none()
                 .fill(BG_CARD)
-                .stroke(Stroke::new(
-                    1.0_f32,
-                    Color32::from_rgba_unmultiplied(0x10, 0xB9, 0x81, 95),
-                ))
+                .stroke(Stroke::new(1.0_f32, PILL_GREEN_BORDER))
                 .rounding(Rounding::same(12.0))
                 .inner_margin(egui::Margin::same(12.0))
                 .show(ui, |ui| {
@@ -439,9 +435,13 @@ impl HostPanelState {
                             .color(TEXT_PRIMARY),
                     );
                     ui.add_space(6.0);
-                    ui.add_sized(
-                        [ui.available_width(), 28.0],
-                        egui::TextEdit::singleline(&mut self.password),
+                    styled_text_input(
+                        ui,
+                        &mut self.password,
+                        "Sin contraseña...",
+                        ui.available_width(),
+                        30.0,
+                        12.5,
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -489,11 +489,8 @@ impl HostPanelState {
                     if self.cached_svc_status == ServiceStatusKind::Running {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             egui::Frame::none()
-                                .fill(Color32::from_rgba_unmultiplied(0x10, 0xB9, 0x81, 34))
-                                .stroke(Stroke::new(
-                                    1.0_f32,
-                                    Color32::from_rgba_unmultiplied(0x10, 0xB9, 0x81, 88),
-                                ))
+                                .fill(PILL_GREEN_BG)
+                                .stroke(Stroke::new(1.0_f32, PILL_GREEN_BORDER))
                                 .rounding(Rounding::same(4.0))
                                 .inner_margin(egui::Margin::symmetric(6.0, 2.0))
                                 .show(ui, |ui| {
@@ -501,7 +498,7 @@ impl HostPanelState {
                                         egui::RichText::new("UAC + SAS")
                                             .size(9.5)
                                             .strong()
-                                            .color(ACCENT_TEAL),
+                                            .color(PILL_GREEN_TEXT),
                                     );
                                 });
                         });
@@ -557,10 +554,10 @@ impl HostPanelState {
                                     egui::Button::new(
                                         egui::RichText::new("Desinstalar")
                                             .size(11.0)
-                                            .color(TEXT_MUTED),
+                                            .color(TEXT_SECONDARY),
                                     )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+                                    .fill(BG_SURFACE_ELEVATED)
+                                    .stroke(Stroke::new(1.0_f32, BORDER_HOVER)),
                                 )
                                 .on_hover_text("Detiene y elimina RandyDeskService de Windows")
                                 .clicked()

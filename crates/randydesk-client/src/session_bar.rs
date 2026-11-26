@@ -3,7 +3,9 @@
 use crate::net::SessionStats;
 use crate::theme::{
     ACCENT_BLUE, ACCENT_DANGER_TEXT, ACCENT_TEAL, BG_SURFACE_ELEVATED, BORDER_HOVER,
-    BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    BORDER_SUBTLE, PILL_AMBER_BG, PILL_AMBER_TEXT, PILL_GREEN_BG, PILL_GREEN_BORDER,
+    PILL_GREEN_TEXT, PILL_RED_BG, PILL_RED_BORDER, STATUS_ORANGE, TEXT_MUTED, TEXT_PRIMARY,
+    TEXT_SECONDARY,
 };
 use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
 use eframe::egui::{self, Color32, Rounding, Shape, Stroke, Vec2};
@@ -205,9 +207,8 @@ pub fn render_session_overlay(
                                     };
                                     if !t_label.is_empty() {
                                         egui::Frame::none()
-                                            .fill(Color32::from_rgba_unmultiplied(
-                                                0x10, 0xB9, 0x81, 36,
-                                            ))
+                                            .fill(PILL_GREEN_BG)
+                                            .stroke(Stroke::new(1.0_f32, PILL_GREEN_BORDER))
                                             .rounding(Rounding::same(99.0))
                                             .inner_margin(egui::Margin::symmetric(7.0, 2.0))
                                             .show(ui, |ui| {
@@ -215,7 +216,7 @@ pub fn render_session_overlay(
                                                     egui::RichText::new(t_label)
                                                         .size(10.0)
                                                         .strong()
-                                                        .color(ACCENT_TEAL),
+                                                        .color(PILL_GREEN_TEXT),
                                                 );
                                             });
                                     }
@@ -531,8 +532,8 @@ pub fn render_session_overlay(
                                 let (status_txt, status_col, pill_bg) = if state.view_only {
                                     (
                                         "Estado entrada: Solo visualización".to_string(),
-                                        STATUS_ORANGE,
-                                        Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, 28),
+                                        PILL_AMBER_TEXT,
+                                        PILL_AMBER_BG,
                                     )
                                 } else if !state.keyboard_grab_enabled {
                                     (
@@ -552,11 +553,7 @@ pub fn render_session_overlay(
                                                 input.hook_hits
                                             ),
                                         };
-                                        (
-                                            label,
-                                            ACCENT_TEAL,
-                                            Color32::from_rgba_unmultiplied(0x10, 0xB9, 0x81, 32),
-                                        )
+                                        (label, PILL_GREEN_TEXT, PILL_GREEN_BG)
                                     } else {
                                         (
                                             "Teclado: Tu PC (haz clic aquí para controlar)"
@@ -568,8 +565,8 @@ pub fn render_session_overlay(
                                 } else {
                                     (
                                         "Estado hook: Hook no disponible".to_string(),
-                                        STATUS_ORANGE,
-                                        Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, 28),
+                                        PILL_AMBER_TEXT,
+                                        PILL_AMBER_BG,
                                     )
                                 };
 
@@ -641,11 +638,8 @@ pub fn render_session_overlay(
                                             .color(ACCENT_DANGER_TEXT)
                                             .strong(),
                                     )
-                                    .fill(Color32::from_rgba_unmultiplied(0xEF, 0x44, 0x44, 42))
-                                    .stroke(Stroke::new(
-                                        1.0_f32,
-                                        Color32::from_rgba_unmultiplied(0xEF, 0x44, 0x44, 115),
-                                    ))
+                                    .fill(PILL_RED_BG)
+                                    .stroke(Stroke::new(1.0_f32, PILL_RED_BORDER))
                                     .rounding(Rounding::same(6.0)),
                                 )
                                 .clicked()

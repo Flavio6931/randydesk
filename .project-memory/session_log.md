@@ -1,5 +1,22 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.6.1: Fix visual Obsidian Craft (`Segoe UI`, grid por filas, degradado suave y píldoras opacas)
+- **Causa raíz visual observada en vivo (`v0.6.0`):**
+  1. `ui.horizontal_wrapped` + `allocate_ui` generaba desplazamiento en escalera entre tarjetas vecinas.
+  2. El rectángulo `lower_half` translúcido producía un corte horizontal duro a mitad del banner.
+  3. `ui.add_sized(..., TextEdit::singleline(...))` dejaba cajas negras sin borde alineadas arriba a la izquierda.
+  4. `from_rgba_unmultiplied` en `egui` lavaba las píldoras (`Relay E2E`, `UAC + SAS`, `Copiar`, `Desconectar`).
+  5. Fuente bitmap por defecto de `egui` poco nítida y doble recuadro detrás del botón `...` de las tarjetas, además de hero sobre-estirado a `1920×1080`.
+- **Resumen técnico:**
+  - `Cargo.toml` (+ `Cargo.lock`): versión subida a `0.6.1`.
+  - [theme.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/theme.rs): carga nativa de `C:\Windows\Fonts\segoeui.ttf`, constantes opacas `PILL_*`, `BANNER_GRADIENTS`, `paint_vertical_gradient_banner` (malla continua con esquinas redondeadas) y `styled_text_input` (borde visible + foco cobalto + centrado vertical).
+  - [cards.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/cards.rs): grid determinista por filas (`chunks(cols)` con `272×152`, gap `16 px`), `allocate_exact_size`, banner con malla degradada, pill opaca superior y menú `...` de una sola capa.
+  - [host_panel.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/host_panel.rs), [app.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/app.rs) y [session_bar.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydesk-client/src/session_bar.rs): píldoras opacas (`PILL_*`), `content_w` acotado a `1180 px` en `CentralPanel`, y campos `styled_text_input` de `42 px` (dirección) / `34 px` (búsqueda) / `30 px` (contraseña).
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 48 pruebas aprobadas (22 `randydesk-client`, 16 unit + 1 `quic_loopback` `randydesk-host`, 8 `randydesk-proto`, 1 `relay_e2e` `randydesk-relay`).
+  - `cargo build --workspace --release` + Release `v0.6.1` en GitHub (`target\release\RandyDesk.exe` `13,800,960` bytes; `dist\RandyDesk.exe` omitido sin matar el proceso abierto por el usuario).
+
 ## 2026-11-26 — RandyDesk v0.6.0: Rediseño UI Obsidian Craft (Figma -> egui)
 - **Diseño en Figma:** https://www.figma.com/design/8cPEueVwbe7tsD2wJ5Gq6G (`01 · Design System` con variables/componentes, `02 · Lobby (Inicio)` 1240×740, `03 · Sesión Remota & HUD`).
 - **Resumen técnico:**

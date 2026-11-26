@@ -13,9 +13,9 @@ use crate::session_bar::{
     render_session_overlay, QualityPreset, ScaleMode, SessionBarInput, SessionBarState,
 };
 use crate::theme::{
-    apply_rustdesk_theme, ACCENT_BLUE, ACCENT_TEAL, ACCENT_TEAL_SOLID, BANNER_COLORS, BG_CARD,
-    BG_INPUT, BG_MAIN, BG_SIDEBAR, BG_SURFACE_ELEVATED, BORDER_HOVER, BORDER_SUBTLE, STATUS_ORANGE,
-    TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    apply_rustdesk_theme, styled_text_input, ACCENT_BLUE, ACCENT_TEAL, ACCENT_TEAL_SOLID,
+    BANNER_COLORS, BG_CARD, BG_INPUT, BG_MAIN, BG_SIDEBAR, BG_SURFACE_ELEVATED, BORDER_HOVER,
+    BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use crate::tray::TrayController;
 use crate::updater::{UpdateState, UpdaterHandle};
@@ -694,6 +694,9 @@ impl RandyDeskApp {
                     .inner_margin(egui::Margin::symmetric(24.0, 20.0)),
             )
             .show(ctx, |ui| {
+                let content_w = ui.available_width().min(1180.0);
+                ui.set_max_width(content_w);
+
                 // Tarjeta Hero Obsidian Craft "Controlar escritorio remoto"
                 egui::Frame::none()
                     .fill(BG_CARD)
@@ -774,20 +777,20 @@ impl RandyDeskApp {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
                             let input_w = (ui.available_width() - 134.0).max(220.0);
-                            let input_resp = ui.add_sized(
-                                [input_w, 40.0],
-                                egui::TextEdit::singleline(&mut self.quick_address)
-                                    .hint_text(
-                                        "Escribe el ID de 9 dígitos o IP local (ej. 482 910 331)...",
-                                    )
-                                    .font(egui::FontId::proportional(14.0)),
+                            let input_resp = styled_text_input(
+                                ui,
+                                &mut self.quick_address,
+                                "Escribe el ID de 9 dígitos o IP local (ej. 482 910 331)...",
+                                input_w,
+                                42.0,
+                                14.0,
                             );
                             pressed_enter = input_resp.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                             connect_clicked = ui
                                 .add_sized(
-                                    [122.0, 40.0],
+                                    [122.0, 42.0],
                                     egui::Button::new(
                                         egui::RichText::new("Conectar")
                                             .size(13.5)
@@ -856,7 +859,7 @@ impl RandyDeskApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_sized(
-                                [96.0, 32.0],
+                                [96.0, 34.0],
                                 egui::Button::new(
                                     egui::RichText::new("+ Agregar")
                                         .size(12.5)
@@ -876,10 +879,13 @@ impl RandyDeskApp {
                             });
                         }
 
-                        ui.add_sized(
-                            [200.0, 32.0],
-                            egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("Buscar equipo..."),
+                        styled_text_input(
+                            ui,
+                            &mut self.search_query,
+                            "Buscar equipo...",
+                            220.0,
+                            34.0,
+                            12.5,
                         );
                     });
                 });

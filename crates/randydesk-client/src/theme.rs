@@ -17,6 +17,22 @@ pub const ACCENT_TEAL_SOLID: Color32 = Color32::from_rgb(0x05, 0x96, 0x69);
 pub const STATUS_ORANGE: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B);
 pub const ACCENT_DANGER_TEXT: Color32 = Color32::from_rgb(0xFC, 0xA5, 0xA5);
 
+/// Píldoras opacas pre-mezcladas para mantener contraste nítido en `egui`.
+pub const PILL_GREEN_BG: Color32 = Color32::from_rgb(0x0E, 0x26, 0x22);
+pub const PILL_GREEN_BORDER: Color32 = Color32::from_rgb(0x16, 0x5C, 0x48);
+pub const PILL_GREEN_TEXT: Color32 = Color32::from_rgb(0x34, 0xD3, 0x99);
+
+pub const PILL_BLUE_BG: Color32 = Color32::from_rgb(0x14, 0x24, 0x3E);
+pub const PILL_BLUE_BORDER: Color32 = Color32::from_rgb(0x28, 0x4D, 0x8A);
+pub const PILL_BLUE_TEXT: Color32 = Color32::from_rgb(0x79, 0xB8, 0xFF);
+
+pub const PILL_AMBER_BG: Color32 = Color32::from_rgb(0x2B, 0x21, 0x10);
+pub const PILL_AMBER_BORDER: Color32 = Color32::from_rgb(0x78, 0x4B, 0x14);
+pub const PILL_AMBER_TEXT: Color32 = Color32::from_rgb(0xFB, 0xBF, 0x24);
+
+pub const PILL_RED_BG: Color32 = Color32::from_rgb(0x2D, 0x13, 0x18);
+pub const PILL_RED_BORDER: Color32 = Color32::from_rgb(0x7F, 0x23, 0x2D);
+
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xF3, 0xF5, 0xF9);
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x9C, 0xA3, 0xB5);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x64, 0x6D, 0x82);
@@ -32,8 +48,31 @@ pub const BANNER_COLORS: [Color32; 7] = [
     Color32::from_rgb(0x14, 0x30, 0x40), // Petróleo nocturno
 ];
 
+/// Pares `(arriba, abajo)` para degradados verticales suaves en banners de tarjetas.
+pub const BANNER_GRADIENTS: [(Color32, Color32); 7] = [
+    (Color32::from_rgb(0x1E, 0x3A, 0x6E), Color32::from_rgb(0x10, 0x1F, 0x3D)),
+    (Color32::from_rgb(0x16, 0x47, 0x42), Color32::from_rgb(0x0D, 0x25, 0x24)),
+    (Color32::from_rgb(0x31, 0x28, 0x6B), Color32::from_rgb(0x19, 0x15, 0x39)),
+    (Color32::from_rgb(0x24, 0x3F, 0x5A), Color32::from_rgb(0x13, 0x21, 0x31)),
+    (Color32::from_rgb(0x4A, 0x23, 0x52), Color32::from_rgb(0x26, 0x12, 0x2C)),
+    (Color32::from_rgb(0x2D, 0x31, 0x3C), Color32::from_rgb(0x18, 0x1B, 0x22)),
+    (Color32::from_rgb(0x19, 0x3D, 0x52), Color32::from_rgb(0x0D, 0x21, 0x2D)),
+];
+
 /// Aplica el tema Obsidian Craft sobre todo el contexto `egui`.
 pub fn apply_rustdesk_theme(ctx: &egui::Context) {
+    #[cfg(target_os = "windows")]
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "segoe_ui".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            family.insert(0, "segoe_ui".to_owned());
+        }
+        ctx.set_fonts(fonts);
+    }
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(12.0, 6.0);
@@ -147,4 +186,104 @@ pub fn draw_status_pill(
                 ui.label(egui::RichText::new(label).size(11.0).strong().color(text_color));
             });
         });
+}
+
+/// Pinta un degradado vertical suave con esquinas superiores redondeadas usando una malla de vértices.
+pub fn paint_vertical_gradient_banner(
+    painter: &egui::Painter,
+    rect: Rect,
+    top_rounding: f32,
+    top: Color32,
+    bottom: Color32,
+) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let r = top_rounding.min(rect.height() * 0.5).min(rect.width() * 0.5);
+    let lerp = |t: f32| -> Color32 {
+        let t = t.clamp(0.0, 1.0);
+        Color32::from_rgb(
+            (top.r() as f32 + (bottom.r() as f32 - top.r() as f32) * t).round() as u8,
+            (top.g() as f32 + (bottom.g() as f32 - top.g() as f32) * t).round() as u8,
+            (top.b() as f32 + (bottom.b() as f32 - top.b() as f32) * t).round() as u8,
+        )
+    };
+
+    let mut mesh = egui::Mesh::default();
+    let arc_steps = 8usize;
+    let mut y_rows: Vec<(f32, f32)> = Vec::with_capacity(arc_steps + 2);
+    for i in 0..=arc_steps {
+        let frac = i as f32 / arc_steps as f32;
+        let angle = frac * std::f32::consts::FRAC_PI_2;
+        let dy = r * (1.0 - angle.cos());
+        let inset = r * (1.0 - angle.sin());
+        y_rows.push((rect.min.y + dy, inset));
+    }
+    y_rows.push((rect.max.y, 0.0));
+
+    let h = rect.height().max(1.0);
+    for (idx, (y, inset)) in y_rows.iter().enumerate() {
+        let t = (*y - rect.min.y) / h;
+        let col = lerp(t);
+        mesh.colored_vertex(Pos2::new(rect.min.x + inset, *y), col);
+        mesh.colored_vertex(Pos2::new(rect.max.x - inset, *y), col);
+        if idx > 0 {
+            let prev = ((idx - 1) * 2) as u32;
+            let curr = (idx * 2) as u32;
+            mesh.add_triangle(prev, prev + 1, curr);
+            mesh.add_triangle(prev + 1, curr + 1, curr);
+        }
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Renderiza un campo de texto de una línea con borde visible, relleno `BG_INPUT` y centrado vertical.
+pub fn styled_text_input(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+    height: f32,
+    font_size: f32,
+) -> egui::Response {
+    let (rect, box_resp) =
+        ui.allocate_exact_size(Vec2::new(width.max(60.0), height), egui::Sense::click());
+    let id = ui.make_persistent_id(("styled_input", hint));
+    let focused = ui.memory(|m| m.has_focus(id));
+    let hovered = box_resp.hovered();
+    let border_col = if focused {
+        ACCENT_BLUE
+    } else if hovered {
+        Color32::from_rgb(0x43, 0x50, 0x6B)
+    } else {
+        BORDER_HOVER
+    };
+
+    ui.painter().rect_filled(rect, Rounding::same(8.0), BG_INPUT);
+    ui.painter().rect_stroke(
+        rect,
+        Rounding::same(8.0),
+        Stroke::new(if focused { 1.4_f32 } else { 1.0_f32 }, border_col),
+    );
+
+    let inner_rect = rect.shrink2(Vec2::new(12.0, 2.0));
+    let mut inner_resp: Option<egui::Response> = None;
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            let edit = egui::TextEdit::singleline(text)
+                .id(id)
+                .frame(false)
+                .desired_width(inner_rect.width())
+                .hint_text(egui::RichText::new(hint).size(font_size).color(TEXT_MUTED))
+                .font(egui::FontId::proportional(font_size))
+                .text_color(TEXT_PRIMARY);
+            inner_resp = Some(ui.add(edit));
+        });
+    });
+
+    let resp = inner_resp.expect("allocate_new_ui siempre ejecuta su cuerpo");
+    if box_resp.clicked() && !resp.has_focus() {
+        resp.request_focus();
+    }
+    resp
 }
