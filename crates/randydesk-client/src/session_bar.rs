@@ -1,7 +1,10 @@
-//! Barra flotante superior colapsable estilo RustDesk y tarjeta de métricas en sesión remota.
+//! Barra flotante superior Obsidian Craft colapsable y tarjeta de telemetría en sesión remota.
 
 use crate::net::SessionStats;
-use crate::theme::{ACCENT_BLUE, ACCENT_TEAL, BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED};
+use crate::theme::{
+    ACCENT_BLUE, ACCENT_DANGER_TEXT, ACCENT_TEAL, BG_SURFACE_ELEVATED, BORDER_HOVER,
+    BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+};
 use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
 use eframe::egui::{self, Color32, Rounding, Shape, Stroke, Vec2};
 use randydesk_proto::CodecKind;
@@ -100,17 +103,17 @@ pub fn render_session_overlay(
             .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 2.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                let fill = Color32::from_rgba_unmultiplied(24, 28, 36, 228);
+                let fill = Color32::from_rgba_unmultiplied(16, 19, 25, 240);
                 let frame_resp = egui::Frame::none()
                     .fill(fill)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .stroke(Stroke::new(1.0_f32, BORDER_HOVER))
                     .rounding(Rounding {
                         nw: 0.0,
                         ne: 0.0,
                         sw: 8.0,
                         se: 8.0,
                     })
-                    .inner_margin(egui::Margin::symmetric(12.0, 3.0))
+                    .inner_margin(egui::Margin::symmetric(14.0, 4.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
@@ -124,9 +127,9 @@ pub fn render_session_overlay(
                             ui.painter().circle_filled(dot_rect.center(), 3.5, dot_color);
                             ui.label(
                                 egui::RichText::new("RandyDesk")
-                                    .size(11.0)
+                                    .size(11.5)
                                     .strong()
-                                    .color(Color32::WHITE),
+                                    .color(TEXT_PRIMARY),
                             );
                             let (tri_rect, _) =
                                 ui.allocate_exact_size(Vec2::new(9.0, 6.0), egui::Sense::hover());
@@ -137,7 +140,7 @@ pub fn render_session_overlay(
                                     egui::pos2(c.x + 4.0, c.y - 2.0),
                                     egui::pos2(c.x, c.y + 3.0),
                                 ],
-                                TEXT_MUTED,
+                                TEXT_SECONDARY,
                                 Stroke::NONE,
                             ));
                         });
@@ -150,16 +153,16 @@ pub fn render_session_overlay(
             state.bar_collapsed = false;
         }
     } else {
-        let bar_fill = Color32::from_rgba_unmultiplied(24, 28, 36, 240);
+        let bar_fill = Color32::from_rgba_unmultiplied(16, 19, 25, 240);
         let bar_resp = egui::Area::new(egui::Id::new("session_floating_bar"))
-            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 6.0))
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 8.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(bar_fill)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+                    .stroke(Stroke::new(1.0_f32, BORDER_HOVER))
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 6.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
@@ -183,14 +186,46 @@ pub fn render_session_overlay(
                                     egui::RichText::new(input.host_name)
                                         .size(12.5)
                                         .strong()
-                                        .color(Color32::WHITE),
+                                        .color(TEXT_PRIMARY),
                                 );
+
+                                if !input.stats.transport_label.is_empty()
+                                    || input.stats.rtt_ms.is_some()
+                                {
+                                    let t_label = match (
+                                        input.stats.transport_label.is_empty(),
+                                        input.stats.rtt_ms,
+                                    ) {
+                                        (false, Some(ms)) => {
+                                            format!("{} · {ms} ms", input.stats.transport_label)
+                                        }
+                                        (false, None) => input.stats.transport_label.clone(),
+                                        (true, Some(ms)) => format!("{ms} ms"),
+                                        (true, None) => String::new(),
+                                    };
+                                    if !t_label.is_empty() {
+                                        egui::Frame::none()
+                                            .fill(Color32::from_rgba_unmultiplied(
+                                                0x10, 0xB9, 0x81, 36,
+                                            ))
+                                            .rounding(Rounding::same(99.0))
+                                            .inner_margin(egui::Margin::symmetric(7.0, 2.0))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(t_label)
+                                                        .size(10.0)
+                                                        .strong()
+                                                        .color(ACCENT_TEAL),
+                                                );
+                                            });
+                                    }
+                                }
                             }
 
                             ui.separator();
 
                             ui.menu_button("Pantalla", |ui| {
-                                ui.set_min_width(235.0);
+                                ui.set_min_width(240.0);
                                 if ui
                                     .selectable_label(
                                         matches!(state.scale_mode, ScaleMode::Adaptive),
@@ -442,7 +477,7 @@ pub fn render_session_overlay(
                             });
 
                             ui.menu_button("Teclado y ratón", |ui| {
-                                ui.set_min_width(275.0);
+                                ui.set_min_width(288.0);
                                 if ui
                                     .selectable_label(
                                         state.keyboard_mode == KeyboardMode::Map,
@@ -493,10 +528,18 @@ pub fn render_session_overlay(
                                 }
 
                                 ui.separator();
-                                let (status_txt, status_col) = if state.view_only {
-                                    ("Estado entrada: Solo visualización".to_string(), STATUS_ORANGE)
+                                let (status_txt, status_col, pill_bg) = if state.view_only {
+                                    (
+                                        "Estado entrada: Solo visualización".to_string(),
+                                        STATUS_ORANGE,
+                                        Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, 28),
+                                    )
                                 } else if !state.keyboard_grab_enabled {
-                                    ("Estado hook: Desactivado".to_string(), TEXT_MUTED)
+                                    (
+                                        "Estado hook: Desactivado".to_string(),
+                                        TEXT_MUTED,
+                                        BG_SURFACE_ELEVATED,
+                                    )
                                 } else if input.hook_installed {
                                     if KeyboardHookGuard::is_window_foreground() {
                                         let label = match state.keyboard_mode {
@@ -509,24 +552,61 @@ pub fn render_session_overlay(
                                                 input.hook_hits
                                             ),
                                         };
-                                        (label, ACCENT_TEAL)
+                                        (
+                                            label,
+                                            ACCENT_TEAL,
+                                            Color32::from_rgba_unmultiplied(0x10, 0xB9, 0x81, 32),
+                                        )
                                     } else {
                                         (
                                             "Teclado: Tu PC (haz clic aquí para controlar)"
                                                 .to_string(),
-                                            TEXT_MUTED,
+                                            TEXT_SECONDARY,
+                                            BG_SURFACE_ELEVATED,
                                         )
                                     }
                                 } else {
-                                    ("Estado hook: Hook no disponible".to_string(), STATUS_ORANGE)
+                                    (
+                                        "Estado hook: Hook no disponible".to_string(),
+                                        STATUS_ORANGE,
+                                        Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, 28),
+                                    )
                                 };
-                                ui.label(egui::RichText::new(status_txt).size(11.5).color(status_col));
+
+                                egui::Frame::none()
+                                    .fill(pill_bg)
+                                    .rounding(Rounding::same(6.0))
+                                    .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(
+                                            egui::RichText::new(status_txt)
+                                                .size(11.0)
+                                                .color(status_col),
+                                        );
+                                    });
                             });
 
                             ui.separator();
 
                             if ui
-                                .selectable_label(state.bar_pinned, "Fijar")
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Fijar").size(11.5).color(
+                                            if state.bar_pinned {
+                                                Color32::WHITE
+                                            } else {
+                                                TEXT_SECONDARY
+                                            },
+                                        ),
+                                    )
+                                    .fill(if state.bar_pinned {
+                                        ACCENT_BLUE
+                                    } else {
+                                        BG_SURFACE_ELEVATED
+                                    })
+                                    .rounding(Rounding::same(6.0)),
+                                )
                                 .on_hover_text(
                                     "Mantener barra fijada arriba (si la desactivas, se oculta al alejar el puntero)",
                                 )
@@ -536,7 +616,15 @@ pub fn render_session_overlay(
                             }
 
                             if ui
-                                .button("Ocultar")
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Ocultar")
+                                            .size(11.5)
+                                            .color(TEXT_SECONDARY),
+                                    )
+                                    .fill(BG_SURFACE_ELEVATED)
+                                    .rounding(Rounding::same(6.0)),
+                                )
                                 .on_hover_text(
                                     "Contraer la barra en una pestaña superior para no tapar pestañas",
                                 )
@@ -549,11 +637,16 @@ pub fn render_session_overlay(
                                 .add(
                                     egui::Button::new(
                                         egui::RichText::new("Desconectar")
-                                            .size(12.0)
-                                            .color(Color32::WHITE)
+                                            .size(11.5)
+                                            .color(ACCENT_DANGER_TEXT)
                                             .strong(),
                                     )
-                                    .fill(Color32::from_rgb(198, 56, 56)),
+                                    .fill(Color32::from_rgba_unmultiplied(0xEF, 0x44, 0x44, 42))
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
+                                        Color32::from_rgba_unmultiplied(0xEF, 0x44, 0x44, 115),
+                                    ))
+                                    .rounding(Rounding::same(6.0)),
                                 )
                                 .clicked()
                             {
@@ -574,17 +667,17 @@ pub fn render_session_overlay(
     }
 
     if state.show_monitor_stats {
-        let card_y = if state.bar_collapsed { 14.0 } else { 52.0 };
+        let card_y = if state.bar_collapsed { 14.0 } else { 58.0 };
         egui::Area::new(egui::Id::new("session_monitor_card"))
-            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-12.0, card_y))
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-14.0, card_y))
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(18, 21, 28, 215))
+                    .fill(Color32::from_rgba_unmultiplied(16, 19, 25, 224))
                     .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
                     .show(ui, |ui| {
                         let bw = if input.stats.kbps >= 1024.0 {
                             format!("{:.2} MB/s", input.stats.kbps / 8192.0)
@@ -614,19 +707,19 @@ pub fn render_session_overlay(
 
                         ui.label(
                             egui::RichText::new(format!(
-                                "{res_str} | {:.1} fps | {bw} | {rtt}",
+                                "{res_str} · {:.1} fps · {bw} · {rtt}",
                                 input.stats.fps
                             ))
-                            .size(11.5)
-                            .color(ACCENT_BLUE),
+                            .size(11.0)
+                            .color(Color32::from_rgb(0x60, 0xA5, 0xFA)),
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "{codec_str}{transport_suffix} | {}",
+                                "{codec_str}{transport_suffix} · {}",
                                 format_duration(input.stats.elapsed_secs)
                             ))
-                            .size(11.0)
-                            .color(TEXT_MUTED),
+                            .size(10.5)
+                            .color(TEXT_SECONDARY),
                         );
                     });
             });

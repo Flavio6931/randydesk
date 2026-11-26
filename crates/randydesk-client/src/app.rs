@@ -13,8 +13,9 @@ use crate::session_bar::{
     render_session_overlay, QualityPreset, ScaleMode, SessionBarInput, SessionBarState,
 };
 use crate::theme::{
-    apply_rustdesk_theme, ACCENT_BLUE, ACCENT_TEAL, BANNER_COLORS, BG_CARD, BG_MAIN, BG_SIDEBAR,
-    BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED,
+    apply_rustdesk_theme, ACCENT_BLUE, ACCENT_TEAL, ACCENT_TEAL_SOLID, BANNER_COLORS, BG_CARD,
+    BG_INPUT, BG_MAIN, BG_SIDEBAR, BG_SURFACE_ELEVATED, BORDER_HOVER, BORDER_SUBTLE, STATUS_ORANGE,
+    TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use crate::tray::TrayController;
 use crate::updater::{UpdateState, UpdaterHandle};
@@ -507,23 +508,24 @@ impl RandyDeskApp {
     fn render_lobby(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("este_equipo_panel")
             .resizable(false)
-            .exact_width(240.0)
+            .exact_width(272.0)
             .frame(
                 egui::Frame::none()
                     .fill(BG_SIDEBAR)
-                    .inner_margin(egui::Margin::symmetric(14.0, 10.0)),
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .inner_margin(egui::Margin::symmetric(16.0, 14.0)),
             )
             .show(ctx, |ui| {
                 self.host_panel.ui(ui, &self.rt_handle);
             });
 
         egui::TopBottomPanel::bottom("status_footer")
-            .exact_height(34.0)
+            .exact_height(38.0)
             .frame(
                 egui::Frame::none()
                     .fill(BG_SIDEBAR)
                     .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .inner_margin(egui::Margin::symmetric(14.0, 6.0)),
+                    .inner_margin(egui::Margin::symmetric(16.0, 7.0)),
             )
             .show(ctx, |ui| {
                 let info = self.host_panel.runtime_info();
@@ -539,24 +541,35 @@ impl RandyDeskApp {
                     } else {
                         TEXT_MUTED
                     };
-                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
 
                     let state_txt = if relay_ok && info.as_ref().is_some_and(|i| i.is_system) {
-                        "Listo (Internet y red local · SYSTEM)."
+                        "Listo · Internet (Relay E2E) y red local · SYSTEM"
                     } else if relay_ok {
-                        "Listo (Internet y red local)."
+                        "Listo · Internet (Relay E2E) y red local"
                     } else if has_relay {
                         "Conectando al servidor Relay..."
                     } else if running {
-                        "Solo red local."
+                        "Solo red local"
                     } else {
-                        "Recepción detenida."
+                        "Recepción detenida"
                     };
-                    ui.label(egui::RichText::new(state_txt).size(12.0).color(TEXT_MUTED));
+                    ui.label(
+                        egui::RichText::new(state_txt)
+                            .size(11.5)
+                            .color(TEXT_SECONDARY),
+                    );
+
+                    ui.label(egui::RichText::new("|").size(11.5).color(BORDER_SUBTLE));
 
                     if ui
-                        .link(egui::RichText::new("Configurar servidor Relay").size(12.0))
+                        .link(
+                            egui::RichText::new("Servidor Relay")
+                                .size(11.5)
+                                .color(ACCENT_BLUE),
+                        )
                         .clicked()
                     {
                         self.relay_url_input = self.settings.relay_url.clone();
@@ -564,9 +577,16 @@ impl RandyDeskApp {
                         self.show_relay_modal = true;
                     }
 
-                    ui.label(egui::RichText::new("|").size(12.0).color(BORDER_SUBTLE));
+                    ui.label(egui::RichText::new("|").size(11.5).color(BORDER_SUBTLE));
 
-                    if ui.link(egui::RichText::new("Guía rápida").size(12.0)).clicked() {
+                    if ui
+                        .link(
+                            egui::RichText::new("Guía rápida")
+                                .size(11.5)
+                                .color(ACCENT_BLUE),
+                        )
+                        .clicked()
+                    {
                         self.show_guide = true;
                     }
 
@@ -577,12 +597,16 @@ impl RandyDeskApp {
                                 .color(TEXT_MUTED),
                         );
 
-                        ui.label(egui::RichText::new("|").size(12.0).color(BORDER_SUBTLE));
+                        ui.label(egui::RichText::new("|").size(11.5).color(BORDER_SUBTLE));
 
                         match self.updater.state() {
                             UpdateState::Idle => {
                                 if ui
-                                    .link(egui::RichText::new("Buscar actualización").size(12.0))
+                                    .link(
+                                        egui::RichText::new("Buscar actualización")
+                                            .size(11.5)
+                                            .color(ACCENT_BLUE),
+                                    )
                                     .clicked()
                                 {
                                     self.updater.check_now(false);
@@ -597,7 +621,11 @@ impl RandyDeskApp {
                             }
                             UpdateState::UpToDate => {
                                 if ui
-                                    .link(egui::RichText::new("Al día · Buscar").size(12.0))
+                                    .link(
+                                        egui::RichText::new("Al día · Buscar")
+                                            .size(11.5)
+                                            .color(TEXT_SECONDARY),
+                                    )
                                     .clicked()
                                 {
                                     self.updater.check_now(false);
@@ -609,17 +637,20 @@ impl RandyDeskApp {
                                     .add(
                                         egui::Button::new(
                                             egui::RichText::new(label)
-                                                .size(11.5)
+                                                .size(11.0)
                                                 .strong()
                                                 .color(Color32::WHITE),
                                         )
-                                        .fill(ACCENT_TEAL),
+                                        .fill(ACCENT_TEAL_SOLID)
+                                        .rounding(Rounding::same(6.0)),
                                     )
                                     .on_hover_text("Descargar y aplicar actualización desde GitHub")
                                     .clicked()
                                 {
-                                    self.updater
-                                        .download_and_apply(info, self.host_panel.is_service_installed());
+                                    self.updater.download_and_apply(
+                                        info,
+                                        self.host_panel.is_service_installed(),
+                                    );
                                 }
                             }
                             UpdateState::Downloading { version, percent } => {
@@ -660,113 +691,200 @@ impl RandyDeskApp {
             .frame(
                 egui::Frame::none()
                     .fill(BG_MAIN)
-                    .inner_margin(egui::Margin::symmetric(22.0, 16.0)),
+                    .inner_margin(egui::Margin::symmetric(24.0, 20.0)),
             )
             .show(ctx, |ui| {
-                // Tarjeta superior compacta "Controlar escritorio remoto"
+                // Tarjeta Hero Obsidian Craft "Controlar escritorio remoto"
                 egui::Frame::none()
                     .fill(BG_CARD)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(egui::Margin::same(16.0))
+                    .stroke(Stroke::new(1.0_f32, BORDER_HOVER))
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(egui::Margin::same(18.0))
                     .show(ui, |ui| {
-                        ui.set_width(390.0);
-                        ui.label(
-                            egui::RichText::new("Controlar escritorio remoto")
-                                .size(15.0)
-                                .strong(),
-                        );
-                        ui.add_space(10.0);
-
-                        let input_resp = ui.add_sized(
-                            [370.0, 38.0],
-                            egui::TextEdit::singleline(&mut self.quick_address)
-                                .hint_text("Escribe el ID (ej. 482 910 331) o IP local")
-                                .font(egui::FontId::proportional(15.0)),
-                        );
-                        let pressed_enter =
-                            input_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-                        ui.add_space(10.0);
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.menu_button("Opciones", |ui| {
-                                    ui.label("Modo de video:");
-                                    ui.radio_value(
-                                        &mut self.codec_input,
-                                        CodecKind::H264,
-                                        "H.264 (Ultra fluido)",
-                                    );
-                                    ui.radio_value(
-                                        &mut self.codec_input,
-                                        CodecKind::Jpeg,
-                                        "Fluido (JPEG)",
-                                    );
-                                    ui.radio_value(
-                                        &mut self.codec_input,
-                                        CodecKind::Lz4Rgba,
-                                        "Nítido (LZ4)",
-                                    );
-                                    ui.separator();
-                                    ui.add(
-                                        egui::Slider::new(&mut self.quality_input, 35..=95)
-                                            .text("Calidad %"),
-                                    );
-                                    ui.add(
-                                        egui::Slider::new(&mut self.fps_input, 5..=60).text("FPS"),
-                                    );
-                                });
+                            ui.label(
+                                egui::RichText::new("Controlar escritorio remoto")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(TEXT_PRIMARY),
+                            );
 
-                                let connect_btn = ui.add_sized(
-                                    [110.0, 32.0],
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.menu_button("Ajustes", |ui| {
+                                        ui.label("Calidad / Fluidez:");
+                                        ui.add(
+                                            egui::Slider::new(&mut self.quality_input, 35..=95)
+                                                .text("Calidad %"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(&mut self.fps_input, 5..=60)
+                                                .text("FPS"),
+                                        );
+                                    });
+
+                                    egui::Frame::none()
+                                        .fill(BG_INPUT)
+                                        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                                        .rounding(Rounding::same(8.0))
+                                        .inner_margin(egui::Margin::same(3.0))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 3.0;
+                                                for (kind, lbl) in [
+                                                    (CodecKind::Lz4Rgba, "LZ4 Nítido"),
+                                                    (CodecKind::Jpeg, "JPEG"),
+                                                    (CodecKind::H264, "H.264"),
+                                                ] {
+                                                    let active = self.codec_input == kind;
+                                                    let resp = ui.add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new(lbl)
+                                                                .size(11.0)
+                                                                .color(if active {
+                                                                    TEXT_PRIMARY
+                                                                } else {
+                                                                    TEXT_SECONDARY
+                                                                }),
+                                                        )
+                                                        .fill(if active {
+                                                            ACCENT_BLUE
+                                                        } else {
+                                                            Color32::TRANSPARENT
+                                                        })
+                                                        .stroke(Stroke::NONE)
+                                                        .rounding(Rounding::same(6.0))
+                                                        .min_size(Vec2::new(48.0, 22.0)),
+                                                    );
+                                                    if resp.clicked() {
+                                                        self.codec_input = kind;
+                                                    }
+                                                }
+                                            });
+                                        });
+                                },
+                            );
+                        });
+
+                        ui.add_space(12.0);
+                        let mut pressed_enter = false;
+                        let mut connect_clicked = false;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let input_w = (ui.available_width() - 134.0).max(220.0);
+                            let input_resp = ui.add_sized(
+                                [input_w, 40.0],
+                                egui::TextEdit::singleline(&mut self.quick_address)
+                                    .hint_text(
+                                        "Escribe el ID de 9 dígitos o IP local (ej. 482 910 331)...",
+                                    )
+                                    .font(egui::FontId::proportional(14.0)),
+                            );
+                            pressed_enter = input_resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                            connect_clicked = ui
+                                .add_sized(
+                                    [122.0, 40.0],
                                     egui::Button::new(
                                         egui::RichText::new("Conectar")
+                                            .size(13.5)
                                             .color(Color32::WHITE)
                                             .strong(),
                                     )
-                                    .fill(ACCENT_BLUE),
-                                );
-                                if connect_btn.clicked() || pressed_enter {
-                                    let addr = self.quick_address.clone();
-                                    self.connect_direct_address(&addr, ctx);
-                                }
-                            });
+                                    .fill(ACCENT_BLUE)
+                                    .rounding(Rounding::same(8.0)),
+                                )
+                                .clicked();
                         });
+
+                        if connect_clicked || pressed_enter {
+                            let addr = self.quick_address.clone();
+                            self.connect_direct_address(&addr, ctx);
+                        }
                     });
 
                 if let Some(notice) = &self.ui_notice {
                     ui.add_space(8.0);
-                    ui.colored_label(Color32::from_rgb(245, 195, 90), notice);
+                    ui.colored_label(STATUS_ORANGE, notice);
                 }
 
-                ui.add_space(18.0);
-                ui.separator();
-                ui.add_space(8.0);
+                ui.add_space(16.0);
 
+                // Barra de pestañas segmentadas + Buscador + "+ Agregar"
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.active_tab, HostTab::Recent, "Recientes");
-                    ui.selectable_value(&mut self.active_tab, HostTab::Favorites, "Favoritos");
-                    ui.selectable_value(&mut self.active_tab, HostTab::All, "Todos");
-                    ui.add_space(8.0);
-                    if ui.button("+ Agregar").clicked() {
-                        self.host_editor = Some(HostEditor {
-                            editing_idx: None,
-                            name: String::new(),
-                            address: String::new(),
-                            color_idx: (self.hosts.len() % 7) as u8,
+                    egui::Frame::none()
+                        .fill(BG_CARD)
+                        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(egui::Margin::same(3.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for (tab, lbl) in [
+                                    (HostTab::Recent, "Recientes"),
+                                    (HostTab::Favorites, "Favoritos"),
+                                    (HostTab::All, "Todos"),
+                                ] {
+                                    let active = self.active_tab == tab;
+                                    let btn = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new(lbl).size(12.0).color(if active {
+                                                TEXT_PRIMARY
+                                            } else {
+                                                TEXT_SECONDARY
+                                            }),
+                                        )
+                                        .fill(if active {
+                                            BG_SURFACE_ELEVATED
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .stroke(Stroke::NONE)
+                                        .rounding(Rounding::same(6.0))
+                                        .min_size(Vec2::new(72.0, 26.0)),
+                                    );
+                                    if btn.clicked() {
+                                        self.active_tab = tab;
+                                    }
+                                }
+                            });
                         });
-                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_sized(
+                                [96.0, 32.0],
+                                egui::Button::new(
+                                    egui::RichText::new("+ Agregar")
+                                        .size(12.5)
+                                        .color(TEXT_PRIMARY),
+                                )
+                                .fill(BG_SURFACE_ELEVATED)
+                                .stroke(Stroke::new(1.0_f32, BORDER_HOVER))
+                                .rounding(Rounding::same(8.0)),
+                            )
+                            .clicked()
+                        {
+                            self.host_editor = Some(HostEditor {
+                                editing_idx: None,
+                                name: String::new(),
+                                address: String::new(),
+                                color_idx: (self.hosts.len() % 7) as u8,
+                            });
+                        }
+
                         ui.add_sized(
-                            [190.0, 26.0],
+                            [200.0, 32.0],
                             egui::TextEdit::singleline(&mut self.search_query)
                                 .hint_text("Buscar equipo..."),
                         );
                     });
                 });
 
-                ui.add_space(12.0);
+                ui.add_space(14.0);
                 if let Some(act) =
                     render_host_cards(ui, &self.hosts, self.active_tab, &self.search_query)
                 {

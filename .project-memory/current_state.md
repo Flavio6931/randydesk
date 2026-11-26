@@ -1,19 +1,19 @@
 # Estado Actual — RandyDesk
 
 - **Proyecto:** RandyDesk (escritorio remoto en Rust puro para Windows, inspirado en RustDesk)
-- **Versión actual:** `0.5.3`
+- **Versión actual:** `0.6.0`
 - **Regla del proyecto:** Cada mejora incrementa la versión en `Cargo.toml` (`[workspace.package].version`) y publica un nuevo Release `vX.Y.Z` en GitHub con `RandyDesk.exe`.
 - **Servidor Relay propio (Render Free):** `wss://randydesk-relay.onrender.com` (preconfigurado por defecto en `RandyDesk.exe`)
 - **GitHub vinculado:** cuenta `Flavio6931` (`Flavio Morales <copiaste2024@gmail.com>`)
 - **Repositorio:** https://github.com/Flavio6931/randydesk
-- **Último Release:** `v0.5.3` — https://github.com/Flavio6931/randydesk/releases/tag/v0.5.3
-- **Descarga directa (`RandyDesk.exe`):** https://github.com/Flavio6931/randydesk/releases/download/v0.5.3/RandyDesk.exe
+- **Último Release:** `v0.6.0` — https://github.com/Flavio6931/randydesk/releases/tag/v0.6.0
+- **Descarga directa (`RandyDesk.exe`):** https://github.com/Flavio6931/randydesk/releases/download/v0.6.0/RandyDesk.exe
+- **Diseño Figma (`Obsidian Craft`):** https://www.figma.com/design/8cPEueVwbe7tsD2wJ5Gq6G
 - **Bóveda Obsidian:** `RandyDesk Vault` (`C:\Users\Flavio\Documents\RandyDesk Vault`)
 
 ## Tareas Pendientes
-- [ ] Descargar `RandyDesk.exe v0.5.3` por última vez en ambas PCs (desde `v0.5.4+` ya se actualiza con el botón integrado `Actualizar a vX.Y.Z` / `Buscar actualización`).
-- [ ] Probar en vivo `Modo mapa (Teclado físico · Recomendado)` en `v0.5.3`: escribir, usar `Win`, `Win+R/E`, `Alt+Tab`, `AltGr`, confirmar que no escape a tu PC dentro de RandyDesk y que al tocar la barra de tareas local regrese tu teclado.
-- [ ] Probar el botón `Buscar actualización` / `Actualizar a vX.Y.Z`, códec `H.264` y promoción automática `Relay -> QUIC directo`.
+- [ ] Actualizar de `v0.5.3` a `v0.6.0` usando el nuevo botón **`Actualizar a v0.6.0`** en 1 clic desde la app.
+- [ ] Probar en vivo el nuevo diseño **Obsidian Craft**, `Modo mapa (Teclado físico · Recomendado)`, códec `H.264` y promoción `Relay -> QUIC directo`.
 
 ## Ideas Futuras Guardadas (Alternativas \$0 para `randydesk-relay`)
 1. **En tu propia casa (PC vieja, mini-PC o Raspberry Pi) — \$0:**
@@ -24,6 +24,7 @@
    - VM Linux permanente con IP pública fija y **10 TB/mes gratis** que nunca se duerme *(pide tarjeta solo para verificar identidad, cobra \$0)*.
 
 ## Últimas Tareas Completadas
+- Rediseño visual completo **Obsidian Craft** en Figma (`RandyDesk — UI Redesign`) y portado a `egui` (`v0.6.0`): paleta oscura `#0B0D11`/`#101319`/`#141821` en `theme.rs` + iconos vectoriales (`draw_star`, `draw_lock_icon`, `draw_status_pill`), sidebar `272 px` con tarjeta `"TU ID DE ACCESO"` y `"Servicio SYSTEM"` en `host_panel.rs`, tarjetas `HostCard` `256×148` con pills de transporte en `cards.rs`, hero ancho con selector de códec instantáneo y pestañas segmentadas en `app.rs`, y barra flotante HUD estilo glass oscuro en `session_bar.rs`.
 - Fix definitivo de `Modo mapa (Teclado físico)` estilo RustDesk (`REA + Ghidra`) y Auto-Actualizador en 1 clic (`v0.5.3`): inyección física pura por scan code (`KEYEVENTF_SCANCODE`, `wVk = 0`) con filtro `0x021D` (`AltGr`) y exclusión `0x36`/`0x45`, bloqueo local solo en `KeyDown` (pasando `KeyUp`/`CapsLock`/`NumLock` a `CallNextHookEx`), liberación completa de teclas pulsadas con doble pulso `Alt`/`AltGr`, `AllowSetForegroundWindow` en `tray.rs`, más auto-actualizador integrado desde GitHub Releases en `updater.rs` (`--apply-update` + `--cleanup-file` + actualización de `RandyDeskService`).
 - Captura estricta de teclado por foco de ventana de `RandyDesk` y `Modo mapa` por defecto (`v0.5.2`): foco automático al conectar en `app.rs`, eliminación de captura por `cursor_pid` en `win_hook.rs` (`should_capture_for_focus`), arreglo de `Win+R`/`Win+E` en `Modo traducción`, e indicador claro en `session_bar.rs`.
 - Fix definitivo de teclado cliente + host `SYSTEM` estilo RustDesk (`v0.5.1`): token interactivo de `winlogon.exe` en `win_service.rs` (`DETACHED_PROCESS`), logger asíncrono sin I/O en `WH_KEYBOARD_LL` + log `SYSTEM` en `C:\ProgramData\RandyDesk\host_input_debug.log`, fix `desktop_names_match` + `GENERIC_WRITE` + liberación de `Shift` en `KEYEVENTF_UNICODE` en `input.rs`, refresco de canal `same_channel` en `win_hook.rs`, fix `AltGr` (`VK_RMENU`) y reenvío de `Copy`/`Cut`/`Paste` (`Ctrl+C/X/V`) en `app.rs`.

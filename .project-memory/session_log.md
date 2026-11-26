@@ -1,5 +1,19 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.6.0: Rediseño UI Obsidian Craft (Figma -> egui)
+- **Diseño en Figma:** https://www.figma.com/design/8cPEueVwbe7tsD2wJ5Gq6G (`01 · Design System` con variables/componentes, `02 · Lobby (Inicio)` 1240×740, `03 · Sesión Remota & HUD`).
+- **Resumen técnico:**
+  - `Cargo.toml` (+ `Cargo.lock`): versión subida a `0.6.0`.
+  - [theme.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/theme.rs): tokens Obsidian Craft (`#0B0D11`, `#101319`, `#141821`, `#1B202C`, `#0D1016`, `#2F81F7`, `#10B981`, `#059669`, `#F59E0B`, `#FCA5A5`), bordes de 1 px (`#1F2533`/`#313B52`), banners profundos y helpers vectoriales (`draw_star`, `draw_lock_icon`, `draw_status_pill`).
+  - [host_panel.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/host_panel.rs): sidebar `272 px` con tarjeta `"TU ID DE ACCESO"` (`Copiar`, `...`, `Relay E2E`, `LAN`, `Configurar PIN`), tarjeta dedicada `"Servicio SYSTEM"` (`UAC + SAS`) y sello inferior `Cifrado E2E · X25519 + ChaCha20`.
+  - [cards.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/cards.rs): `HostCard` `256×148` (`12 px` radius), banner degradado oscuro con pill `Relay E2E`/`QUIC LAN`, estrella vectorial de favoritos y pie con nombre e ID/IP.
+  - [app.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/app.rs): Hero ancho `"Controlar escritorio remoto"` con selector segmentado de códec (`H.264` / `JPEG` / `LZ4 Nítido`), pestañas segmentadas (`Recientes` / `Favoritos` / `Todos`), botón `+ Agregar` y footer con botón `Actualizar a vX.Y.Z`.
+  - [session_bar.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydesk-client/src/session_bar.rs): barra flotante glass (`12 px`), pill en vivo de transporte (`QUIC`/`Relay`), botón `Desconectar` rojo translúcido y tarjeta de telemetría sin solapamiento (`y = 58`).
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 48 pruebas aprobadas (22 `randydesk-client`, 16 unit + 1 `quic_loopback` `randydesk-host`, 8 `randydesk-proto`, 1 `relay_e2e` `randydesk-relay`).
+  - `cargo build --workspace --release` + copia a `dist\`.
+
 ## 2026-11-26 — RandyDesk v0.5.3: Fix definitivo `Modo mapa (Teclado físico)` estilo RustDesk (`REA + Ghidra`) + Auto-Actualizador en 1 clic
 - **Causa raíz confirmada con REA + Ghidra 12.2 (`RustDesk.exe` / `librustdesk.dll`) y fuente de RustDesk (`rdev` Windows + `keyboard.rs` + `input_service.rs`):**
   1. `Modo mapa` en `v0.5.2` enviaba `vk != 0` en lugar de scan code físico puro (`wVk = 0`, `KEYEVENTF_SCANCODE`), no filtraba el scan code sintético `0x021D` de `AltGr`, ni excluía `0x45` (`NumLock`/`Pause`) de `KEYEVENTF_EXTENDEDKEY`.
