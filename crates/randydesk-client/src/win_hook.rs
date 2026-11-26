@@ -7,16 +7,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 use tracing::warn;
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetAncestor, GetCursorPos, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HHOOK, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, MSG, PM_NOREMOVE, PM_NOYIELD, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+    PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, PM_NOREMOVE, PM_NOYIELD, WH_KEYBOARD_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// Códigos Virtual-Key de modificadores que se liberan al perder foco para evitar teclas pegadas.
@@ -29,9 +28,9 @@ const VK_RWIN_U16: u16 = 0x005C;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyboardMode {
     /// Texto normal vía ventana y captura de `Win` / `Alt+Tab` por hook de bajo nivel.
-    #[default]
     Translate,
-    /// Captura directa de todas las teclas físicas por hook mientras está en sesión.
+    /// Captura directa de todas las teclas físicas por hook mientras RandyDesk tiene el foco.
+    #[default]
     Map,
 }
 
@@ -39,6 +38,7 @@ struct HookSharedState {
     installed: AtomicBool,
     active: AtomicBool,
     map_mode: AtomicBool,
+    window_focused: AtomicBool,
     win_down: AtomicBool,
     own_pid: u32,
     sent_keys: AtomicU64,
@@ -52,7 +52,8 @@ fn shared_state() -> &'static Arc<HookSharedState> {
         Arc::new(HookSharedState {
             installed: AtomicBool::new(false),
             active: AtomicBool::new(false),
-            map_mode: AtomicBool::new(false),
+            map_mode: AtomicBool::new(true),
+            window_focused: AtomicBool::new(false),
             win_down: AtomicBool::new(false),
             own_pid: unsafe { GetCurrentProcessId() },
             sent_keys: AtomicU64::new(0),
@@ -91,10 +92,11 @@ impl KeyboardHookGuard {
         unsafe { is_own_window_foreground(own_pid) }
     }
 
-    /// Indica si el cursor está actualmente sobre la ventana principal de RandyDesk.
-    pub fn is_cursor_over_own_window() -> bool {
-        let own_pid = shared_state().own_pid;
-        own_pid != 0 && unsafe { cursor_window_pid() } == own_pid
+    /// Actualiza si la ventana principal de RandyDesk reporta foco activo desde `egui`.
+    pub fn set_window_focused(&self, focused: bool) {
+        shared_state()
+            .window_focused
+            .store(focused, Ordering::Relaxed);
     }
 
     /// Indica si la tecla `AltGr` (`VK_RMENU`) está pulsada físicamente en Windows.
@@ -119,15 +121,17 @@ impl KeyboardHookGuard {
             .store(matches!(mode, KeyboardMode::Map), Ordering::Relaxed);
     }
 
-    /// Indica si el hook está capturando todas las teclas físicas (`Modo mapa` o fallback sin foreground).
+    /// Indica si el hook está capturando todas las teclas físicas (`Modo mapa` con ventana enfocada).
     pub fn is_capturing_all_keys(&self) -> bool {
         let state = shared_state();
         self.was_active
             && self.is_installed()
-            && (state.map_mode.load(Ordering::Relaxed)
-                || (state.own_pid != 0
-                    && !unsafe { is_own_window_foreground(state.own_pid) }
-                    && unsafe { cursor_window_pid() } == state.own_pid))
+            && state.map_mode.load(Ordering::Relaxed)
+            && should_capture_for_focus(
+                state.own_pid,
+                unsafe { foreground_window_pid() },
+                state.window_focused.load(Ordering::Relaxed),
+            )
     }
 
     /// Activa o desactiva la captura de atajos de sistema hacia `tx`; instala y desinstala el hook dinámicamente.
@@ -166,6 +170,7 @@ impl KeyboardHookGuard {
             self.release_modifiers_now();
         }
         state.win_down.store(false, Ordering::Relaxed);
+        state.window_focused.store(false, Ordering::Relaxed);
         state.active.store(false, Ordering::SeqCst);
 
         if self.was_active || self.worker.is_some() {
@@ -318,19 +323,17 @@ pub(crate) fn build_hook_key_event(vk_code: u32, scan_code: u32, flags: u32, dow
     }
 }
 
-/// Decide si el hook debe capturar según si nuestra ventana está en primer plano o bajo el cursor.
-pub(crate) fn should_capture_for_pids(own_pid: u32, fg_pid: u32, cursor_pid: u32) -> bool {
-    own_pid != 0 && (fg_pid == own_pid || cursor_pid == own_pid)
-}
-
-/// Decide si el hook debe interceptar todas las teclas físicas (`Modo mapa` o cuando otra app como `SearchHost` retiene el foreground con el puntero encima).
-pub(crate) fn should_hook_capture_all_keys(
-    map_mode: bool,
-    own_pid: u32,
-    fg_pid: u32,
-    cursor_pid: u32,
-) -> bool {
-    map_mode || (own_pid != 0 && fg_pid != own_pid && cursor_pid == own_pid)
+/// Captura teclado hacia la PC remota únicamente cuando la ventana de RandyDesk es la ventana activa.
+/// Si la barra de tareas u otra app local tiene el primer plano (`fg_pid != own_pid`), libera el teclado a tu PC.
+pub(crate) fn should_capture_for_focus(own_pid: u32, fg_pid: u32, window_focused: bool) -> bool {
+    if own_pid == 0 {
+        return false;
+    }
+    if fg_pid != 0 {
+        fg_pid == own_pid
+    } else {
+        window_focused
+    }
 }
 
 unsafe extern "system" fn low_level_kb_proc(
@@ -351,15 +354,15 @@ unsafe extern "system" fn low_level_kb_proc(
         let active = state.active.load(Ordering::Relaxed);
         let is_self_injected = kb.dwExtraInfo == RANDYDESK_INPUT_EXTRA_INFO;
         let fg_pid = foreground_window_pid();
-        let cursor_pid = cursor_window_pid();
+        let win_focused = state.window_focused.load(Ordering::Relaxed);
         let can_capture = active
             && !is_self_injected
-            && should_capture_for_pids(state.own_pid, fg_pid, cursor_pid);
+            && should_capture_for_focus(state.own_pid, fg_pid, win_focused);
 
         if vk == VK_LWIN_U16 || vk == VK_RWIN_U16 {
             let has_tx = state.tx.try_lock().map(|g| g.is_some()).unwrap_or(false);
             append_input_debug_log(&format!(
-                "[CLIENT-HOOK] win_key vk=0x{vk:04X} active={active} fg_pid={fg_pid} cursor_pid={cursor_pid} own_pid={} has_tx={has_tx} down={:?} self_injected={is_self_injected}",
+                "[CLIENT-HOOK] win_key vk=0x{vk:04X} active={active} fg_pid={fg_pid} focused={win_focused} own_pid={} can_capture={can_capture} has_tx={has_tx} down={:?} self_injected={is_self_injected}",
                 state.own_pid, down
             ));
         } else if active
@@ -370,12 +373,12 @@ unsafe extern "system" fn low_level_kb_proc(
             && matches!(vk, 0x0D | 0x20)
         {
             append_input_debug_log(&format!(
-                "[CLIENT-HOOK] map_skip vk=0x{vk:04X} fg_pid={fg_pid} cursor_pid={cursor_pid} own_pid={}",
+                "[CLIENT-HOOK] map_skip vk=0x{vk:04X} fg_pid={fg_pid} focused={win_focused} own_pid={}",
                 state.own_pid
             ));
         }
 
-        // Limpia win_down SIEMPRE al soltar Win incluso si el cursor o foco salieron de RandyDesk.
+        // Limpia win_down SIEMPRE al soltar Win incluso si el foco salió de RandyDesk.
         if !is_self_injected && matches!(vk, VK_LWIN_U16 | VK_RWIN_U16) && down == Some(false) && !can_capture {
             let was_win_down = state.win_down.swap(false, Ordering::Relaxed);
             if active && was_win_down {
@@ -390,19 +393,14 @@ unsafe extern "system" fn low_level_kb_proc(
 
         if can_capture {
             if let Some(down) = down {
-                let map_mode = state.map_mode.load(Ordering::Relaxed);
-                let capture_all =
-                    should_hook_capture_all_keys(map_mode, state.own_pid, fg_pid, cursor_pid);
+                let capture_all = state.map_mode.load(Ordering::Relaxed);
                 let intercept = if capture_all {
                     if matches!(vk, VK_LWIN_U16 | VK_RWIN_U16) {
                         state.win_down.store(down, Ordering::Relaxed);
                     }
                     true
                 } else {
-                    let win_phys_down = ((GetAsyncKeyState(VK_LWIN_U16 as i32) as u16 & 0x8000) != 0)
-                        || ((GetAsyncKeyState(VK_RWIN_U16 as i32) as u16 & 0x8000) != 0);
-                    let win_was_down = state.win_down.load(Ordering::Relaxed)
-                        && (win_phys_down || matches!(vk, VK_LWIN_U16 | VK_RWIN_U16));
+                    let win_was_down = state.win_down.load(Ordering::Relaxed);
                     let alt_down = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0;
                     let ctrl_down = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0;
                     let (hit, new_win_down) =
@@ -448,22 +446,6 @@ unsafe fn foreground_window_pid() -> u32 {
     let mut fg_pid = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut fg_pid));
     fg_pid
-}
-
-unsafe fn cursor_window_pid() -> u32 {
-    let mut pt = POINT::default();
-    if GetCursorPos(&mut pt).is_err() {
-        return 0;
-    }
-    let hwnd = WindowFromPoint(pt);
-    if hwnd.is_invalid() {
-        return 0;
-    }
-    let root = GetAncestor(hwnd, GA_ROOT);
-    let target = if root.is_invalid() { hwnd } else { root };
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(target, Some(&mut pid));
-    pid
 }
 
 unsafe fn is_own_window_foreground(own_pid: u32) -> bool {
@@ -536,26 +518,17 @@ mod tests {
     }
 
     #[test]
-    fn captures_when_foreground_or_cursor_is_over_own_window() {
-        // Caso real Windows 11: Menú Inicio (SearchHost PID 8496) en foreground mientras cursor sigue sobre RandyDesk
-        assert!(should_capture_for_pids(12736, 12736, 12736));
-        assert!(should_capture_for_pids(12736, 8496, 12736));
-        assert!(should_capture_for_pids(12736, 12736, 9999));
-        assert!(!should_capture_for_pids(12736, 8496, 9999));
-        assert!(!should_capture_for_pids(0, 8496, 0));
-    }
-
-    #[test]
-    fn fallback_captures_all_keys_when_searchhost_steals_foreground() {
-        // Modo traducción con foreground propio: solo hotkeys de sistema (capture_all = false)
-        assert!(!should_hook_capture_all_keys(false, 19184, 19184, 19184));
-        // Modo traducción cuando SearchHost (8480) retiene foreground y cursor está sobre RandyDesk:
-        // captura TODAS las teclas por hook para que no se pierda escritura
-        assert!(should_hook_capture_all_keys(false, 19184, 8480, 19184));
-        // Modo mapa siempre captura todas las teclas
-        assert!(should_hook_capture_all_keys(true, 19184, 19184, 19184));
-        // Cursor y foreground fuera de RandyDesk -> false
-        assert!(!should_hook_capture_all_keys(false, 19184, 8480, 8488));
+    fn captures_only_when_randydesk_window_is_foreground_and_defaults_to_map() {
+        assert_eq!(KeyboardMode::default(), KeyboardMode::Map);
+        assert!(should_capture_for_focus(12736, 12736, true));
+        assert!(should_capture_for_focus(12736, 12736, false));
+        // Si la barra de tareas (explorer PID 7460) o SearchHost (8480) local tiene foco, NO roba teclado
+        assert!(!should_capture_for_focus(12736, 7460, true));
+        assert!(!should_capture_for_focus(12736, 8480, true));
+        // Si Windows reporta fg_pid = 0 temporalmente, usa fallback window_focused
+        assert!(should_capture_for_focus(12736, 0, true));
+        assert!(!should_capture_for_focus(12736, 0, false));
+        assert!(!should_capture_for_focus(0, 0, true));
     }
 
     #[test]

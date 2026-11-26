@@ -442,7 +442,18 @@ pub fn render_session_overlay(
                             });
 
                             ui.menu_button("Teclado y ratón", |ui| {
-                                ui.set_min_width(245.0);
+                                ui.set_min_width(275.0);
+                                if ui
+                                    .selectable_label(
+                                        state.keyboard_mode == KeyboardMode::Map,
+                                        "Modo mapa (Teclado físico · Recomendado)",
+                                    )
+                                    .clicked()
+                                {
+                                    state.keyboard_mode = KeyboardMode::Map;
+                                    actions.keyboard_cfg_changed = true;
+                                    ui.close_menu();
+                                }
                                 if ui
                                     .selectable_label(
                                         state.keyboard_mode == KeyboardMode::Translate,
@@ -451,17 +462,6 @@ pub fn render_session_overlay(
                                     .clicked()
                                 {
                                     state.keyboard_mode = KeyboardMode::Translate;
-                                    actions.keyboard_cfg_changed = true;
-                                    ui.close_menu();
-                                }
-                                if ui
-                                    .selectable_label(
-                                        state.keyboard_mode == KeyboardMode::Map,
-                                        "Modo mapa (Teclado físico)",
-                                    )
-                                    .clicked()
-                                {
-                                    state.keyboard_mode = KeyboardMode::Map;
                                     actions.keyboard_cfg_changed = true;
                                     ui.close_menu();
                                 }
@@ -498,20 +498,21 @@ pub fn render_session_overlay(
                                 } else if !state.keyboard_grab_enabled {
                                     ("Estado hook: Desactivado".to_string(), TEXT_MUTED)
                                 } else if input.hook_installed {
-                                    let focus_note = if KeyboardHookGuard::is_window_foreground() {
-                                        "foco activo"
-                                    } else if KeyboardHookGuard::is_cursor_over_own_window() {
-                                        "puntero activo"
+                                    if KeyboardHookGuard::is_window_foreground() {
+                                        (
+                                            format!(
+                                                "Teclado: PC remota (activo, {} teclas)",
+                                                input.hook_hits
+                                            ),
+                                            ACCENT_TEAL,
+                                        )
                                     } else {
-                                        "en espera"
-                                    };
-                                    (
-                                        format!(
-                                            "Hook: Activo ({focus_note}, {} teclas)",
-                                            input.hook_hits
-                                        ),
-                                        ACCENT_TEAL,
-                                    )
+                                        (
+                                            "Teclado: Tu PC (haz clic aquí para controlar)"
+                                                .to_string(),
+                                            TEXT_MUTED,
+                                        )
+                                    }
                                 } else {
                                     ("Estado hook: Hook no disponible".to_string(), STATUS_ORANGE)
                                 };

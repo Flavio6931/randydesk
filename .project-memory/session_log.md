@@ -1,5 +1,20 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.5.2: Captura de teclado por foco estricto de `RandyDesk` y `Modo mapa` por defecto
+- **Causa raíz identificada (video + `input_debug.log`):**
+  1. `KeyboardMode::Translate` era el modo por defecto al conectar, dejando pasar teclas fuera del hook y rompiendo `Win+R`/`Win+E` por depender de `GetAsyncKeyState(VK_LWIN)` cuando el hook bloqueaba `Win`.
+  2. La regla `cursor_pid == own_pid` hacía que el teclado siguiera secuestrado hacia la PC remota cuando otra ventana local (`OBS`, `SearchHost`, barra de tareas) tenía foco si el puntero permanecía sobre `RandyDesk`, y escapaba si el puntero tocaba la barra de tareas local.
+  3. Faltaba enfoque automático al llegar el primer cuadro de la sesión remota.
+- **Resumen técnico:**
+  - `Cargo.toml` (+ `Cargo.lock`): versión subida a `0.5.2`.
+  - [win_hook.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/win_hook.rs): `KeyboardMode::Map` como valor por defecto (`#[default]`), reemplazo de `cursor_pid` por `should_capture_for_focus(own_pid, fg_pid, window_focused)` (`set_window_focused`), limpieza de `is_cursor_over_own_window` y fix de `win_was_down` en `Modo traducción`.
+  - [app.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/app.rs): enfoque automático único al conectar (`focused_on_connect` + `ensure_foreground()` + `ViewportCommand::Focus`) y sincronización continua de `set_window_focused(ctx.input(|i| i.focused))`.
+  - [session_bar.rs](file:///c:/Users/Flavio/Desktop/H4CK/Flavio/randydeskt/crates/randydesk-client/src/session_bar.rs): `Modo mapa (Teclado físico · Recomendado)` primero en el menú y etiqueta clara de foco (`Teclado: PC remota (activo, N teclas)` vs `Teclado: Tu PC (haz clic aquí para controlar)`).
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 43 pruebas aprobadas (18 `randydesk-client`, 15 unit + 1 `quic_loopback` `randydesk-host`, 8 `randydesk-proto`, 1 `relay_e2e` `randydesk-relay`).
+  - `cargo build --workspace --release` + copia limpia a `dist\`: `RandyDesk.exe` (`12,352,512` bytes) y `randydesk-relay.exe` (`2,768,384` bytes).
+
 ## 2026-11-26 — RandyDesk v0.5.1: Fix definitivo de teclado cliente y host `SYSTEM` estilo RustDesk
 - **Causa raíz identificada (comparando código RustDesk y trazas reales en Windows 11):**
   1. `win_service.rs`: `spawn_worker_in_session` duplicaba el token de Session 0 con `SecurityIdentification` + `TokenSessionId` + `CREATE_NO_WINDOW`, en lugar de usar el token interactivo de `winlogon.exe` de la sesión activa (`DETACHED_PROCESS`), bloqueando `INPUT_KEYBOARD` bajo Windows 11 aunque el ratón funcionaba.

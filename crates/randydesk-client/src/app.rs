@@ -96,6 +96,7 @@ pub struct RandyDeskApp {
     bar_collapsed: bool,
     bar_pinned: bool,
     was_foreground: bool,
+    focused_on_connect: bool,
     remote_ctrl_down: bool,
     remote_alt_down: bool,
     remote_shift_down: bool,
@@ -148,13 +149,14 @@ impl RandyDeskApp {
             show_monitor_stats: true,
             show_remote_cursor: true,
             keyboard_grab_enabled: true,
-            keyboard_mode: KeyboardMode::Translate,
+            keyboard_mode: KeyboardMode::default(),
             invert_wheel: false,
             swap_mouse_buttons: false,
             view_only: false,
             bar_collapsed: false,
             bar_pinned: true,
             was_foreground: false,
+            focused_on_connect: false,
             remote_ctrl_down: false,
             remote_alt_down: false,
             remote_shift_down: false,
@@ -273,6 +275,7 @@ impl RandyDeskApp {
     fn launch_connection(&mut self, prompt: PasswordPrompt, ctx: &egui::Context) {
         self.active_target_address = Some(prompt.address.clone());
         self.recorded_recent_for_session = false;
+        self.focused_on_connect = false;
         self.last_error_handled = None;
         self.ui_notice = None;
         self.last_attempt = Some(prompt.clone());
@@ -428,6 +431,7 @@ impl eframe::App for RandyDeskApp {
 
         match status {
             ConnectionState::Disconnected | ConnectionState::Error(_) => {
+                self.focused_on_connect = false;
                 self.release_remote_modifiers();
                 self.kb_hook.set_capture(false, None);
                 if let ConnectionState::Error(msg) = &status {
@@ -448,6 +452,7 @@ impl eframe::App for RandyDeskApp {
                 self.render_modals(ctx);
             }
             ConnectionState::Connecting { ref address } => {
+                self.focused_on_connect = false;
                 self.release_remote_modifiers();
                 self.kb_hook.set_capture(false, None);
                 self.render_connecting(ctx, address);
@@ -1202,6 +1207,7 @@ impl RandyDeskApp {
                 self.fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
+            self.focused_on_connect = false;
             self.release_remote_modifiers();
             self.kb_hook.set_capture(false, None);
             self.net.disconnect();
@@ -1212,6 +1218,16 @@ impl RandyDeskApp {
             return;
         }
 
+        if !self.focused_on_connect && reconnecting.is_none() && !self.hidden_to_tray {
+            self.focused_on_connect = true;
+            if let Some(tray) = self.tray.as_ref() {
+                tray.ensure_foreground();
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        let egui_focused = ctx.input(|i| i.focused);
+        self.kb_hook.set_window_focused(egui_focused);
         let is_fg = KeyboardHookGuard::is_window_foreground();
         let should_capture_kb = reconnecting.is_none()
             && self.keyboard_grab_enabled
