@@ -7,15 +7,16 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 use tracing::warn;
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, PM_NOREMOVE, PM_NOYIELD, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetAncestor, GetCursorPos, GetForegroundWindow, GetMessageW,
+    GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, MSG, PM_NOREMOVE, PM_NOYIELD, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// Códigos Virtual-Key de modificadores que se liberan al perder foco para evitar teclas pegadas.
@@ -24,9 +25,20 @@ const VK_PACKET_U16: u16 = 0x00E7;
 const VK_LWIN_U16: u16 = 0x005B;
 const VK_RWIN_U16: u16 = 0x005C;
 
+/// Modo de captura/traducción de teclado hacia la sesión remota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyboardMode {
+    /// Texto normal vía ventana y captura de `Win` / `Alt+Tab` por hook de bajo nivel.
+    #[default]
+    Translate,
+    /// Captura directa de todas las teclas físicas por hook mientras está en sesión.
+    Map,
+}
+
 struct HookSharedState {
     installed: AtomicBool,
     active: AtomicBool,
+    map_mode: AtomicBool,
     win_down: AtomicBool,
     own_pid: u32,
     sent_keys: AtomicU64,
@@ -40,6 +52,7 @@ fn shared_state() -> &'static Arc<HookSharedState> {
         Arc::new(HookSharedState {
             installed: AtomicBool::new(false),
             active: AtomicBool::new(false),
+            map_mode: AtomicBool::new(false),
             win_down: AtomicBool::new(false),
             own_pid: unsafe { GetCurrentProcessId() },
             sent_keys: AtomicU64::new(0),
@@ -86,6 +99,20 @@ impl KeyboardHookGuard {
     /// Cantidad acumulada de teclas de sistema capturadas por el hook.
     pub fn sent_key_count(&self) -> u64 {
         shared_state().sent_keys.load(Ordering::Relaxed)
+    }
+
+    /// Cambia el modo de teclado (`Translate`: solo atajos sistema, `Map`: teclado físico completo).
+    pub fn set_mode(&self, mode: KeyboardMode) {
+        shared_state()
+            .map_mode
+            .store(matches!(mode, KeyboardMode::Map), Ordering::Relaxed);
+    }
+
+    /// Indica si el hook está activo capturando todas las teclas físicas (`Modo mapa`).
+    pub fn is_capturing_all_keys(&self) -> bool {
+        self.was_active
+            && self.is_installed()
+            && shared_state().map_mode.load(Ordering::Relaxed)
     }
 
     /// Activa o desactiva la captura de atajos de sistema hacia `tx`; instala y desinstala el hook dinámicamente.
@@ -270,6 +297,11 @@ pub(crate) fn build_hook_key_event(vk_code: u32, scan_code: u32, flags: u32, dow
     }
 }
 
+/// Decide si el hook debe capturar según si nuestra ventana está en primer plano o bajo el cursor.
+pub(crate) fn should_capture_for_pids(own_pid: u32, fg_pid: u32, cursor_pid: u32) -> bool {
+    own_pid != 0 && (fg_pid == own_pid || cursor_pid == own_pid)
+}
+
 unsafe extern "system" fn low_level_kb_proc(
     n_code: i32,
     w_param: WPARAM,
@@ -288,23 +320,36 @@ unsafe extern "system" fn low_level_kb_proc(
         let active = state.active.load(Ordering::Relaxed);
         let is_self_injected = kb.dwExtraInfo == RANDYDESK_INPUT_EXTRA_INFO;
         let fg_pid = foreground_window_pid();
+        let cursor_pid = cursor_window_pid();
 
         if vk == VK_LWIN_U16 || vk == VK_RWIN_U16 {
             let has_tx = state.tx.try_lock().map(|g| g.is_some()).unwrap_or(false);
             append_input_debug_log(&format!(
-                "[CLIENT-HOOK] win_key vk=0x{vk:04X} active={active} fg_pid={fg_pid} own_pid={} has_tx={has_tx} down={:?} self_injected={is_self_injected}",
+                "[CLIENT-HOOK] win_key vk=0x{vk:04X} active={active} fg_pid={fg_pid} cursor_pid={cursor_pid} own_pid={} has_tx={has_tx} down={:?} self_injected={is_self_injected}",
                 state.own_pid, down
             ));
         }
 
-        if active && !is_self_injected && fg_pid != 0 && fg_pid == state.own_pid {
+        if active
+            && !is_self_injected
+            && should_capture_for_pids(state.own_pid, fg_pid, cursor_pid)
+        {
             if let Some(down) = down {
                 let win_was_down = state.win_down.load(Ordering::Relaxed);
-                let alt_down = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0;
-                let ctrl_down = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0;
-                let (intercept, new_win_down) =
-                    should_intercept_system_key(vk, down, win_was_down, alt_down, ctrl_down);
-                state.win_down.store(new_win_down, Ordering::Relaxed);
+                let map_mode = state.map_mode.load(Ordering::Relaxed);
+                let intercept = if map_mode {
+                    if matches!(vk, VK_LWIN_U16 | VK_RWIN_U16) {
+                        state.win_down.store(down, Ordering::Relaxed);
+                    }
+                    true
+                } else {
+                    let alt_down = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0;
+                    let ctrl_down = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0;
+                    let (hit, new_win_down) =
+                        should_intercept_system_key(vk, down, win_was_down, alt_down, ctrl_down);
+                    state.win_down.store(new_win_down, Ordering::Relaxed);
+                    hit
+                };
 
                 if intercept {
                     if let Ok(guard) = state.tx.try_lock() {
@@ -343,6 +388,22 @@ unsafe fn foreground_window_pid() -> u32 {
     let mut fg_pid = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut fg_pid));
     fg_pid
+}
+
+unsafe fn cursor_window_pid() -> u32 {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        return 0;
+    }
+    let hwnd = WindowFromPoint(pt);
+    if hwnd.is_invalid() {
+        return 0;
+    }
+    let root = GetAncestor(hwnd, GA_ROOT);
+    let target = if root.is_invalid() { hwnd } else { root };
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(target, Some(&mut pid));
+    pid
 }
 
 unsafe fn is_own_window_foreground(own_pid: u32) -> bool {
@@ -412,6 +473,16 @@ mod tests {
         assert_eq!(should_intercept_system_key(0x1B, true, false, true, false), (true, false));
         assert_eq!(should_intercept_system_key(0x1B, true, false, false, true), (true, false));
         assert_eq!(should_intercept_system_key(0x2C, true, false, false, false), (true, false));
+    }
+
+    #[test]
+    fn captures_when_foreground_or_cursor_is_over_own_window() {
+        // Caso real Windows 11: Menú Inicio (SearchHost PID 8496) en foreground mientras cursor sigue sobre RandyDesk
+        assert!(should_capture_for_pids(12736, 12736, 12736));
+        assert!(should_capture_for_pids(12736, 8496, 12736));
+        assert!(should_capture_for_pids(12736, 12736, 9999));
+        assert!(!should_capture_for_pids(12736, 8496, 9999));
+        assert!(!should_capture_for_pids(0, 8496, 0));
     }
 
     #[test]

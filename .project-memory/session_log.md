@@ -1,5 +1,19 @@
 # Registro de Sesiones — RandyDesk
 
+## 2026-11-26 — RandyDesk v0.4.5: Barra flotante estilo RustDesk y fix definitivo de foco / tecla `Win`
+- **Resumen técnico:**
+  - Versión subida a `0.4.5` en `Cargo.toml` (y `Cargo.lock`).
+  - `crates/randydesk-client/src/win_hook.rs`: corregido bloqueo en Windows 11 donde `fg_pid` correspondía a `SearchHost.exe`; ahora `should_capture_for_pids(own_pid, fg_pid, cursor_pid)` captura también cuando `cursor_pid == own_pid` (`GetCursorPos` + `WindowFromPoint` + `GetAncestor(GA_ROOT)`). Añadido enum `KeyboardMode` (`Translate` y `Map`), `set_mode()` e `is_capturing_all_keys()`.
+  - `crates/randydesk-client/src/tray.rs`: implementado `force_foreground` con `AttachThreadInput` + `BringWindowToTop` + `SetForegroundWindow` en `restore_window` y nuevo método público `TrayController::ensure_foreground()`.
+  - `crates/randydesk-client/src/session_bar.rs`, `main.rs` y `app.rs`: reemplazada la barra fija superior por el apartado flotante centrado estilo RustDesk (`Pantalla`, `Acciones`, `Teclado`, `Desconectar`) más tarjeta flotante de métricas (`Mostrar calidad del monitor`), soporte `Escala adaptativa` / `Escala original` (`ScrollArea::both()`), protección para que clics en la barra/menús no pasen al escritorio remoto, y sincronización de foco `ensure_foreground()` al hacer clic dentro del canvas.
+- **Verificación ejecutada:**
+  - `cargo clippy --workspace --all-targets -- -D warnings`: 0 errores, 0 warnings.
+  - `cargo test --workspace`: 34 pruebas aprobadas (15 en `randydesk-client`, 9 unit + 1 `quic_loopback` en `randydesk-host`, 8 en `randydesk-proto`, 1 `relay_e2e` en `randydesk-relay`).
+  - `cargo build --workspace --release` + copia a `dist\`: `RandyDesk.exe` (`11,340,800` bytes) y `randydesk-relay.exe` (`2,766,336` bytes).
+  - Publicado commit en `main` y Release `v0.4.5` en `Flavio6931/randydesk`.
+- **Pendiente de verificación en vivo:**
+  - Probar `v0.4.5` en ambas PCs (barra flotante, métricas, restauración desde bandeja y tecla `Win` sobre el escritorio remoto).
+
 ## 2026-11-24 — RandyDesk v0.4.4: Fluidez de video/red, fix bandeja Win32, hook dinámico y perfiles rápidos
 - **Resumen técnico:**
   - Versión subida a `0.4.4` en `Cargo.toml` (y `Cargo.lock`).

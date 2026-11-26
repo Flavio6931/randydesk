@@ -9,11 +9,12 @@ use tracing::warn;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE, WPARAM};
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindow, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindow, GW_OWNER,
-    GWL_EXSTYLE, SW_HIDE, SW_RESTORE, WM_CLOSE, WS_EX_TOOLWINDOW,
+    BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowLongW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
+    SetForegroundWindow, ShowWindow, GW_OWNER, GWL_EXSTYLE, SW_HIDE, SW_RESTORE, WM_CLOSE,
+    WS_EX_TOOLWINDOW,
 };
 
 /// Genera el icono RGBA8 32x32 de RandyDesk (fondo azul `#0078FF` con pantalla blanca).
@@ -201,6 +202,15 @@ impl TrayController {
     pub fn take_restore_requested(&self) -> bool {
         self.restore_requested.swap(false, Ordering::SeqCst)
     }
+
+    /// Fuerza el foco Win32 hacia la ventana principal de RandyDesk cuando el usuario interactúa con ella.
+    pub fn ensure_foreground(&self) {
+        if let Some(hwnd) = resolve_or_cache_hwnd(&self.main_hwnd) {
+            unsafe {
+                force_foreground(hwnd);
+            }
+        }
+    }
 }
 
 impl Drop for TrayController {
@@ -318,6 +328,23 @@ fn find_main_hwnd() -> Option<HWND> {
     search.preferred.or(search.fallback)
 }
 
+unsafe fn force_foreground(hwnd: HWND) {
+    let fg = GetForegroundWindow();
+    if !fg.is_invalid() && fg != hwnd {
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let cur_tid = GetCurrentThreadId();
+        if fg_tid != 0 && fg_tid != cur_tid {
+            let _ = AttachThreadInput(cur_tid, fg_tid, true);
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = AttachThreadInput(cur_tid, fg_tid, false);
+            return;
+        }
+    }
+    let _ = BringWindowToTop(hwnd);
+    let _ = SetForegroundWindow(hwnd);
+}
+
 fn restore_window(
     ctx: &egui::Context,
     restore_flag: &AtomicBool,
@@ -329,7 +356,7 @@ fn restore_window(
     if let Some(hwnd) = resolve_or_cache_hwnd(main_hwnd) {
         unsafe {
             let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = SetForegroundWindow(hwnd);
+            force_foreground(hwnd);
         }
     }
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));

@@ -9,12 +9,15 @@ use crate::decoder::FrameUpdate;
 use crate::host_panel::HostPanelState;
 use crate::keymap::{is_control_or_nav_key, map_egui_key_to_vk, map_mouse_button, normalize_pos};
 use crate::net::{ConnectRequest, ConnectionState, NetCommand, NetworkHandle};
+use crate::session_bar::{
+    render_session_overlay, QualityPreset, ScaleMode, SessionBarInput, SessionBarState,
+};
 use crate::theme::{
     apply_rustdesk_theme, ACCENT_BLUE, ACCENT_TEAL, BANNER_COLORS, BG_CARD, BG_MAIN, BG_SIDEBAR,
     BORDER_SUBTLE, STATUS_ORANGE, TEXT_MUTED,
 };
 use crate::tray::TrayController;
-use crate::win_hook::KeyboardHookGuard;
+use crate::win_hook::{KeyboardHookGuard, KeyboardMode};
 use arboard::Clipboard;
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2};
 use randydesk_proto::{
@@ -78,7 +81,11 @@ pub struct RandyDeskApp {
     // Renderizado incremental del escritorio remoto
     screen_texture: Option<egui::TextureHandle>,
     fullscreen: bool,
+    scale_mode: ScaleMode,
+    quality_preset: QualityPreset,
+    show_monitor_stats: bool,
     keyboard_grab_enabled: bool,
+    keyboard_mode: KeyboardMode,
     was_foreground: bool,
     remote_ctrl_down: bool,
     remote_alt_down: bool,
@@ -125,7 +132,11 @@ impl RandyDeskApp {
             show_guide: false,
             screen_texture: None,
             fullscreen: false,
+            scale_mode: ScaleMode::Adaptive,
+            quality_preset: QualityPreset::Balanced,
+            show_monitor_stats: true,
             keyboard_grab_enabled: true,
+            keyboard_mode: KeyboardMode::Translate,
             was_foreground: false,
             remote_ctrl_down: false,
             remote_alt_down: false,
@@ -904,173 +915,9 @@ impl RandyDeskApp {
         stats: &crate::net::SessionStats,
         reconnecting: Option<(u32, &str)>,
     ) {
-        egui::TopBottomPanel::top("session_toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if let Some((attempt, reason)) = reconnecting {
-                    ui.colored_label(
-                        Color32::from_rgb(245, 165, 66),
-                        format!("Reconectando (#{attempt}): {reason}"),
-                    );
-                } else {
-                    let (dot_rect, _) =
-                        ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot_rect.center(), 4.0, ACCENT_TEAL);
-                    ui.colored_label(
-                        ACCENT_TEAL,
-                        format!("{host_name} ({width}x{height})"),
-                    );
-                }
-
-                ui.separator();
-                ui.label(format_duration(stats.elapsed_secs));
-                ui.label(format!("{:.1} fps", stats.fps));
-                if stats.kbps >= 1024.0 {
-                    ui.label(format!("{:.2} MB/s", stats.kbps / 8192.0));
-                } else {
-                    ui.label(format!("{:.0} kbps", stats.kbps));
-                }
-                if let Some(rtt) = stats.rtt_ms {
-                    ui.label(format!("{rtt} ms"));
-                }
-
-                ui.separator();
-                let mut changed = false;
-                let is_fast = self.codec_input == CodecKind::Jpeg && self.quality_input <= 58;
-                let is_balanced = self.codec_input == CodecKind::Jpeg && self.quality_input > 58;
-                if ui
-                    .selectable_label(is_fast, "Rápido")
-                    .on_hover_text("JPEG 52%, 30 FPS — menor latencia en redes lentas")
-                    .clicked()
-                {
-                    self.codec_input = CodecKind::Jpeg;
-                    self.quality_input = 52;
-                    self.fps_input = 30;
-                    changed = true;
-                }
-                if ui
-                    .selectable_label(is_balanced, "Equilibrado")
-                    .on_hover_text("JPEG 72%, 30 FPS — balance recomendado")
-                    .clicked()
-                {
-                    self.codec_input = CodecKind::Jpeg;
-                    self.quality_input = 72;
-                    self.fps_input = 30;
-                    changed = true;
-                }
-                if ui
-                    .selectable_label(self.codec_input == CodecKind::Lz4Rgba, "Nítido")
-                    .on_hover_text("LZ4 sin pérdida — máxima nitidez para texto y código")
-                    .clicked()
-                {
-                    self.codec_input = CodecKind::Lz4Rgba;
-                    changed = true;
-                }
-                if self.codec_input == CodecKind::Jpeg
-                    && ui
-                        .add(egui::Slider::new(&mut self.quality_input, 35..=95).show_value(false))
-                        .on_hover_text(format!("Calidad JPEG: {}%", self.quality_input))
-                        .changed()
-                {
-                    changed = true;
-                }
-                if changed {
-                    self.net.send_cmd(NetCommand::UpdateSettings(StreamSettings {
-                        codec: self.codec_input,
-                        jpeg_quality: self.quality_input,
-                        target_fps: self.fps_input,
-                    }));
-                }
-
-                ui.separator();
-                let kb_hits = self.kb_hook.sent_key_count();
-                let kb_label = if !self.keyboard_grab_enabled {
-                    egui::RichText::new("Atajos Win: OFF").color(TEXT_MUTED)
-                } else if self.kb_hook.is_installed() {
-                    let txt = if kb_hits > 0 {
-                        format!("Atajos Win: ON ({kb_hits})")
-                    } else {
-                        "Atajos Win: ON".to_string()
-                    };
-                    egui::RichText::new(txt).color(ACCENT_TEAL)
-                } else {
-                    egui::RichText::new("Atajos Win: Error").color(STATUS_ORANGE)
-                };
-                if ui
-                    .button(kb_label)
-                    .on_hover_text("Captura tecla Windows y Alt+Tab hacia la PC remota (escribir texto siempre está activo)")
-                    .clicked()
-                {
-                    self.keyboard_grab_enabled = !self.keyboard_grab_enabled;
-                    if !self.keyboard_grab_enabled {
-                        self.kb_hook.set_capture(false, None);
-                    }
-                }
-                if ui
-                    .button("Tecla Win")
-                    .on_hover_text("Enviar pulsación de tecla Windows a la PC remota")
-                    .clicked()
-                {
-                    if let Some(tx) = self.net.cmd_sender() {
-                        self.rt_handle.spawn(async move {
-                            let _ = tx
-                                .send(NetCommand::Input(InputEvent::Key {
-                                    vk: 0x5B,
-                                    scan: 0x5B,
-                                    extended: true,
-                                    down: true,
-                                }))
-                                .await;
-                            tokio::time::sleep(Duration::from_millis(35)).await;
-                            let _ = tx
-                                .send(NetCommand::Input(InputEvent::Key {
-                                    vk: 0x5B,
-                                    scan: 0x5B,
-                                    extended: true,
-                                    down: false,
-                                }))
-                                .await;
-                        });
-                    }
-                }
-                if ui.button("Enviar portapapeles").clicked() {
-                    if let Ok(text) = Clipboard::new().and_then(|mut c| c.get_text()) {
-                        self.net.send_cmd(NetCommand::ClipboardSet(text));
-                    }
-                }
-                if ui.button("Traer").clicked() {
-                    self.net.send_cmd(NetCommand::ClipboardGet);
-                }
-                if ui.button("Refrescar").clicked() {
-                    self.net.send_cmd(NetCommand::RequestKeyframe);
-                }
-                if ui
-                    .button(if self.fullscreen {
-                        "Ventana"
-                    } else {
-                        "Pantalla completa"
-                    })
-                    .clicked()
-                {
-                    self.fullscreen = !self.fullscreen;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-                }
-                if ui
-                    .button(
-                        egui::RichText::new("Desconectar")
-                            .color(Color32::from_rgb(245, 115, 115)),
-                    )
-                    .clicked()
-                {
-                    if self.fullscreen {
-                        self.fullscreen = false;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                    }
-                    self.release_remote_modifiers();
-                    self.kb_hook.set_capture(false, None);
-                    self.net.disconnect();
-                }
-            });
-        });
+        let mut img_rect = egui::Rect::NOTHING;
+        let mut pointer_in_canvas = false;
+        let mut has_texture = false;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::BLACK))
@@ -1082,153 +929,306 @@ impl RandyDeskApp {
                     });
                     return;
                 };
+                has_texture = true;
 
-                let avail = ui.available_size();
                 let tex_size = tex.size_vec2();
-                let scale = (avail.x / tex_size.x.max(1.0)).min(avail.y / tex_size.y.max(1.0));
-                let draw_size = tex_size * scale;
-
-                let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-                let img_rect = egui::Rect::from_center_size(rect.center(), draw_size);
-
-                ui.painter().image(
-                    tex.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-
-                let pointer_in_canvas = response.hovered() || response.dragged();
-                let is_fg = KeyboardHookGuard::is_window_foreground();
-                let should_capture_kb =
-                    reconnecting.is_none() && self.keyboard_grab_enabled && !self.hidden_to_tray;
-                if self.was_foreground && !is_fg {
-                    self.release_remote_modifiers();
-                    if should_capture_kb {
-                        self.kb_hook.release_modifiers_now();
+                match self.scale_mode {
+                    ScaleMode::Adaptive => {
+                        let avail = ui.available_size();
+                        let scale =
+                            (avail.x / tex_size.x.max(1.0)).min(avail.y / tex_size.y.max(1.0));
+                        let draw_size = tex_size * scale;
+                        let (rect, response) =
+                            ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+                        img_rect = egui::Rect::from_center_size(rect.center(), draw_size);
+                        pointer_in_canvas = response.hovered() || response.dragged();
+                        ui.painter().image(
+                            tex.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
                     }
-                }
-                self.was_foreground = is_fg;
-
-                self.kb_hook.set_capture(
-                    should_capture_kb,
-                    if should_capture_kb {
-                        self.net.cmd_sender()
-                    } else {
-                        None
-                    },
-                );
-
-                // Sincroniza Ctrl/Alt/Shift con la ventana remota para atajos (Ctrl+C, Ctrl+V, Alt+F4, Shift+Flechas)
-                if is_fg && reconnecting.is_none() {
-                    let mods = ctx.input(|i| i.modifiers);
-                    if mods.ctrl != self.remote_ctrl_down {
-                        self.net.send_input(InputEvent::Key {
-                            vk: 0xA2,
-                            scan: 0x1D,
-                            extended: false,
-                            down: mods.ctrl,
-                        });
-                        self.remote_ctrl_down = mods.ctrl;
-                    }
-                    if mods.alt != self.remote_alt_down {
-                        self.net.send_input(InputEvent::Key {
-                            vk: 0xA4,
-                            scan: 0x38,
-                            extended: false,
-                            down: mods.alt,
-                        });
-                        self.remote_alt_down = mods.alt;
-                    }
-                    if mods.shift != self.remote_shift_down {
-                        self.net.send_input(InputEvent::Key {
-                            vk: 0xA0,
-                            scan: 0x2A,
-                            extended: false,
-                            down: mods.shift,
-                        });
-                        self.remote_shift_down = mods.shift;
-                    }
-                } else {
-                    self.release_remote_modifiers();
-                }
-
-                let events = ctx.input(|i| i.events.clone());
-
-                for ev in events {
-                    match ev {
-                        egui::Event::PointerMoved(pos) if pointer_in_canvas => {
-                            if let Some((x_norm, y_norm)) = normalize_pos(pos, img_rect) {
-                                self.net
-                                    .send_input(InputEvent::MouseMove { x_norm, y_norm });
-                            }
-                        }
-                        egui::Event::PointerButton {
-                            pos,
-                            button,
-                            pressed,
-                            ..
-                        } if img_rect.contains(pos) || !pressed => {
-                            if let Some((x_norm, y_norm)) = normalize_pos(pos, img_rect) {
-                                self.net
-                                    .send_input(InputEvent::MouseMove { x_norm, y_norm });
-                            }
-                            if let Some(mb) = map_mouse_button(button) {
-                                self.net.send_input(InputEvent::MouseButton {
-                                    button: mb,
-                                    down: pressed,
-                                });
-                            }
-                        }
-                        egui::Event::MouseWheel { delta, .. } if pointer_in_canvas => {
-                            let dx = (delta.x * 3.0).round() as i16 * 40;
-                            let dy = (delta.y * 3.0).round() as i16 * 40;
-                            if dx != 0 || dy != 0 {
-                                self.net.send_input(InputEvent::MouseWheel {
-                                    delta_x: dx,
-                                    delta_y: dy,
-                                });
-                            }
-                        }
-                        egui::Event::Key {
-                            key,
-                            pressed,
-                            modifiers,
-                            ..
-                        } => {
-                            let is_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
-                            if is_combo || is_control_or_nav_key(key) {
-                                if let Some((vk, extended)) = map_egui_key_to_vk(key) {
-                                    self.net.send_input(InputEvent::Key {
-                                        vk,
-                                        scan: 0,
-                                        extended,
-                                        down: pressed,
-                                    });
-                                }
-                            }
-                        }
-                        egui::Event::Text(text) => {
-                            let mods = ctx.input(|i| i.modifiers);
-                            if !mods.ctrl && !mods.alt && !mods.command {
-                                for ch in text.chars().filter(|c| !c.is_control()) {
-                                    self.net
-                                        .send_input(InputEvent::UnicodeChar { ch, down: true });
-                                    self.net
-                                        .send_input(InputEvent::UnicodeChar { ch, down: false });
-                                }
-                            }
-                        }
-                        _ => {}
+                    ScaleMode::Original => {
+                        egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let size = tex_size.max(ui.available_size());
+                                let (rect, response) =
+                                    ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                                img_rect = egui::Rect::from_center_size(rect.center(), tex_size);
+                                pointer_in_canvas = response.hovered() || response.dragged();
+                                ui.painter().image(
+                                    tex.id(),
+                                    img_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    Color32::WHITE,
+                                );
+                            });
                     }
                 }
             });
-    }
-}
 
-fn format_duration(total_secs: u64) -> String {
-    let h = total_secs / 3600;
-    let m = (total_secs % 3600) / 60;
-    let s = total_secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+        let mut bar_state = SessionBarState {
+            codec: self.codec_input,
+            quality: self.quality_input,
+            fps: self.fps_input,
+            scale_mode: self.scale_mode,
+            quality_preset: self.quality_preset,
+            show_monitor_stats: self.show_monitor_stats,
+            fullscreen: self.fullscreen,
+            keyboard_grab_enabled: self.keyboard_grab_enabled,
+            keyboard_mode: self.keyboard_mode,
+        };
+        let bar_actions = render_session_overlay(
+            ctx,
+            SessionBarInput {
+                host_name,
+                width,
+                height,
+                stats,
+                reconnecting,
+                hook_installed: self.kb_hook.is_installed(),
+                hook_hits: self.kb_hook.sent_key_count(),
+            },
+            &mut bar_state,
+        );
+
+        self.codec_input = bar_state.codec;
+        self.quality_input = bar_state.quality;
+        self.fps_input = bar_state.fps;
+        self.scale_mode = bar_state.scale_mode;
+        self.quality_preset = bar_state.quality_preset;
+        self.show_monitor_stats = bar_state.show_monitor_stats;
+        self.fullscreen = bar_state.fullscreen;
+        self.keyboard_grab_enabled = bar_state.keyboard_grab_enabled;
+        self.keyboard_mode = bar_state.keyboard_mode;
+
+        if bar_actions.settings_changed {
+            self.net.send_cmd(NetCommand::UpdateSettings(StreamSettings {
+                codec: self.codec_input,
+                jpeg_quality: self.quality_input,
+                target_fps: self.fps_input,
+            }));
+        }
+        if bar_actions.send_win_key {
+            if let Some(tx) = self.net.cmd_sender() {
+                self.rt_handle.spawn(async move {
+                    let _ = tx
+                        .send(NetCommand::Input(InputEvent::Key {
+                            vk: 0x5B,
+                            scan: 0x5B,
+                            extended: true,
+                            down: true,
+                        }))
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(35)).await;
+                    let _ = tx
+                        .send(NetCommand::Input(InputEvent::Key {
+                            vk: 0x5B,
+                            scan: 0x5B,
+                            extended: true,
+                            down: false,
+                        }))
+                        .await;
+                });
+            }
+        }
+        if bar_actions.send_task_manager {
+            if let Some(tx) = self.net.cmd_sender() {
+                self.rt_handle.spawn(async move {
+                    for (vk, scan) in [(0xA2u16, 0x1Du16), (0xA0, 0x2A), (0x1B, 0x01)] {
+                        let _ = tx
+                            .send(NetCommand::Input(InputEvent::Key {
+                                vk,
+                                scan,
+                                extended: false,
+                                down: true,
+                            }))
+                            .await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(35)).await;
+                    for (vk, scan) in [(0x1Bu16, 0x01u16), (0xA0, 0x2A), (0xA2, 0x1D)] {
+                        let _ = tx
+                            .send(NetCommand::Input(InputEvent::Key {
+                                vk,
+                                scan,
+                                extended: false,
+                                down: false,
+                            }))
+                            .await;
+                    }
+                });
+            }
+        }
+        if bar_actions.send_clipboard {
+            if let Ok(text) = Clipboard::new().and_then(|mut c| c.get_text()) {
+                self.net.send_cmd(NetCommand::ClipboardSet(text));
+            }
+        }
+        if bar_actions.fetch_clipboard {
+            self.net.send_cmd(NetCommand::ClipboardGet);
+        }
+        if bar_actions.request_keyframe {
+            self.net.send_cmd(NetCommand::RequestKeyframe);
+        }
+        if bar_actions.toggle_fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        if bar_actions.keyboard_cfg_changed {
+            self.kb_hook.set_mode(self.keyboard_mode);
+            if !self.keyboard_grab_enabled {
+                self.kb_hook.set_capture(false, None);
+            }
+        }
+        if bar_actions.disconnect {
+            if self.fullscreen {
+                self.fullscreen = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+            self.release_remote_modifiers();
+            self.kb_hook.set_capture(false, None);
+            self.net.disconnect();
+            return;
+        }
+
+        if !has_texture {
+            return;
+        }
+
+        let is_fg = KeyboardHookGuard::is_window_foreground();
+        let should_capture_kb =
+            reconnecting.is_none() && self.keyboard_grab_enabled && !self.hidden_to_tray;
+        if self.was_foreground && !is_fg {
+            self.release_remote_modifiers();
+            if should_capture_kb {
+                self.kb_hook.release_modifiers_now();
+            }
+        }
+        self.was_foreground = is_fg;
+
+        self.kb_hook.set_mode(self.keyboard_mode);
+        self.kb_hook.set_capture(
+            should_capture_kb,
+            if should_capture_kb {
+                self.net.cmd_sender()
+            } else {
+                None
+            },
+        );
+
+        let hook_blocking_egui = self.kb_hook.is_capturing_all_keys();
+
+        // Sincroniza Ctrl/Alt/Shift con la ventana remota para atajos en Modo traducción
+        if !hook_blocking_egui && is_fg && reconnecting.is_none() {
+            let mods = ctx.input(|i| i.modifiers);
+            if mods.ctrl != self.remote_ctrl_down {
+                self.net.send_input(InputEvent::Key {
+                    vk: 0xA2,
+                    scan: 0x1D,
+                    extended: false,
+                    down: mods.ctrl,
+                });
+                self.remote_ctrl_down = mods.ctrl;
+            }
+            if mods.alt != self.remote_alt_down {
+                self.net.send_input(InputEvent::Key {
+                    vk: 0xA4,
+                    scan: 0x38,
+                    extended: false,
+                    down: mods.alt,
+                });
+                self.remote_alt_down = mods.alt;
+            }
+            if mods.shift != self.remote_shift_down {
+                self.net.send_input(InputEvent::Key {
+                    vk: 0xA0,
+                    scan: 0x2A,
+                    extended: false,
+                    down: mods.shift,
+                });
+                self.remote_shift_down = mods.shift;
+            }
+        } else {
+            self.release_remote_modifiers();
+        }
+
+        let events = ctx.input(|i| i.events.clone());
+
+        for ev in events {
+            match ev {
+                egui::Event::PointerMoved(pos) if pointer_in_canvas => {
+                    if let Some((x_norm, y_norm)) = normalize_pos(pos, img_rect) {
+                        self.net
+                            .send_input(InputEvent::MouseMove { x_norm, y_norm });
+                    }
+                }
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    ..
+                } if (pointer_in_canvas && img_rect.contains(pos)) || !pressed => {
+                    if pressed && pointer_in_canvas && img_rect.contains(pos) {
+                        if let Some(tray) = self.tray.as_ref() {
+                            tray.ensure_foreground();
+                        }
+                    }
+                    if let Some((x_norm, y_norm)) = normalize_pos(pos, img_rect) {
+                        self.net
+                            .send_input(InputEvent::MouseMove { x_norm, y_norm });
+                    }
+                    if let Some(mb) = map_mouse_button(button) {
+                        self.net.send_input(InputEvent::MouseButton {
+                            button: mb,
+                            down: pressed,
+                        });
+                    }
+                }
+                egui::Event::MouseWheel { delta, .. } if pointer_in_canvas => {
+                    let dx = (delta.x * 3.0).round() as i16 * 40;
+                    let dy = (delta.y * 3.0).round() as i16 * 40;
+                    if dx != 0 || dy != 0 {
+                        self.net.send_input(InputEvent::MouseWheel {
+                            delta_x: dx,
+                            delta_y: dy,
+                        });
+                    }
+                }
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } if !hook_blocking_egui => {
+                    let is_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
+                    if is_combo || is_control_or_nav_key(key) {
+                        if let Some((vk, extended)) = map_egui_key_to_vk(key) {
+                            self.net.send_input(InputEvent::Key {
+                                vk,
+                                scan: 0,
+                                extended,
+                                down: pressed,
+                            });
+                        }
+                    }
+                }
+                egui::Event::Text(text) if !hook_blocking_egui => {
+                    let mods = ctx.input(|i| i.modifiers);
+                    if !mods.ctrl && !mods.alt && !mods.command {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            self.net
+                                .send_input(InputEvent::UnicodeChar { ch, down: true });
+                            self.net
+                                .send_input(InputEvent::UnicodeChar { ch, down: false });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }

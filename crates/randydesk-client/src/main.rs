@@ -10,6 +10,7 @@ mod host_panel;
 mod keymap;
 mod net;
 mod relay_client;
+mod session_bar;
 mod theme;
 mod tray;
 mod win_hook;
